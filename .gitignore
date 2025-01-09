@@ -1,0 +1,6 @@
+venv
+__pycache__
+bgwrapper/bgwrapper
+bgwrapper/lib*
+bgwrapper/*.egg-info
+bgwrapper/go.sum
