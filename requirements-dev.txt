@@ -1,0 +1,12 @@
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0
+
+# Code quality
+black>=24.1.0
+flake8>=7.0.0
+mypy>=1.8.0
+
+# Debug tools
+ipdb>=0.13.0

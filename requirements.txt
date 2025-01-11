@@ -23,3 +23,7 @@ torch-tb-profiler>=0.4.1
 
 # Optional: for distributed training
 ray>=2.9.0
+
+pytest
+pytest-cov
+mcts
