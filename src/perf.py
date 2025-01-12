@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import json
+import numpy as np
 
 class PerformanceAnalyzer:
     def __init__(self, log_dir):
