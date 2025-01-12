@@ -1,6 +1,6 @@
 # network_config.py
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple, List, Union, Dict, Callable, Optional
 
 @dataclass
 class NetworkConfig:
@@ -32,5 +32,16 @@ class TrainingConfig:
     eval_positions: int = 100
     save_interval: int = 10
     patience: int = 20
-    lr_schedule: dict = None
     save_dir: str = "checkpoints"
+    # Learning rate schedule: either None, dict mapping epoch -> lr, or callable
+    lr_schedule: Optional[Union[Dict[int, float], Callable[[int], float]]] = None
+    
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if self.lr_schedule is None:
+            # Default schedule: reduce learning rate by factor of 10 at epochs 500 and 750
+            self.lr_schedule = {
+                0: self.learning_rate,
+                500: self.learning_rate * 0.1,
+                750: self.learning_rate * 0.01
+            }

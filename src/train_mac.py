@@ -40,7 +40,12 @@ training_config = TrainingConfig(
     eval_positions=20,  # Reduced from 100
     save_interval=5,
     patience=5,  # Reduced from 20
-    save_dir="local_training"
+    save_dir="local_training",
+    # Simple learning rate schedule for testing
+    lr_schedule={
+        0: 0.001,
+        5: 0.0001  # Reduce LR halfway through training
+    }
 )
 
 if __name__ == "__main__":

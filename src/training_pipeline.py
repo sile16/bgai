@@ -68,21 +68,27 @@ class SelfPlayWorker(threading.Thread):
         
         done = False
         while not done:
-            # Get current state
-            state = env.get_observation()
+            # Get current state and properly shape it
+            state = env.get_observation()  # Shape is (30, 24)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)  # Add batch dimension -> (1, 30, 24)
             
             # Run MCTS simulations
-            root = mcts.run(state, self.network, env.get_state()["Roller"])
+            root = mcts.run(state_tensor, self.network, env.get_state()["Roller"])
             
             # Get action probabilities from visit counts
             action_probs = mcts.get_action_probabilities(root, temperature=1.0)
             
+            # Convert action_probs to tensor for storage
+            action_probs_tensor = torch.zeros(env.action_space_size)
+            for action, prob in action_probs.items():
+                action_probs_tensor[action] = prob
+            
             # Store position
             game_history.append({
-                "state": state,
-                "action_probs": action_probs,
+                "state": state,  # Store original state
+                "policy": action_probs_tensor,  # Store as tensor
                 "player": env.get_state()["Roller"],
-                "Roller": env.get_state()["Roller"]
+                "value": 0.0  # Will be updated when game ends
             })
             
             # Select and apply action
@@ -92,7 +98,7 @@ class SelfPlayWorker(threading.Thread):
             if done:
                 # Add game outcome to all positions
                 for pos in game_history:
-                    pos["value"] = reward if pos["player"] == 1 else -reward
+                    pos["value"] = torch.FloatTensor([reward if pos["player"] == 1 else -reward])
                     
         return game_history
 

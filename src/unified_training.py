@@ -148,16 +148,19 @@ class UnifiedTrainer:
         """Train on a single batch."""
         self.optimizer.zero_grad()
         
-        # Prepare batch data - Fix the tensor stacking
-        states = torch.stack([pos["state"] for pos in batch]).to(self.device)
+        # Prepare batch data
+        states = torch.stack([
+            torch.FloatTensor(pos["state"]).unsqueeze(0) for pos in batch
+        ]).squeeze(1).to(self.device)  # Shape: (batch_size, 30, 24)
+        
         target_policies = torch.stack([pos["policy"] for pos in batch]).to(self.device)
-        target_values = torch.stack([pos["value"] for pos in batch]).to(self.device)
+        target_values = torch.stack([pos["value"] for pos in batch]).squeeze(-1).to(self.device)
         
         # Forward pass
         policy_logits, values = self.network(states)
         
         # Calculate losses
-        policy_loss = F.cross_entropy(policy_logits, target_policies)
+        policy_loss = -torch.mean(torch.sum(target_policies * F.log_softmax(policy_logits, dim=1), dim=1))
         value_loss = F.mse_loss(values.squeeze(-1), target_values)
         total_loss = policy_loss + value_loss
         
@@ -176,6 +179,28 @@ class UnifiedTrainer:
             "value_loss": value_loss.item()
         }
     
+    def _update_learning_rate(self, epoch: int) -> None:
+        """Update learning rate according to schedule if defined."""
+        if not hasattr(self.config, 'lr_schedule') or self.config.lr_schedule is None:
+            return  # No schedule defined, keep initial learning rate
+            
+        # Get current schedule if it exists
+        schedule = self.config.lr_schedule
+        
+        if isinstance(schedule, dict):
+            # Dictionary schedule format: {epoch: learning_rate}
+            for schedule_epoch in sorted(schedule.keys(), reverse=True):
+                if epoch >= schedule_epoch:
+                    new_lr = schedule[schedule_epoch]
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    break
+        elif callable(schedule):
+            # Function schedule format: schedule(epoch) -> learning_rate
+            new_lr = schedule(epoch)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+
     def _check_early_stopping(self) -> bool:
         """Check if early stopping criteria are met."""
         if len(self.metrics["eval_metrics"]) < self.config.patience:
