@@ -22,6 +22,13 @@ class TestEvaluation:
     @pytest.fixture
     def network(self):
         return BackgammonNetwork(NetworkConfig())
+    
+    @pytest.fixture
+    def temp_dir(self, tmp_path):
+        """Create test directory."""
+        test_dir = tmp_path / "test_outputs"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        return test_dir
         
     @pytest.fixture
     def trainer(self, network, temp_dir):

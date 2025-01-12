@@ -18,6 +18,8 @@ from mcts import  BackgammonMCTS, MCTSConfig
 from backgammon_env import BackgammonEnv
 import torch.nn.functional as F
 from pathlib import Path
+from evaluation import BackgammonEvaluator
+
 
 
 
@@ -47,6 +49,7 @@ class UnifiedTrainer:
             "value_loss": [],
             "eval_metrics": []
         }
+        self.evaluator = BackgammonEvaluator(network, save_dir=config.save_dir)
         
     def train(self):
         """Main training loop with integrated evaluation."""
@@ -197,3 +200,42 @@ class UnifiedTrainer:
         self.network.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.metrics = checkpoint.get('metrics', self.metrics)
+
+    def _evaluate_model(self) -> Dict[str, float]:
+        """Evaluate current model performance."""
+        metrics = self.evaluator.evaluate_performance(
+            num_games=self.config.eval_games,
+            num_positions=self.config.eval_positions,
+            mcts_sims=100  # Can make this configurable if needed
+        )
+        
+        # Return only the metrics that the tests expect
+        return {
+            "win_rate": metrics["win_rate"],
+            "draw_rate": metrics["draw_rate"],
+            "position_accuracy": metrics["position_accuracy"]
+        }
+
+    def _evaluate_and_save(self, epoch: Optional[int] = None, final: bool = False) -> None:
+        """Evaluate current model and save if appropriate."""
+        print("\nPerforming evaluation...")
+        eval_metrics = self._evaluate_model()
+        self.metrics["eval_metrics"].append(eval_metrics)
+        
+        # Also save detailed metrics through the evaluator
+        self.evaluator.save_metrics()
+        
+        # Save checkpoint if needed
+        if epoch is not None and (epoch + 1) % self.config.save_interval == 0:
+            self._save_checkpoint(epoch, eval_metrics)
+            self.evaluator.plot_metrics(save=True)
+        
+        # Final cleanup
+        if final:
+            self._save_final_results()
+
+    def _update_metrics(self, metrics: Dict[str, float]) -> None:
+        """Update training metrics."""
+        for key, value in metrics.items():
+            if key in self.metrics:
+                self.metrics[key].append(value)

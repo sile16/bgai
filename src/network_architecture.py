@@ -110,8 +110,16 @@ class BackgammonNetwork(nn.Module):
 
     def recurrent_inference(self, hidden_state: Optional[torch.Tensor], action: int) -> NetworkOutput:
         """Recurrent model inference for future states."""
-        # For the base network, we don't use hidden states or actions
-        # This is implemented fully in the MuZero variant
+        # If no hidden state provided, use initial inference
+        if hidden_state is None:
+            # Return dummy values since we don't have a state
+            return NetworkOutput(
+                value=0.0,
+                reward=0.0,
+                policy_logits=torch.zeros(1, self.config.action_space_size),
+                hidden_state=None
+            )
+
         policy_logits, value = self.forward(hidden_state)
         return NetworkOutput(
             value=value.item(),

@@ -33,3 +33,4 @@ class TrainingConfig:
     save_interval: int = 10
     patience: int = 20
     lr_schedule: dict = None
+    save_dir: str = "checkpoints"

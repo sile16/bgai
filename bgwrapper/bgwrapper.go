@@ -1,5 +1,7 @@
 package main
 
+// build with: go build -buildmode=c-shared -o libbackgammon.dylib 
+
 /*
 #cgo CFLAGS: -I.
 #include <stdlib.h>
@@ -467,8 +469,54 @@ type EncodedState struct {
     GamePhase    int       `json:"game_phase"`    // Added game phase tracking
 }
 
-// encodeStateToTensor converts board state to neural network input format
 func encodeStateToTensor(board *brd.Board) []float32 {
+    // Initialize state tensor (30 channels x 24 positions)
+    stateData := make([]float32, 30*24)
+    
+    // Encode piece positions (first 15 channels for each color)
+    for i := 1; i < 25; i++ {
+        whiteCount := board.Pips[i].NumWhite()
+        redCount := board.Pips[i].NumRed()
+        
+        // Encode white pieces
+        for w := 0; w < min(whiteCount, 15); w++ {
+            stateData[w*24 + i-1] = 1.0
+        }
+        
+        // Encode red pieces
+        for r := 0; r < min(redCount, 15); r++ {
+            stateData[(15+r)*24 + i-1] = 1.0
+        }
+    }
+    
+    // Current player channel (channel 29)
+    playerIdx := 29 * 24
+    if board.Roller == brd.White {
+        for i := 0; i < 24; i++ {
+            stateData[playerIdx+i] = 1.0
+        }
+    }
+    
+    // Dice values in last row of channel 29
+    if board.Roll[0] > 0 {
+        stateData[playerIdx+20] = float32(board.Roll[0]) / 6.0
+        stateData[playerIdx+21] = float32(board.Roll[1]) / 6.0
+        if board.Roll[2] > 0 {  // Handle doubles
+            stateData[playerIdx+22] = float32(board.Roll[2]) / 6.0
+            stateData[playerIdx+23] = float32(board.Roll[3]) / 6.0
+        }
+    }
+    
+    // Bar pieces encoded in channel 28
+    barIdx := 28 * 24
+    stateData[barIdx] = float32(board.Pips[23].NumWhite()) / 15.0      // White bar
+    stateData[barIdx+23] = float32(board.Pips[22].NumRed()) / 15.0     // Red bar
+    
+    return stateData
+}
+
+// encodeStateToTensor converts board state to neural network input format
+func oldEncodeStateToTensor(board *brd.Board) []float32 {
     // Initialize state tensor (30 channels x 24 positions)
     stateData := make([]float32, 30*24)
     

@@ -2,6 +2,7 @@ import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
+import torch
 
 @dataclass
 class MCTSConfig:
@@ -242,10 +243,10 @@ class BackgammonMCTS(MCTS):
         super().__init__(config)
         self.dice_handler = DiceRollHandler()
         
-    def run(self,
-            root_state: np.ndarray,
-            network: Any,
-            to_play: int) -> Node:
+    def run(self, 
+        root_state: torch.Tensor,
+        network: Any,
+        to_play: int) -> Node:
         """
         Run MCTS with backgammon dice mechanics.
         """
@@ -254,6 +255,7 @@ class BackgammonMCTS(MCTS):
         
         # Get initial predictions
         network_output = network.initial_inference(root_state)
+        root.hidden_state = network_output.hidden_state  # Store hidden state
         
         # For each simulation
         for _ in range(self.config.num_simulations):
@@ -275,13 +277,15 @@ class BackgammonMCTS(MCTS):
             # Expansion and evaluation
             if len(search_path) > 1:  # Only if we made at least one move
                 parent = search_path[-2]
-                network_output = network.recurrent_inference(parent.hidden_state, action)
+                # Use parent's hidden state or root state if parent has no hidden state
+                curr_state = parent.hidden_state if parent.hidden_state is not None else root_state
+                network_output = network.recurrent_inference(curr_state, action)
                 if moves:  # If we still have moves left
                     self.expand_node(node, parent.to_play * -1, network_output, moves, dice_roll.probability)
             
             self.backpropagate(search_path, network_output.value, 
-                             parent.to_play, self.config.discount)
-                             
+                            parent.to_play, self.config.discount)
+                            
         return root
     
     def select_child(self, node: Node, available_moves: List[int]) -> Tuple[int, Node]:
@@ -303,24 +307,36 @@ class BackgammonMCTS(MCTS):
                 
         return max_action, max_child
     
-    def expand_node(self,
-                   node: Node,
-                   to_play: int,
-                   network_output: Any,
-                   available_moves: List[int],
-                   roll_prob: float) -> None:
+    def expand_node(self, 
+               node: Node,
+               to_play: int,
+               network_output: Any,
+               available_moves: List[int],
+               roll_prob: float) -> None:
         """Expand node with only legal moves for current roll."""
         node.to_play = to_play
         node.hidden_state = network_output.hidden_state
         node.reward = network_output.reward
         
-        # Get policy from network
-        policy = {a: math.exp(logit) for a, logit in enumerate(network_output.policy_logits)}
-        policy_sum = sum(policy.values())
+        # Get policy logits and convert to numpy
+        logits = network_output.policy_logits.detach().cpu().numpy().flatten()
         
-        # Only create children for legal moves given the dice roll
+        # Calculate policy for each legal move
+        policy_dict = {}
+        total_prob = 0.0
+        
         for action in available_moves:
-            if action in policy:
-                # Adjust prior by roll probability
-                prior = (policy[action] / policy_sum) * roll_prob
-                node.children[action] = Node(prior)
+            if action < len(logits):
+                prob = float(np.exp(logits[action])) * roll_prob
+                policy_dict[action] = prob
+                total_prob += prob
+        
+        # Normalize probabilities
+        if total_prob > 0:
+            for action in policy_dict:
+                node.children[action] = Node(policy_dict[action] / total_prob)
+        else:
+            # If no valid moves with probability, distribute evenly
+            prob = roll_prob / len(available_moves)
+            for action in available_moves:
+                node.children[action] = Node(prob)
