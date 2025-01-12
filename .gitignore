@@ -8,6 +8,6 @@ bgwrapper/go.sum
 .DS_Store
 test_outputs/*
 src/test_outputs/*
-local_trainig
+local_training
 old/*
 golang/*

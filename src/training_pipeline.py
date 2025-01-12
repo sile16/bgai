@@ -49,9 +49,10 @@ class SelfPlayWorker(threading.Thread):
         self.config = config
         self.daemon = True
         self.game_count = 0
+        self._stop_event = threading.Event()
         
     def run(self):
-        while True:
+        while not self.stopped():
             # Play a game
             game_history = self.play_game()
             self.game_buffer.add_game(game_history)
@@ -101,6 +102,14 @@ class SelfPlayWorker(threading.Thread):
                     pos["value"] = torch.FloatTensor([reward if pos["player"] == 1 else -reward])
                     
         return game_history
+    
+    def stop(self):
+        """Signal the worker to stop."""
+        self._stop_event.set()
+        
+    def stopped(self):
+        """Check if the worker has been stopped."""
+        return self._stop_event.is_set()
 
 class Trainer:
     """Main training loop."""

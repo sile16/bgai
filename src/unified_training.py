@@ -382,9 +382,18 @@ class UnifiedTrainer:
         
         # Stop worker threads
         for worker in self.workers:
-            worker.daemon = False  # Allow workers to complete current game
             if hasattr(worker, 'stop'):
+                print(f"Stopping worker thread {worker.name}...")
                 worker.stop()
+        
+        # Wait for workers to finish (with timeout)
+        for worker in self.workers:
+            try:
+                worker.join(timeout=5.0)  # Wait up to 5 seconds for each worker
+                if worker.is_alive():
+                    print(f"Warning: Worker {worker.name} did not stop gracefully")
+            except Exception as e:
+                print(f"Error while stopping worker {worker.name}: {str(e)}")
         
         # Clean up evaluator
         if hasattr(self.evaluator, 'cleanup'):
