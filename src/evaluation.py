@@ -199,23 +199,38 @@ class BackgammonEvaluator:
     def plot_metrics(self, save: bool = True):
         """Plot evaluation metrics over time."""
         if not self.metrics_history:
+            print("No metrics to plot - metrics_history is empty")
             return
             
-        plt.figure(figsize=(15, 10))
+        print(f"Plotting {len(self.metrics_history)} metrics: {list(self.metrics_history.keys())}")
+        
+        # Calculate number of rows and columns needed
+        n_metrics = len(self.metrics_history)
+        n_cols = min(3, n_metrics)  # Max 3 columns
+        n_rows = (n_metrics + n_cols - 1) // n_cols  # Ceiling division
+        
+        plt.figure(figsize=(5*n_cols, 4*n_rows))
         
         # Plot each metric
-        for i, (metric, history) in enumerate(self.metrics_history.items(), 1):
-            plt.subplot(2, 2, i)
-            timestamps, values = zip(*history)
-            plt.plot(range(len(values)), values, marker='o')
-            plt.title(metric.replace('_', ' ').title())
-            plt.xlabel('Evaluation Number')
-            plt.ylabel('Value')
-            plt.grid(True)
+        for i, (metric, history) in enumerate(self.metrics_history.items()):
+            plt.subplot(n_rows, n_cols, i+1)
+            if history:  # Check if history exists
+                timestamps, values = zip(*history)
+                plt.plot(range(len(values)), values, marker='o')
+                plt.title(metric.replace('_', ' ').title())
+                plt.xlabel('Evaluation Number')
+                plt.ylabel('Value')
+                plt.grid(True)
             
         plt.tight_layout()
         
-        if save:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            plt.savefig(os.path.join(self.save_dir, f'metrics_plot_{timestamp}.png'))
-        plt.close()
+        try:
+            if save:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_path = os.path.join(self.save_dir, f'metrics_plot_{timestamp}.png')
+                plt.savefig(save_path)
+                print(f"Saved metrics plot to: {save_path}")
+        except Exception as e:
+            print(f"Error saving metrics plot: {str(e)}")
+        finally:
+            plt.close()
