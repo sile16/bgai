@@ -7,50 +7,92 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
+from network_config import NetworkConfig
 
 @dataclass
 class NetworkOutput:
-    """Output from the network containing value, reward, policy logits and hidden state."""
+    """Output from the network containing value, reward, policy logits and hidden state.
+    
+    Attributes:
+        value (float): Predicted value of the position (-1 to 1)
+        reward (float): Immediate reward for the last action (0 for initial inference)
+        policy_logits (torch.Tensor): Shape (batch_size, action_space_size) logits for move probabilities
+        hidden_state (Optional[torch.Tensor]): Shape (batch_size, conv_channels, board_size) hidden state representation
+    """
     value: float
     reward: float
     policy_logits: torch.Tensor
     hidden_state: Optional[torch.Tensor]
 
 class BackgammonNetwork(nn.Module):
-    """Neural network for backgammon value and policy prediction."""
+    """Neural network for backgammon value and policy prediction.
     
-    def __init__(self):
+    Input shape: (batch_size, input_channels, board_size)
+    where:
+        - input_channels = 30 (piece configurations and game state)
+        - board_size = 24 (board positions)
+    """
+    
+    def __init__(self, config: NetworkConfig):
         super().__init__()
-        # Input: 30 channels x 24 positions (from observation_shape)
+        self.config = config
+        
+        # Input validation
+        self.input_shape = (config.input_channels, config.input_size)
         
         # Shared representation layers
-        self.conv1 = nn.Conv1d(30, 128, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
-        
-        # Policy head - outputs logits for all possible moves
-        self.policy_conv = nn.Conv1d(128, 64, kernel_size=1)
-        self.policy_fc = nn.Linear(64 * 24, 7128)  # 7128 possible moves
-        
-        # Value head - predicts game outcome
-        self.value_conv = nn.Conv1d(128, 32, kernel_size=1)
-        self.value_fc1 = nn.Linear(32 * 24, 256)
-        self.value_fc2 = nn.Linear(256, 1)
-        
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Shared representation
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
+        self.conv_blocks = nn.ModuleList([
+            nn.Conv1d(
+                config.input_channels if i == 0 else config.conv_channels,
+                config.conv_channels,
+                kernel_size=config.kernel_size,
+                padding=config.kernel_size // 2
+            ) for i in range(config.num_blocks)
+        ])
         
         # Policy head
-        policy = F.relu(self.policy_conv(x))
-        policy = policy.view(-1, 64 * 24)
+        self.policy_conv = nn.Conv1d(config.conv_channels, config.policy_channels, kernel_size=1)
+        self.policy_fc = nn.Linear(config.policy_channels * config.input_size, config.action_space_size)
+        
+        # Value head
+        self.value_conv = nn.Conv1d(config.conv_channels, config.value_channels, kernel_size=1)
+        self.value_fc1 = nn.Linear(config.value_channels * config.input_size, config.hidden_size)
+        self.value_fc2 = nn.Linear(config.hidden_size, 1)
+        
+    def _validate_input(self, x: torch.Tensor) -> None:
+        """Validate input tensor shape."""
+        if len(x.shape) != 3:
+            raise ValueError(f"Expected 3D input tensor, got shape {x.shape}")
+        if x.shape[1:] != self.input_shape:
+            raise ValueError(f"Expected input shape {self.input_shape}, got {x.shape[1:]}")
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the network.
+        
+        Args:
+            x (torch.Tensor): Shape (batch_size, input_channels, board_size)
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 
+                - policy_logits: Shape (batch_size, action_space_size)
+                - value: Shape (batch_size, 1)
+        """
+        self._validate_input(x)
+        
+        # Shared representation
+        hidden = x
+        for conv in self.conv_blocks:
+            hidden = F.relu(conv(hidden))
+        
+        # Policy head
+        policy = F.relu(self.policy_conv(hidden))
+        policy = policy.view(policy.size(0), -1)
         policy_logits = self.policy_fc(policy)
         
         # Value head
-        value = F.relu(self.value_conv(x))
-        value = value.view(-1, 32 * 24)
+        value = F.relu(self.value_conv(hidden))
+        value = value.view(value.size(0), -1)
         value = F.relu(self.value_fc1(value))
         value = torch.tanh(self.value_fc2(value))
         

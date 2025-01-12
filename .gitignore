@@ -6,4 +6,6 @@ bgwrapper/*.h
 bgwrapper/*.egg-info
 bgwrapper/go.sum
 .DS_Store
+test_outputs/*
+src/test_outputs/*
 
