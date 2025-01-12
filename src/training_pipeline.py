@@ -72,7 +72,7 @@ class SelfPlayWorker(threading.Thread):
             state = env.get_observation()
             
             # Run MCTS simulations
-            root = mcts.run(state, self.network, env.get_state()["player"])
+            root = mcts.run(state, self.network, env.get_state()["Roller"])
             
             # Get action probabilities from visit counts
             action_probs = mcts.get_action_probabilities(root, temperature=1.0)
@@ -81,7 +81,8 @@ class SelfPlayWorker(threading.Thread):
             game_history.append({
                 "state": state,
                 "action_probs": action_probs,
-                "player": env.get_state()["player"]
+                "player": env.get_state()["Roller"],
+                "Roller": env.get_state()["Roller"]
             })
             
             # Select and apply action

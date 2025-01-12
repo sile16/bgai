@@ -50,6 +50,39 @@ class UnifiedTrainer:
             "eval_metrics": []
         }
         self.evaluator = BackgammonEvaluator(network, save_dir=config.save_dir)
+
+    def _start_workers(self):
+        """
+        Creates self-play worker threads and starts them. 
+        Adjust the arguments passed to SelfPlayWorker according to your design.
+        """
+        # Example: Use config.num_workers, similar to training_pipeline.py
+        for _ in range(self.config.num_workers):
+            # The config object used by SelfPlayWorker might differ from self.config
+            # Update or replace as needed to match your SelfPlayWorker signature
+            worker = SelfPlayWorker(
+                network=self.network,
+                game_buffer=self.game_buffer,
+                config={
+                    "learning_rate": self.config.learning_rate,
+                    "buffer_size": self.config.buffer_size,
+                    # ... any other fields SelfPlayWorker needs
+                }
+            )
+            worker.start()
+            self.workers.append(worker)
+    
+    def _wait_for_initial_games(self):
+        """
+        Waits until the game buffer holds enough games/positions for the first training step.
+        Adjust the threshold (self.config.initial_games) to your needs.
+        """
+        # If 'initial_games' isn't defined, you can set a default or remove this check
+        target_games = getattr(self.config, "initial_games", 100)
+        while len(self.game_buffer.buffer) < target_games:
+            time.sleep(1)
+        print(f"Initial games collected: {len(self.game_buffer.buffer)}")
+
         
     def train(self):
         """Main training loop with integrated evaluation."""
