@@ -38,25 +38,6 @@ import (
     "github.com/chandler37/gobackgammon/ai"
 )
 
-type Move struct {
-    From int
-    To   int
-    Dice int
-}
-
-type MoveSequence struct {
-    Moves []Move
-    Roll  brd.Roll  // Changed from [4]int to brd.Roll
-}
-
-// Move encoding constants
-const (
-    POINTS = 24      // Number of points on the board
-    BAR_POS = 24     // Position index for bar
-    OFF_POS = 25     // Position index for bearing off
-    MAX_MOVES = 4    // Maximum moves in a sequence
-)
-
 
 type BoardState struct {
     board *brd.Board
@@ -461,12 +442,13 @@ func EncodeBoard(board *brd.Board) BoardInfo {
 
 // Add new struct for encoded state
 type EncodedState struct {
-    StateData    []float32 `json:"state_data"`    // Flattened state tensor
-    Shape        []int     `json:"shape"`         // Shape of the tensor (30, 24)
-    LegalMoves   []int     `json:"legal_moves"`   // Encoded legal moves
-    IsTerminal   bool      `json:"is_terminal"`   // Whether game is over
-    CurrentValue float32   `json:"value"`         // Current position value if terminal
-    GamePhase    int       `json:"game_phase"`    // Added game phase tracking
+    StateData      []float32       `json:"state_data"`    // Flattened state tensor
+    Shape          []int           `json:"shape"`         // Shape of the tensor (30, 24)
+    LegalMoves     []uint32        `json:"legal_moves"`   // Encoded legal moves
+    IsTerminal     bool            `json:"is_terminal"`   // Whether game is over
+    CurrentValue   float32         `json:"value"`         // Current position value if terminal
+    GamePhase      int             `json:"game_phase"`    // Added game phase tracking
+    LegalMovesObj  []MoveSequence  `json:"legal_moves_obj"`   // json legal moves
 }
 
 func encodeStateToTensor(board *brd.Board) []float32 {
@@ -562,10 +544,10 @@ func oldEncodeStateToTensor(board *brd.Board) []float32 {
 
 
 // encodeLegalMoves converts legal moves to integer indices
-func encodeLegalMoves(stateID C.uint64_t) []int {
+func encodeLegalMoves(stateID C.uint64_t) []uint32 {
     brdState := boards[uint64(stateID)]
 
-    encoded := make([]int, len(brdState.legalMoves))
+    encoded := make([]uint32, len(brdState.legalMoves))
     for i := range encoded {
         encoded[i] = encodeMoveToIndex(brdState.board, brdState.legalMoves[i])
     }
@@ -573,7 +555,7 @@ func encodeLegalMoves(stateID C.uint64_t) []int {
 }
 
 // encodeMoveToIndex converts a move to a unique integer index
-func encodeMoveToIndex(before *brd.Board, after *brd.Board ) int {
+func encodeMoveToIndex(before *brd.Board, after *brd.Board ) uint32 {
 // Get the parent board from the state
 
     sequence := extractMoveSequence(before, after)
@@ -597,12 +579,12 @@ func extractMoveSequence(before, after *brd.Board) MoveSequence {
         // Detect piece removals (from moves)
         if beforeWhite > afterWhite {
             for j := 0; j < beforeWhite-afterWhite; j++ {
-                sequence.Moves = append(sequence.Moves, Move{From: i, To: -1, Dice: -1})
+                sequence.Moves = append(sequence.Moves, Move{From: i, To: NULL_POINT, Dice: NULL_POINT})
             }
         }
         if beforeRed > afterRed {
             for j := 0; j < beforeRed-afterRed; j++ {
-                sequence.Moves = append(sequence.Moves, Move{From: i, To: -1, Dice: -1})
+                sequence.Moves = append(sequence.Moves, Move{From: i, To: NULL_POINT, Dice: NULL_POINT})
             }
         }
     }
@@ -660,69 +642,56 @@ func matchMovesWithDice(before, after *brd.Board, sequence *MoveSequence) {
         }
         
         sequence.Moves[i].To = to
-        sequence.Moves[i].Dice = dice
+        sequence.Moves[i].Dice = brd.Die(dice)
     }
 }
 
-func moveSequenceToIndex(sequence MoveSequence) int {
-    /*
-    Encode move sequence into unique index using this scheme:
-    - Each move can be encoded as: from_pos * (POINTS+2) + to_pos
-    - Each die value can be encoded as: value - 1 (0-5)
-    - Combine these values using base encoding:
-    index = move1 * BASE^3 + move2 * BASE^2 + move3 * BASE + move4
-    where BASE = (POINTS+2)^2 (possible from-to combinations)
-    */
-    
-    BASE := (POINTS + 2) * (POINTS + 2) // All possible from-to combinations
-    index := 0
-    multiplier := 1
+
+func normalizePosition(pos int) int {
+    if pos < 0 || pos > POINTS+1 {
+        return 0
+    }
+    return pos
+}
+
+func denormalizePosition(pos int) int {
+    return pos
+}
+
+func normalizeDice(dice, from, to int) int {
+    if to == OFF_POS {
+        return calculateBearingOffDice(from)
+    }
+    return abs(dice)
+}
+
+func calculateBearingOffDice(from int) int {
+    if from <= 6 {
+        return from
+    }
+    return 6
+}
+
+func isValidPosition(pos int) bool {
+    return pos >= 0 && pos <= POINTS+1
+}
+
+// Additional helper function for doubles handling
+func handleDoubles(sequence MoveSequence) bool {
+    // Track used dice values for doubles
+    usedDice := make(map[brd.Die]brd.Die)
     
     for _, move := range sequence.Moves {
-        moveIndex := move.From*(POINTS+2) + move.To
-        index += moveIndex * multiplier
-        multiplier *= BASE
-    }
-    
-    return index
-}
-
-func decodeIndexToMoveSequence(index int) MoveSequence {
-    BASE := (POINTS + 2) * (POINTS + 2)
-    sequence := MoveSequence{
-        Moves: make([]Move, 0, MAX_MOVES),
-    }
-    
-    for i := 0; i < MAX_MOVES; i++ {
-        if index == 0 {
-            break
+        diceVal := move.Dice
+        usedDice[diceVal]++
+        
+        // Check if we've used more dice than available
+        if usedDice[diceVal] > 4 {
+            return false
         }
-        
-        moveIndex := index % BASE
-        from := moveIndex / (POINTS + 2)
-        to := moveIndex % (POINTS + 2)
-        
-        // Calculate dice value based on special positions
-        var dice int
-        switch {
-        case from == BAR_POS: // Moving from bar
-            dice = to // For white
-        case to == OFF_POS: // Bearing off
-            dice = from
-        default:
-            dice = abs(to - from)
-        }
-        
-        sequence.Moves = append(sequence.Moves, Move{
-            From: from,
-            To:   to,
-            Dice: dice,
-        })
-        
-        index /= BASE
     }
     
-    return sequence
+    return true
 }
 
 func isTerminalState( brdStateID uint64) (bool, float32) {
