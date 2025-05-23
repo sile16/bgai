@@ -52,6 +52,7 @@ from benchmarks.benchmark_common import (
     get_system_info,
     print_system_info,
     get_memory_usage,
+    calculate_memory_percentage,
     create_profile_filename,
     save_profile,
     load_profile,
@@ -68,8 +69,8 @@ from benchmarks.benchmark_common import (
 from benchmarks.benchmark_cli import parse_batch_sizes
 
 # MCTS Constants
-DEFAULT_NUM_ITERATIONS = 200  # Default number of MCTS iterations/simulations
-MAX_NODES = 10000  # Maximum number of nodes in the MCTS tree
+DEFAULT_NUM_ITERATIONS = [200, 600, 1000]  # Default iteration configurations
+DEFAULT_MAX_NODES = [1200, 2400]  # Default max nodes configurations
 
 def dummy_apply_fn(params: chex.ArrayTree, obs: chex.Array, key: chex.PRNGKey) -> Tuple[chex.Array, chex.Array]:
     """Dummy NN apply function returning uniform policy logits and zero value."""
@@ -96,12 +97,20 @@ def dummy_state_to_nn_input_fn(state: chex.ArrayTree) -> chex.Array:
 class MCTSBenchmarkBase(BaseBenchmark):
     """Base class for MCTS benchmarks providing common functionality."""
     
-    def __init__(self, name: str, description: str, num_simulations: int):
+    def __init__(self, name: str, description: str, num_simulations: int, max_nodes: int):
         super().__init__(name, description)
         self.num_simulations = num_simulations
+        self.max_nodes = max_nodes
         self.env = bg.Backgammon(simple_doubles=True)
         self.num_actions = self.env.num_actions
         self.action_selector = PUCTSelector(c=1.0)
+        
+    def get_profile_params(self):
+        """Get parameters for unique profile identification."""
+        return {
+            "num_simulations": self.num_simulations,
+            "max_nodes": self.max_nodes
+        }
         
     def create_evaluator(self) -> MCTS:
         """Create the MCTS evaluator - override in subclasses."""
@@ -109,7 +118,7 @@ class MCTSBenchmarkBase(BaseBenchmark):
             eval_fn=dummy_apply_fn,
             action_selector=self.action_selector,
             branching_factor=self.num_actions,
-            max_nodes=MAX_NODES,
+            max_nodes=self.max_nodes,
             num_iterations=self.num_simulations,
             discount=-1.0,
             temperature=1.0,
@@ -226,25 +235,26 @@ class MCTSBenchmarkBase(BaseBenchmark):
             print("First compilation pass...", flush=True)
             key, subkey = jax.random.split(key)
             # pylint: disable=not-callable
-            new_states = step_fn(subkey, env_states, eval_states)
-            jax.block_until_ready(new_states)
+            new_env_states, new_eval_states, _ = step_fn(subkey, env_states, eval_states)
+            jax.block_until_ready(new_env_states)
             print("Initial compilation successful", flush=True)
             
             print("Running warm-up iterations...", flush=True)
             NUM_WARMUP_ITERATIONS = 4  # Number of warmup iterations
+            env_states, eval_states = new_env_states, new_eval_states
             for _ in range(NUM_WARMUP_ITERATIONS):
                 key, subkey = jax.random.split(key)
-                new_states = step_fn(subkey, *new_states)  # pylint: disable=not-callable
-            jax.block_until_ready(new_states)
+                env_states, eval_states, _ = step_fn(subkey, env_states, eval_states)  # pylint: disable=not-callable
+            jax.block_until_ready(env_states)
             print("Warm-up complete", flush=True)
             # pylint: enable=not-callable
-            return new_states
         except Exception as e:
             print(f"Error warming up: {e}", flush=True)
             return None
         
         # Benchmark loop
         start_time = time.time()
+        total_iterations = 0  # Track MCTS iterations, not just moves
         total_moves = 0
         completed_games = 0
         current_game_moves = np.zeros(batch_size, dtype=np.int32)
@@ -258,16 +268,21 @@ class MCTSBenchmarkBase(BaseBenchmark):
         with tqdm(total=max_duration, desc=f"MCTS B={batch_size} S={self.num_simulations}", unit="s") as pbar:
             while (elapsed_time := time.time() - start_time) < max_duration:
                 # Run iteration
-                result = self.run_benchmark_iteration(step_fn, [env_states, eval_states], pbar, start_time, max_duration)
-                if result is None:
+                key, subkey = jax.random.split(key)
+                try:
+                    env_states, eval_states, terminated = step_fn(subkey, env_states, eval_states)
+                    jax.block_until_ready(terminated)
+                except Exception as e:
+                    print(f"Error during benchmark: {e}", flush=True)
                     break
-                    
-                env_states, eval_states, terminated = result
                 
                 # Update statistics
                 active_mask = ~terminated
                 moves_this_step = np.sum(active_mask)
                 total_moves += moves_this_step
+                # Each move involves batch_size * num_simulations MCTS iterations
+                iterations_this_step = moves_this_step * self.num_simulations
+                total_iterations += iterations_this_step
                 current_game_moves[active_mask] += 1
                 
                 # Track node count
@@ -293,33 +308,38 @@ class MCTSBenchmarkBase(BaseBenchmark):
                 
                 # Update progress display
                 if time.time() - pbar.last_print_t > 0.5:
+                    iterations_per_sec = total_iterations / elapsed_time
                     moves_per_sec = total_moves / elapsed_time
                     games_per_sec = completed_games / elapsed_time
                     pbar.set_postfix({
-                        "moves/s": f"{format_human_readable(moves_per_sec)}/s",
-                        "games/s": f"{format_human_readable(games_per_sec)}/s",
+                        "iters/s": f"{format_human_readable(iterations_per_sec)}",
+                        "moves/s": f"{format_human_readable(moves_per_sec)}",
+                        "games/s": f"{format_human_readable(games_per_sec)}",
                         "mem": f"{peak_memory_gb:.2f}GB"
                     })
         
         # Calculate final metrics
         final_elapsed_time = time.time() - start_time
+        iterations_per_second = total_iterations / final_elapsed_time
         moves_per_second = total_moves / final_elapsed_time
         games_per_second = completed_games / final_elapsed_time
         avg_game_length = np.mean(game_lengths) if game_lengths else 0
         median_game_length = np.median(game_lengths) if game_lengths else 0
         min_game_length = np.min(game_lengths) if game_lengths else 0
         max_game_length = np.max(game_lengths) if game_lengths else 0
-        efficiency = moves_per_second / peak_memory_gb
+        memory_percent = calculate_memory_percentage(peak_memory_gb)
+        efficiency = iterations_per_second / peak_memory_gb  # Efficiency based on iterations
         
         result = BatchBenchResult(
             batch_size=batch_size,
-            moves_per_second=moves_per_second,
+            steps_per_second=iterations_per_second,  # Primary metric: iterations per second
             games_per_second=games_per_second,
             avg_game_length=avg_game_length,
             median_game_length=median_game_length,
             min_game_length=min_game_length,
             max_game_length=max_game_length,
             memory_usage_gb=peak_memory_gb,
+            memory_usage_percent=memory_percent,
             efficiency=efficiency
         )
         
@@ -372,15 +392,25 @@ class MCTSBenchmarkBase(BaseBenchmark):
                 break
         
         return valid_results, max_node_count
+    
+    def _run_discovery(self, 
+                      memory_limit_gb: float, 
+                      duration: int, 
+                      custom_batch_sizes: Optional[List[int]],
+                      verbose: bool) -> List[BatchBenchResult]:
+        """Run the discovery process for MCTS benchmark."""
+        results, _ = self.discover_optimal_batch_sizes(memory_limit_gb, duration, custom_batch_sizes)
+        return results
 
 class MCTSBenchmark(MCTSBenchmarkBase):
     """Standard MCTS benchmark implementation."""
     
-    def __init__(self, num_simulations: int):
+    def __init__(self, num_simulations: int, max_nodes: int):
         super().__init__(
             name="MCTS",
-            description=f"Standard MCTS benchmark with {num_simulations} simulations",
-            num_simulations=num_simulations
+            description=f"Standard MCTS benchmark with {num_simulations} simulations, {max_nodes} max nodes",
+            num_simulations=num_simulations,
+            max_nodes=max_nodes
         )
 
 def main():

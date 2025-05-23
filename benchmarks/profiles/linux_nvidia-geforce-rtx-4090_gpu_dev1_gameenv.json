@@ -1,0 +1,44 @@
+{
+  "platform": "Linux",
+  "processor": "x86_64",
+  "jaxlib_type": "gpu",
+  "device_info": "cuda:0",
+  "python_version": "3.12.8",
+  "jax_version": "0.6.0",
+  "device_name": "nvidia-geforce-rtx-4090",
+  "device_platform": "gpu",
+  "num_devices": 1,
+  "benchmark_name": "GameEnv",
+  "description": "Pure backgammon environment step performance benchmark",
+  "timestamp": "2025-05-22T19:18:04.464650",
+  "batch_sizes": [
+    1,
+    2,
+    4
+  ],
+  "steps_per_second": [
+    3.802431583404541,
+    7.608364105224609,
+    15.169209480285645
+  ],
+  "games_per_second": [
+    0.0,
+    0.0,
+    0.033048388205729126
+  ],
+  "memory_usage_gb": [
+    1.3010177612304688,
+    1.4483528137207031,
+    1.5903167724609375
+  ],
+  "memory_usage_percent": [
+    2.075377710662211,
+    2.3104059270704824,
+    2.5368661987643906
+  ],
+  "efficiency": [
+    2.922659158706665,
+    5.253115177154541,
+    9.538482666015625
+  ]
+}

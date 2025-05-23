@@ -54,6 +54,7 @@ from benchmarks.benchmark_common import (
     get_system_info,
     print_system_info,
     get_memory_usage,
+    calculate_memory_percentage,
     save_profile,
     load_profile,
     generate_benchmark_plots,
@@ -101,11 +102,12 @@ def dummy_state_to_nn_input_fn(state: chex.ArrayTree) -> chex.Array:
 class StochasticMCTSBenchmark(MCTSBenchmarkBase):
     """Benchmark implementation for StochasticMCTS."""
     
-    def __init__(self, num_simulations: int):
+    def __init__(self, num_simulations: int, max_nodes: int):
         super().__init__(
             name="StochasticMCTS",
-            description=f"Stochastic MCTS benchmark with {num_simulations} simulations",
-            num_simulations=num_simulations
+            description=f"Stochastic MCTS benchmark with {num_simulations} simulations, {max_nodes} max nodes",
+            num_simulations=num_simulations,
+            max_nodes=max_nodes
         )
     
     def create_evaluator(self) -> StochasticMCTS:
@@ -115,7 +117,7 @@ class StochasticMCTSBenchmark(MCTSBenchmarkBase):
             action_selector=self.action_selector,
             stochastic_action_probs=self.env.stochastic_action_probs,
             branching_factor=self.num_actions,
-            max_nodes=MAX_NODES,
+            max_nodes=self.max_nodes,
             num_iterations=self.num_simulations,
             discount=-1.0,
             temperature=1.0,
@@ -199,6 +201,15 @@ class StochasticMCTSBenchmark(MCTSBenchmarkBase):
         next_eval_state = self.evaluator.step(mcts_output.eval_state, action)
         
         return next_env_state, next_eval_state
+    
+    def _run_discovery(self, 
+                      memory_limit_gb: float, 
+                      duration: int, 
+                      custom_batch_sizes: Optional[List[int]],
+                      verbose: bool) -> List[BatchBenchResult]:
+        """Run the discovery process for StochasticMCTS benchmark."""
+        results, _ = self.discover_optimal_batch_sizes(memory_limit_gb, duration, custom_batch_sizes)
+        return results
 
 def main():
     """Main entry point for the StochasticMCTS benchmark script."""

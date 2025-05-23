@@ -1,3 +1,2 @@
 #Install Turbo Zero from SAU16 GitHub Turbo Zero
-turbozero=https://github.com/sile16/turbozero/turbozero.git
-
+turbozero @ git+https://github.com/sile16/turbozero.git@main
