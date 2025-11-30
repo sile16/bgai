@@ -1,0 +1,50 @@
+{
+  "platform": "Linux",
+  "processor": "x86_64",
+  "jaxlib_type": "gpu",
+  "device_info": "cuda:0",
+  "python_version": "3.12.8",
+  "jax_version": "0.6.0",
+  "device_name": "nvidia-geforce-rtx-4090",
+  "device_platform": "gpu",
+  "num_devices": 1,
+  "benchmark_name": "TrainingLoop",
+  "description": "Training loop performance benchmark for batch size optimization",
+  "timestamp": "2025-05-23T13:42:11.701761",
+  "batch_sizes": [
+    4,
+    8,
+    32,
+    64
+  ],
+  "steps_per_second": [
+    7610.1687758267935,
+    7226.335812748406,
+    8085.028454045864,
+    7709.263652184781
+  ],
+  "games_per_second": [
+    1.3333333333333333,
+    2.6666666666666665,
+    10.666666666666666,
+    21.333333333333332
+  ],
+  "memory_usage_gb": [
+    1.652130126953125,
+    1.662139892578125,
+    1.6424522399902344,
+    1.6519737243652344
+  ],
+  "memory_usage_percent": [
+    2.6354705852356544,
+    2.6514381185669675,
+    2.6200324632609817,
+    2.6352210925273525
+  ],
+  "efficiency": [
+    4606.276861412572,
+    4347.60987629009,
+    4922.534888499367,
+    4666.698712261323
+  ]
+}

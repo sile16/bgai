@@ -6,7 +6,7 @@ from pgx.core import StepMetadata
 
 def backgammon_step_fn(state: bg.State, action: int, key: chex.PRNGKey) -> Tuple[bg.State, StepMetadata]:
     """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
-    # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state.is_stochastic}), action={action}") # Optional debug
+    # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state._is_stochastic}), action={action}") # Optional debug
 
     # Handle stochastic vs deterministic branches
     def stochastic_branch(operand):
@@ -22,7 +22,7 @@ def backgammon_step_fn(state: bg.State, action: int, key: chex.PRNGKey) -> Tuple
     # Use conditional to route to the appropriate branch
     # The key is only needed for the deterministic branch
     new_state = jax.lax.cond(
-        state.is_stochastic,
+        state._is_stochastic,
         stochastic_branch,
         deterministic_branch,
         (state, action, key) # Pass all required operands

@@ -28,7 +28,7 @@ def backgammon_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key
     value = (opponent_pips + opponent_born_off - current_pips - current_born_off) / total_pips
     
     # Ensure stochastic states are not evaluated directly
-    value = jnp.where(state.is_stochastic, jnp.nan, value)
+    value = jnp.where(state._is_stochastic, jnp.nan, value)
     
     # Uniform policy over legal actions for greedy baseline
     policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)

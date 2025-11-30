@@ -9,30 +9,30 @@
   "device_platform": "gpu",
   "num_devices": 1,
   "benchmark_name": "MCTS",
-  "description": "Standard MCTS benchmark with 200 simulations, 1200 max nodes",
-  "timestamp": "2025-11-29T14:52:33.963973",
+  "description": "Standard MCTS benchmark with 600 simulations, 1200 max nodes",
+  "timestamp": "2025-11-29T14:59:23.930812",
   "batch_sizes": [
     1,
     256
   ],
   "steps_per_second": [
-    292.09033203125,
-    11326.5234375
+    694.7236328125,
+    11061.05859375
   ],
   "games_per_second": [
-    0.5642654142103203,
-    24.93109517413911
+    0.44660806381113066,
+    8.621163725410998
   ],
   "memory_usage_gb": [
-    2.0665512084960938,
-    2.40380859375
+    2.6544837951660156,
+    2.6732826232910156
   ],
   "memory_usage_percent": [
-    3.296557452615341,
-    3.8345496118405737
+    4.234426082366167,
+    4.26441392718759
   ],
   "efficiency": [
-    141.34193420410156,
-    4711.9072265625
+    261.717041015625,
+    4137.63134765625
   ]
 }

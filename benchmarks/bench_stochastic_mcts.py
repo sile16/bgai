@@ -128,7 +128,7 @@ class StochasticMCTSBenchmark(MCTSBenchmarkBase):
         """Create an environment step function with fixed key."""
         def wrapped_step_fn(env_state, action, key):
             # Check if this is a stochastic state
-            is_stochastic = env_state.is_stochastic if hasattr(env_state, 'is_stochastic') else False
+            is_stochastic = env_state._is_stochastic if hasattr(env_state, '_is_stochastic') else (env_state.is_stochastic if hasattr(env_state, 'is_stochastic') else False)
             
             # Use conditional for stochastic vs deterministic step
             new_state = jax.lax.cond(

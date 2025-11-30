@@ -54,27 +54,50 @@ class SimpleTwoPlayerBenchmark(BaseBenchmark):
         steps = 0
         max_steps = 500
         
-        while not state.terminated and steps < max_steps:
-            # Simple heuristic action selection
-            if jnp.any(state.legal_action_mask):
-                # Use pip count evaluation for action selection
-                policy_logits, _ = backgammon_pip_count_eval(state, jnp.array([]), jax.random.PRNGKey(0))
-                
-                # Select best legal action
-                legal_logits = jnp.where(state.legal_action_mask, policy_logits, -jnp.inf)
-                action = jnp.argmax(legal_logits)
-            else:
-                # Fallback to random action if evaluation fails
-                action = random_action_from_mask(jax.random.PRNGKey(steps), state.legal_action_mask)
+        def game_loop_cond(loop_state):
+            state, steps, _ = loop_state
+            return jnp.logical_and(jnp.logical_not(state.terminated), steps < max_steps)
+        
+        def game_loop_body(loop_state):
+            state, steps, key = loop_state
             
-            # Step environment
-            step_key = jax.random.split(jax.random.PRNGKey(steps + 1000), 1)[0]
-            state = self.bg_env.step(state, action, step_key)
-            steps += 1
+            # Use pip count evaluation for action selection
+            policy_logits, _ = backgammon_pip_count_eval(state, jnp.array([]), jax.random.PRNGKey(0))
+            
+            # Select best legal action
+            legal_logits = jnp.where(state.legal_action_mask, policy_logits, -jnp.inf)
+            action = jnp.argmax(legal_logits)
+            
+            # Step environment using conditional for stochastic vs deterministic
+            step_key = jax.random.split(key, 2)[1]
+            
+            def stochastic_step(operand):
+                s, a, _ = operand
+                return self.bg_env.stochastic_step(s, a)
+            
+            def deterministic_step(operand):
+                s, a, k = operand
+                return self.bg_env.step(s, a, k)
+            
+            new_state = jax.lax.cond(
+                state._is_stochastic,
+                stochastic_step,
+                deterministic_step,
+                (state, action, step_key)
+            )
+            
+            return new_state, steps + 1, step_key
+        
+        # Run game loop
+        final_state, final_steps, _ = jax.lax.while_loop(
+            game_loop_cond,
+            game_loop_body,
+            (state, steps, game_key)
+        )
         
         # Determine winner (0 or 1)
-        winner = 0 if state.rewards[0] > state.rewards[1] else 1
-        return steps, winner
+        winner = jnp.where(final_state.rewards[0] > final_state.rewards[1], 0, 1)
+        return final_steps, winner
     
     def run_episode_batch(self, key: chex.PRNGKey, batch_size: int) -> Tuple[chex.Array, int]:
         """Run a batch of simple two-player games."""
@@ -90,7 +113,7 @@ class SimpleTwoPlayerBenchmark(BaseBenchmark):
         # Calculate total steps
         total_steps = jnp.sum(steps_per_game)
         
-        return winners, int(total_steps)
+        return winners, total_steps
     
     def benchmark_batch_size(self, batch_size: int, max_duration: int = DEFAULT_BENCHMARK_DURATION) -> BatchBenchResult:
         """Run benchmark for a specific batch size."""
@@ -149,10 +172,11 @@ class SimpleTwoPlayerBenchmark(BaseBenchmark):
                 # Update statistics
                 episodes_completed = batch_size
                 total_episodes += episodes_completed
-                total_steps += int(steps_this_batch)
+                steps_this_batch_int = int(steps_this_batch.item())
+                total_steps += steps_this_batch_int
                 
                 # Track episode lengths
-                avg_length_this_batch = int(steps_this_batch) // batch_size
+                avg_length_this_batch = steps_this_batch_int // batch_size
                 for _ in range(episodes_completed):
                     episode_lengths.append(avg_length_this_batch)
                 

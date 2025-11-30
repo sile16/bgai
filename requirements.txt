@@ -1,2 +1,3 @@
 #Install Turbo Zero from SAU16 GitHub Turbo Zero
+pgx @ git+https://github.com/sile16/pgx.git@master
 turbozero @ git+https://github.com/sile16/turbozero.git@main

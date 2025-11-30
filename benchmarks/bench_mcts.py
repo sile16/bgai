@@ -127,8 +127,10 @@ class MCTSBenchmarkBase(BaseBenchmark):
     
     def make_env_step_fn(self, step_key):
         """Create an environment step function with fixed key."""
-        def wrapped_step_fn(env_state, action):
-            new_state = self.env.step(env_state, action, step_key)
+        def wrapped_step_fn(env_state, action, key):
+            # Use the provided key if available, otherwise use the fixed step_key
+            actual_key = key if key is not None else step_key
+            new_state = self.env.step(env_state, action, actual_key)
             metadata = StepMetadata(
                 action_mask=new_state.legal_action_mask,
                 terminated=new_state.terminated,

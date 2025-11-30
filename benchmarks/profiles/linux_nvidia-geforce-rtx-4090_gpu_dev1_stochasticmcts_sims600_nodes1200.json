@@ -8,31 +8,31 @@
   "device_name": "nvidia-geforce-rtx-4090",
   "device_platform": "gpu",
   "num_devices": 1,
-  "benchmark_name": "MCTS",
-  "description": "Standard MCTS benchmark with 200 simulations, 1200 max nodes",
-  "timestamp": "2025-11-29T14:52:33.963973",
+  "benchmark_name": "StochasticMCTS",
+  "description": "Stochastic MCTS benchmark with 600 simulations, 1200 max nodes",
+  "timestamp": "2025-11-29T15:35:10.844951",
   "batch_sizes": [
     1,
-    256
+    128
   ],
   "steps_per_second": [
-    292.09033203125,
-    11326.5234375
+    79.65011596679688,
+    2166.13232421875
   ],
   "games_per_second": [
-    0.5642654142103203,
-    24.93109517413911
+    1.8419089379261138,
+    124.51979549903426
   ],
   "memory_usage_gb": [
-    2.0665512084960938,
-    2.40380859375
+    2.40606689453125,
+    2.4536590576171875
   ],
   "memory_usage_percent": [
-    3.296557452615341,
-    3.8345496118405737
+    3.838152047744446,
+    3.9140709503402387
   ],
   "efficiency": [
-    141.34193420410156,
-    4711.9072265625
+    33.10386657714844,
+    882.8171997070312
   ]
 }

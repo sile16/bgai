@@ -31,6 +31,28 @@ PROFILE_DIR = BENCHMARK_DIR / "profiles"
 GRAPHS_DIR = BENCHMARK_DIR / "graphs"
 HUMAN_READABLE_UNITS = ["", "K", "M", "B", "T"]
 
+
+def convert_to_python(value):
+    """Convert JAX arrays and other non-JSON-serializable types to Python native types."""
+    if hasattr(value, 'item'):  # JAX/numpy scalar arrays
+        return value.item()
+    if isinstance(value, (jnp.ndarray, jax.Array)):
+        if value.ndim == 0:
+            return float(value)
+        return [convert_to_python(v) for v in value.tolist()]
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return float(value)
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [convert_to_python(v) for v in value]
+    if isinstance(value, dict):
+        return {k: convert_to_python(v) for k, v in value.items()}
+    if isinstance(value, (np.floating, np.integer)):
+        return float(value) if isinstance(value, np.floating) else int(value)
+    return value
+
+
 # Define common data structures
 class BatchBenchResult(NamedTuple):
     batch_size: int
@@ -521,14 +543,14 @@ def generate_graphs_from_profile(profile: BenchmarkProfile) -> Tuple[str, str]:
 def save_profile(profile: BenchmarkProfile, **kwargs) -> Path:
     """Save benchmark profile to a JSON file."""
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     filename = create_profile_filename(profile.benchmark_name, **kwargs)
     filepath = PROFILE_DIR / filename
-    
+
     # Add current system information to the profile
     profile_dict = asdict(profile)
     sys_info = get_system_info()
-    
+
     # Add all enhanced system info for better traceability
     enhanced_fields = {
         "device_name": sys_info["device_name"],
@@ -542,10 +564,13 @@ def save_profile(profile: BenchmarkProfile, **kwargs) -> Path:
         "turbozero_install_time": sys_info["turbozero_install_time"],
     }
     profile_dict.update(enhanced_fields)
-    
+
+    # Convert all values to JSON-serializable types (handles JAX arrays)
+    profile_dict = convert_to_python(profile_dict)
+
     with open(filepath, 'w') as f:
         json.dump(profile_dict, f, indent=2)
-    
+
     print(f"Profile saved to {filepath}")
     return filepath
 

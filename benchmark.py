@@ -119,6 +119,25 @@ Examples:
                                                     help='Benchmark simple two-player heuristic performance')
     add_common_args(simple_two_player_parser)
     
+    # Model Comparison benchmark
+    model_comp_parser = subparsers.add_parser('model-comparison',
+                                             help='Benchmark model vs model head-to-head comparison')
+    add_common_args(model_comp_parser)
+    model_comp_parser.add_argument('--model1', type=str, default='neural_net', 
+                                  choices=['neural_net', 'resnet_10layer', 'heuristic'],
+                                  help='First model to compare (default: neural_net)')
+    model_comp_parser.add_argument('--model2', type=str, default='heuristic',
+                                  choices=['neural_net', 'resnet_10layer', 'heuristic'], 
+                                  help='Second model to compare (default: heuristic)')
+    model_comp_parser.add_argument('--num-simulations', type=int, default=300, metavar='N',
+                                  help='Number of MCTS simulations per move (default: 300)')
+    model_comp_parser.add_argument('--max-nodes', type=int, default=1000, metavar='N',
+                                  help='Maximum number of nodes in MCTS tree (default: 1000)')
+    model_comp_parser.add_argument('--model1-params', type=str, metavar='PATH',
+                                  help='Path to checkpoint file for model 1 parameters')
+    model_comp_parser.add_argument('--model2-params', type=str, metavar='PATH',
+                                  help='Path to checkpoint file for model 2 parameters')
+    
     return parser
 
 def run_game_env_benchmark(args):
@@ -434,6 +453,41 @@ def run_simple_two_player_benchmark(args):
             verbose=args.verbose
         )
 
+def run_model_comparison_benchmark(args):
+    """Run model comparison benchmark."""
+    from benchmarks.bench_model_comparison import ModelComparisonBenchmark
+    
+    benchmark = ModelComparisonBenchmark(
+        model1_name=args.model1,
+        model2_name=args.model2,
+        num_simulations=args.num_simulations,
+        max_nodes=args.max_nodes,
+        model1_params_path=getattr(args, 'model1_params', None),
+        model2_params_path=getattr(args, 'model2_params', None)
+    )
+    
+    if args.single_batch:
+        result = benchmark.benchmark_batch_size(args.single_batch, args.duration)
+        benchmark.print_single_result(result)
+    elif args.discover:
+        results = benchmark._run_discovery(
+            memory_limit_gb=args.memory_limit,
+            duration=args.duration,
+            custom_batch_sizes=parse_batch_sizes(args.batch_sizes),
+            verbose=args.verbose
+        )
+        
+        # Print summary
+        print(f"\n=== Model Comparison Discovery Complete ===")
+        print(f"Tested {len(results)} batch sizes")
+        if results:
+            best_perf = max(results, key=lambda x: x['games_per_second'])
+            print(f"Best performance: {best_perf['games_per_second']:.2f} games/s at batch size {best_perf['batch_size']}")
+            print(f"Final reward difference ({args.model1} - {args.model2}): {best_perf['reward_difference']:.3f}")
+    elif args.validate:
+        print("Validation mode not implemented for model comparison")
+        return
+
 def parse_batch_sizes(batch_sizes_str: Optional[str]) -> Optional[List[int]]:
     """Parse comma-separated batch sizes string into a list of integers."""
     if not batch_sizes_str:
@@ -495,6 +549,8 @@ def main():
             run_training_loop_benchmark(args)
         elif args.benchmark_type == 'simple-two-player':
             run_simple_two_player_benchmark(args)
+        elif args.benchmark_type == 'model-comparison':
+            run_model_comparison_benchmark(args)
         else:
             print(f"Unknown benchmark type: {args.benchmark_type}")
             sys.exit(1)
