@@ -1,0 +1,87 @@
+# Distributed AlphaZero Training Configuration
+# =============================================
+
+# MCTS Evaluator Settings
+mcts:
+  simulations: 100        # MCTS iterations per move
+  max_nodes: 400          # Maximum tree size
+  temperature: 1.0        # Exploration temperature
+  discount: -1.0          # -1 for two-player zero-sum games
+  persist_tree: true      # Keep tree between moves
+
+# Neural Network Training
+training:
+  batch_size: 128         # Samples per training step
+  learning_rate: 0.0003   # Adam learning rate
+  l2_reg_lambda: 0.0001   # L2 regularization
+  checkpoint_interval: 1000
+  max_checkpoints: 5
+
+# Self-Play Game Generation
+game:
+  batch_size: 16          # Parallel games per worker
+  max_episode_steps: 500  # Max moves per game
+  temperature_start: 1.0  # Initial exploration
+  temperature_end: 0.2    # Final exploitation
+
+# Redis Replay Buffer
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null
+  buffer_capacity: 100000   # Max experiences
+  episode_capacity: 5000    # Max episodes
+
+# Coordinator (Ray Head Node)
+coordinator:
+  heartbeat_timeout: 30.0   # Seconds before worker considered dead
+  heartbeat_interval: 10.0  # Seconds between heartbeats
+  weight_push_interval: 10  # Push weights every N training steps
+  ray_port: 10001
+  dashboard_port: 8265
+
+# Worker Settings
+worker:
+  worker_type: "game"       # 'game', 'training', 'evaluation'
+  prefer_gpu: true
+  auto_config: true         # Auto-configure based on device
+
+# Neural Network Architecture
+network:
+  hidden_dim: 256
+  num_blocks: 6
+  num_actions: 156          # Backgammon action space
+
+# Paths
+checkpoint_dir: "./checkpoints"
+log_dir: "./logs"
+
+# Device-Specific Overrides
+# Applied automatically based on detected hardware
+cuda_overrides:
+  mcts:
+    simulations: 200
+    max_nodes: 800
+  game:
+    batch_size: 64
+  training:
+    batch_size: 256
+
+metal_overrides:
+  mcts:
+    simulations: 100
+    max_nodes: 400
+  game:
+    batch_size: 16
+  training:
+    batch_size: 128
+
+cpu_overrides:
+  mcts:
+    simulations: 50
+    max_nodes: 200
+  game:
+    batch_size: 4
+  training:
+    batch_size: 64
