@@ -1,3 +1,22 @@
-#Install Turbo Zero from SAU16 GitHub Turbo Zero
+# Core dependencies
 pgx @ git+https://github.com/sile16/pgx.git@master
 turbozero @ git+https://github.com/sile16/turbozero.git@main
+
+# JAX ecosystem
+jax<0.5.1; sys_platform == "darwin"
+jaxlib<0.5.1; sys_platform == "darwin"
+chex
+flax
+
+# Distributed training
+ray
+redis
+
+# Utilities
+numpy
+tqdm
+pyyaml
+gnubg
+
+# Testing
+pytest
