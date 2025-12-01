@@ -53,9 +53,12 @@ MCTS_SIMULATIONS=100       # Reduced from 200 for faster JIT
 MCTS_MAX_NODES=400         # Reduced from 800
 LEARNING_RATE="3e-4"
 MIN_BUFFER_SIZE=500        # Reduced from 1000 for faster first train
-MIN_NEW_EXPERIENCES=256    # Min new experiences before pushing weight updates
-WEIGHT_PUSH_INTERVAL=10
 CHECKPOINT_INTERVAL=1000
+
+# Collection-gated training settings
+# Training triggers after GAMES_PER_BATCH new games, then runs STEPS_PER_GAME * new_games steps
+GAMES_PER_BATCH=10         # New games required to trigger training batch
+STEPS_PER_GAME=10          # Training steps per collected game (e.g., 10 games -> 100 steps)
 
 # =============================================================================
 # Setup
@@ -171,6 +174,7 @@ fi
 
 # =============================================================================
 # Start Training Worker (with GPU - uses 0.5 GPU to share with game worker)
+# Collection-gated: waits for new games before training
 # =============================================================================
 echo "[4/4] Starting training worker..."
 python -m distributed.cli.main training-worker \
@@ -179,8 +183,8 @@ python -m distributed.cli.main training-worker \
     --learning-rate "$LEARNING_RATE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --min-buffer-size "$MIN_BUFFER_SIZE" \
-    --min-new-experiences "$MIN_NEW_EXPERIENCES" \
-    --weight-push-interval "$WEIGHT_PUSH_INTERVAL" \
+    --games-per-batch "$GAMES_PER_BATCH" \
+    --steps-per-game "$STEPS_PER_GAME" \
     --checkpoint-interval "$CHECKPOINT_INTERVAL" \
     --redis-host "$REDIS_HOST" \
     --redis-port "$REDIS_PORT" \

@@ -189,14 +189,15 @@ def start_training_worker(args):
         'train_batch_size': args.batch_size,
         'learning_rate': args.learning_rate,
         'l2_reg_lambda': args.l2_reg,
-        'weight_push_interval': args.weight_push_interval,
         'checkpoint_interval': args.checkpoint_interval,
         'min_buffer_size': args.min_buffer_size,
-        'min_new_experiences': args.min_new_experiences,
         'checkpoint_dir': args.checkpoint_dir,
         'redis_host': args.redis_host,
         'redis_port': args.redis_port,
         'redis_password': args.redis_password,
+        # Collection-gated training settings
+        'games_per_training_batch': args.games_per_batch,
+        'steps_per_game': args.steps_per_game,
     }
 
     print(f"Starting training worker with config:")
@@ -485,10 +486,16 @@ def main():
         help='L2 regularization weight (default: 1e-4)'
     )
     train_parser.add_argument(
-        '--weight-push-interval',
+        '--games-per-batch',
         type=int,
         default=10,
-        help='Steps between weight pushes (default: 10)'
+        help='New games required to trigger a training batch (default: 10)'
+    )
+    train_parser.add_argument(
+        '--steps-per-game',
+        type=int,
+        default=10,
+        help='Training steps to run per collected game (default: 10)'
     )
     train_parser.add_argument(
         '--checkpoint-interval',
@@ -501,12 +508,6 @@ def main():
         type=int,
         default=1000,
         help='Minimum buffer size before training (default: 1000)'
-    )
-    train_parser.add_argument(
-        '--min-new-experiences',
-        type=int,
-        default=256,
-        help='Minimum new experiences before pushing weight updates (default: 256)'
     )
     train_parser.add_argument(
         '--checkpoint-dir',

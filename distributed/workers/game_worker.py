@@ -28,6 +28,7 @@ from ..serialization import (
     deserialize_weights,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
+from ..metrics import get_metrics, start_metrics_server
 
 
 @ray.remote
@@ -406,12 +407,28 @@ class GameWorker(BaseWorker):
         print(f"Worker {self.worker_id}: JIT compiling batched step function...")
         self._setup_batched_step()
 
+        # Start Prometheus metrics server
+        metrics_port = self.config.get('metrics_port', 9100)
+        start_metrics_server(metrics_port)
+        metrics = get_metrics()
+
+        # Set worker info
+        metrics.worker_info.labels(worker_id=self.worker_id).info({
+            'type': 'game',
+            'batch_size': str(self.batch_size),
+            'device': 'gpu' if jax.devices()[0].platform == 'gpu' else 'cpu',
+        })
+        metrics.worker_status.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(1)
+
         print(f"Worker {self.worker_id}: Starting game collection loop...")
 
         iteration = 0
         total_games = 0
         total_steps = 0
         start_time = time.time()
+        last_metrics_time = start_time
 
         while self.running:
             if num_iterations >= 0 and iteration >= num_iterations:
@@ -423,16 +440,41 @@ class GameWorker(BaseWorker):
             total_steps += self.batch_size
             iteration += 1
 
-            # Log progress periodically
+            # Update Prometheus metrics
+            if completed > 0:
+                metrics.games_total.labels(
+                    worker_id=self.worker_id, worker_type='game'
+                ).inc(completed)
+
+            metrics.steps_total.labels(worker_id=self.worker_id).inc(self.batch_size)
+
+            # Log progress and update rate metrics periodically
             if iteration % 100 == 0:
                 elapsed = time.time() - start_time
                 steps_per_sec = total_steps / max(elapsed, 0.001)
                 games_per_min = (total_games / max(elapsed, 0.001)) * 60
+
+                # Update rate gauges
+                metrics.collection_steps_per_second.labels(
+                    worker_id=self.worker_id
+                ).set(steps_per_sec)
+                metrics.games_per_minute.labels(
+                    worker_id=self.worker_id
+                ).set(games_per_min)
+                metrics.model_version.labels(
+                    worker_id=self.worker_id, worker_type='game'
+                ).set(self.current_model_version)
+
                 print(
                     f"Worker {self.worker_id}: "
                     f"iter={iteration}, games={total_games}, "
                     f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}"
                 )
+
+        # Mark worker as stopped
+        metrics.worker_status.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(0)
 
         # Cleanup
         self.buffer.close()

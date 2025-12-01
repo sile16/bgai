@@ -3,11 +3,18 @@
 This worker fetches batches of experiences from the Redis replay buffer
 and performs gradient updates on the neural network, pushing updated
 weights back to the coordinator.
+
+Training is gated on collection milestones:
+- Collection runs continuously, filling the buffer
+- Training triggers when N new games have been collected
+- Training runs until it has processed all available data
+- Weights are pushed after each training batch completes
 """
 
 import time
 from functools import partial
 from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +33,26 @@ from ..serialization import (
     batch_experiences_to_jax,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
+from ..metrics import get_metrics, start_metrics_server
+
+
+@dataclass
+class TrainingStats:
+    """Statistics for tracking training progress."""
+    total_steps: int = 0
+    total_batches_trained: int = 0  # Number of training batches (triggered by collection)
+    games_at_last_train: int = 0
+    experiences_at_last_train: int = 0
+    current_batch_steps: int = 0
+    current_batch_start_time: float = 0.0
+    last_batch_duration: float = 0.0
+    last_batch_steps: int = 0
+    cumulative_loss: float = 0.0
+    loss_count: int = 0
+
+    @property
+    def avg_loss(self) -> float:
+        return self.cumulative_loss / max(self.loss_count, 1)
 
 
 @ray.remote
@@ -56,10 +83,10 @@ class TrainingWorker(BaseWorker):
                 - train_batch_size: Batch size for training (default: 128)
                 - learning_rate: Optimizer learning rate (default: 3e-4)
                 - l2_reg_lambda: L2 regularization weight (default: 1e-4)
-                - weight_push_interval: Steps between weight pushes (default: 10)
+                - games_per_training_batch: New games to trigger training (default: 10)
+                - steps_per_game: Training steps per collected game (default: 10)
                 - checkpoint_interval: Steps between checkpoints (default: 1000)
                 - min_buffer_size: Minimum buffer size before training (default: 1000)
-                - min_new_experiences: Min new experiences before pushing weights (default: 256)
                 - redis_host: Redis server host (default: 'localhost')
                 - redis_port: Redis server port (default: 6379)
                 - checkpoint_dir: Directory for saving checkpoints (default: '/tmp/distributed_ckpts')
@@ -70,13 +97,15 @@ class TrainingWorker(BaseWorker):
         self.train_batch_size = self.config.get('train_batch_size', 128)
         self.learning_rate = self.config.get('learning_rate', 3e-4)
         self.l2_reg_lambda = self.config.get('l2_reg_lambda', 1e-4)
-        self.weight_push_interval = self.config.get('weight_push_interval', 10)
         self.checkpoint_interval = self.config.get('checkpoint_interval', 1000)
         self.min_buffer_size = self.config.get('min_buffer_size', 1000)
         self.checkpoint_dir = self.config.get('checkpoint_dir', '/tmp/distributed_ckpts')
-        # Minimum new experiences required before pushing new weights
-        # This prevents training repeatedly on the same small set of games
-        self.min_new_experiences_for_update = self.config.get('min_new_experiences', 256)
+
+        # Collection-gated training configuration
+        # Training triggers after this many new games collected
+        self.games_per_training_batch = self.config.get('games_per_training_batch', 10)
+        # Number of training steps to run per collected game
+        self.steps_per_game = self.config.get('steps_per_game', 10)
 
         # Initialize Redis buffer
         redis_host = self.config.get('redis_host', 'localhost')
@@ -100,7 +129,9 @@ class TrainingWorker(BaseWorker):
         # Training state
         self._total_steps = 0
         self._rng_key = jax.random.PRNGKey(int(time.time() * 1000) % (2**31))
-        self._last_update_buffer_size = 0  # Track buffer size at last weight push
+
+        # Collection-gated training stats
+        self._training_stats = TrainingStats()
 
     @property
     def worker_type(self) -> str:
@@ -325,11 +356,73 @@ class TrainingWorker(BaseWorker):
 
         return metrics
 
-    def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:
-        """Main training loop.
+    def _get_current_games_count(self) -> int:
+        """Get current number of completed games in buffer."""
+        return self.buffer.redis.llen(self.buffer.EPISODE_LIST)
+
+    def _run_training_batch(self, target_steps: int) -> Dict[str, float]:
+        """Run a batch of training steps.
 
         Args:
-            num_iterations: Number of training steps to run (-1 for infinite).
+            target_steps: Number of training steps to run.
+
+        Returns:
+            Dict with averaged metrics from this batch.
+        """
+        batch_start = time.time()
+        batch_metrics = []
+        steps_done = 0
+
+        self._training_stats.current_batch_start_time = batch_start
+        self._training_stats.current_batch_steps = 0
+
+        while steps_done < target_steps and self.running:
+            metrics = self._sample_and_train()
+
+            if metrics is None:
+                # Not enough valid experiences, wait briefly
+                time.sleep(0.1)
+                continue
+
+            batch_metrics.append(metrics)
+            steps_done += 1
+            self._training_stats.current_batch_steps = steps_done
+            self._training_stats.cumulative_loss += metrics.get('loss', 0)
+            self._training_stats.loss_count += 1
+
+            # Save checkpoint periodically
+            if self._total_steps % self.checkpoint_interval == 0:
+                self._save_checkpoint()
+
+        batch_duration = time.time() - batch_start
+
+        # Update stats
+        self._training_stats.last_batch_duration = batch_duration
+        self._training_stats.last_batch_steps = steps_done
+        self._training_stats.total_batches_trained += 1
+
+        # Compute averaged metrics
+        if batch_metrics:
+            avg_metrics = {
+                k: sum(m[k] for m in batch_metrics) / len(batch_metrics)
+                for k in batch_metrics[0].keys()
+            }
+            avg_metrics['batch_duration'] = batch_duration
+            avg_metrics['batch_steps'] = steps_done
+            avg_metrics['steps_per_sec'] = steps_done / max(batch_duration, 0.001)
+            return avg_metrics
+
+        return {'batch_duration': batch_duration, 'batch_steps': 0}
+
+    def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:
+        """Main training loop with collection-gated training.
+
+        Training is triggered when enough new games have been collected.
+        Collection continues while training runs, so training catches up
+        to the collection frontier.
+
+        Args:
+            num_iterations: Maximum training steps to run (-1 for infinite).
 
         Returns:
             Dict with results/statistics from the run.
@@ -340,73 +433,145 @@ class TrainingWorker(BaseWorker):
         self._setup_neural_network()
         self._initialize_train_state()
 
-        print(f"Worker {self.worker_id}: Starting training loop...")
+        # Start Prometheus metrics server
+        metrics_port = self.config.get('metrics_port', 9200)
+        start_metrics_server(metrics_port)
+        metrics = get_metrics()
+
+        # Set worker info
+        metrics.worker_info.labels(worker_id=self.worker_id).info({
+            'type': 'training',
+            'batch_size': str(self.train_batch_size),
+            'learning_rate': str(self.learning_rate),
+        })
+        metrics.worker_status.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(1)
+
+        print(f"Worker {self.worker_id}: Collection-gated training mode")
+        print(f"Worker {self.worker_id}: Will train {self.steps_per_game} steps "
+              f"for every {self.games_per_training_batch} games collected")
 
         start_time = time.time()
         last_log_time = start_time
-        accumulated_metrics = []
-        wait_logged = False
+
+        # Initialize tracking
+        self._training_stats.games_at_last_train = self._get_current_games_count()
+        self._training_stats.experiences_at_last_train = self.buffer.get_size()
 
         while self.running:
             if num_iterations >= 0 and self._total_steps >= num_iterations:
                 break
 
-            # Train step
-            metrics = self._sample_and_train()
-
-            if metrics is None:
-                # Buffer not ready, wait
-                if not wait_logged:
-                    buffer_size = self.buffer.get_size()
-                    print(
-                        f"Worker {self.worker_id}: Waiting for buffer "
-                        f"({buffer_size}/{self.min_buffer_size})..."
-                    )
-                    wait_logged = True
-                time.sleep(1.0)
+            # Check buffer minimum size
+            buffer_size = self.buffer.get_size()
+            if buffer_size < self.min_buffer_size:
+                print(
+                    f"Worker {self.worker_id}: Waiting for buffer "
+                    f"({buffer_size}/{self.min_buffer_size})..."
+                )
+                time.sleep(2.0)
                 continue
 
-            wait_logged = False
-            accumulated_metrics.append(metrics)
+            # Check for new games
+            current_games = self._get_current_games_count()
+            new_games = current_games - self._training_stats.games_at_last_train
 
-            # Push weights periodically, but only if enough new experiences
-            if self._total_steps % self.weight_push_interval == 0:
-                current_buffer_size = self.buffer.get_size()
-                new_experiences = current_buffer_size - self._last_update_buffer_size
+            if new_games < self.games_per_training_batch:
+                # Not enough new games, wait
+                time.sleep(1.0)
 
-                if new_experiences >= self.min_new_experiences_for_update:
-                    self._push_weights_to_coordinator()
-                    self._last_update_buffer_size = current_buffer_size
+                # Update games since last train metric
+                metrics.games_since_last_train.labels(
+                    worker_id=self.worker_id
+                ).set(new_games)
 
-            # Save checkpoint periodically
-            if self._total_steps % self.checkpoint_interval == 0:
-                self._save_checkpoint()
-
-            # Log metrics periodically
-            current_time = time.time()
-            if current_time - last_log_time >= 10.0:  # Log every 10 seconds
-                if accumulated_metrics:
-                    avg_metrics = {
-                        k: sum(m[k] for m in accumulated_metrics) / len(accumulated_metrics)
-                        for k in accumulated_metrics[0].keys()
-                    }
-                    elapsed = current_time - start_time
-                    steps_per_sec = self._total_steps / max(elapsed, 0.001)
-
+                # Periodic status log while waiting
+                current_time = time.time()
+                if current_time - last_log_time >= 30.0:
                     print(
-                        f"Worker {self.worker_id}: "
-                        f"step={self._total_steps}, "
-                        f"loss={avg_metrics.get('loss', 0):.4f}, "
-                        f"steps/s={steps_per_sec:.1f}, "
+                        f"Worker {self.worker_id}: Waiting for games "
+                        f"({new_games}/{self.games_per_training_batch} new games), "
+                        f"total_games={current_games}, "
+                        f"buffer={buffer_size}, "
                         f"version={self.current_model_version}"
                     )
-                    accumulated_metrics = []
-                last_log_time = current_time
+                    last_log_time = current_time
+                continue
+
+            # Calculate how many steps to train
+            # Train proportionally to games collected, catching up if behind
+            target_steps = new_games * self.steps_per_game
+
+            print(
+                f"Worker {self.worker_id}: Training batch triggered! "
+                f"{new_games} new games -> {target_steps} training steps"
+            )
+
+            # Run training batch
+            batch_metrics = self._run_training_batch(target_steps)
+
+            # Push updated weights
+            self._push_weights_to_coordinator()
+
+            # Update tracking
+            self._training_stats.games_at_last_train = current_games
+            self._training_stats.experiences_at_last_train = self.buffer.get_size()
+
+            # Log batch results
+            elapsed = time.time() - start_time
+            overall_steps_per_sec = self._total_steps / max(elapsed, 0.001)
+
+            # Update Prometheus metrics
+            metrics.training_steps_total.labels(
+                worker_id=self.worker_id
+            ).inc(batch_metrics.get('batch_steps', 0))
+            metrics.training_batches_total.labels(
+                worker_id=self.worker_id
+            ).inc()
+            metrics.training_loss.labels(
+                worker_id=self.worker_id, loss_type='total'
+            ).set(batch_metrics.get('loss', 0))
+            metrics.training_steps_per_second.labels(
+                worker_id=self.worker_id
+            ).set(overall_steps_per_sec)
+            metrics.training_batch_duration.labels(
+                worker_id=self.worker_id
+            ).observe(batch_metrics.get('batch_duration', 0))
+            metrics.training_batch_steps.labels(
+                worker_id=self.worker_id
+            ).observe(batch_metrics.get('batch_steps', 0))
+            metrics.buffer_size.set(buffer_size)
+            metrics.buffer_games.set(current_games)
+            metrics.model_version.labels(
+                worker_id=self.worker_id, worker_type='training'
+            ).set(self.current_model_version)
+            metrics.weight_updates_total.labels(
+                worker_id=self.worker_id
+            ).inc()
+
+            print(
+                f"Worker {self.worker_id}: Batch complete! "
+                f"step={self._total_steps}, "
+                f"loss={batch_metrics.get('loss', 0):.4f}, "
+                f"batch_steps={batch_metrics.get('batch_steps', 0)}, "
+                f"batch_time={batch_metrics.get('batch_duration', 0):.1f}s, "
+                f"batch_steps/s={batch_metrics.get('steps_per_sec', 0):.1f}, "
+                f"overall_steps/s={overall_steps_per_sec:.1f}, "
+                f"version={self.current_model_version}"
+            )
+
+            last_log_time = time.time()
 
         # Final checkpoint
         if self._total_steps > 0:
             self._push_weights_to_coordinator()
             self._save_checkpoint()
+
+        # Mark worker as stopped
+        metrics.worker_status.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(0)
 
         # Cleanup
         self.buffer.close()
@@ -414,22 +579,40 @@ class TrainingWorker(BaseWorker):
         return {
             'status': 'completed',
             'total_steps': self._total_steps,
+            'total_training_batches': self._training_stats.total_batches_trained,
             'final_model_version': self.current_model_version,
             'duration_seconds': time.time() - start_time,
+            'avg_loss': self._training_stats.avg_loss,
         }
 
     def get_training_stats(self) -> Dict[str, Any]:
         """Get current training statistics.
 
         Returns:
-            Dict with training stats.
+            Dict with training stats including collection-gated training info.
         """
         base_stats = self.get_stats()
+
+        # Current buffer state
+        buffer_size = self.buffer.get_size() if self.buffer else 0
+        current_games = self._get_current_games_count() if self.buffer else 0
+
         base_stats.update({
             'train_batch_size': self.train_batch_size,
             'learning_rate': self.learning_rate,
             'total_steps': self._total_steps,
-            'buffer_size': self.buffer.get_size() if self.buffer else 0,
+            'buffer_size': buffer_size,
+            'total_games': current_games,
+            # Collection-gated training stats
+            'games_per_training_batch': self.games_per_training_batch,
+            'steps_per_game': self.steps_per_game,
+            'total_training_batches': self._training_stats.total_batches_trained,
+            'games_at_last_train': self._training_stats.games_at_last_train,
+            'games_since_last_train': current_games - self._training_stats.games_at_last_train,
+            'current_batch_steps': self._training_stats.current_batch_steps,
+            'last_batch_duration': self._training_stats.last_batch_duration,
+            'last_batch_steps': self._training_stats.last_batch_steps,
+            'avg_loss': self._training_stats.avg_loss,
         })
         return base_stats
 
