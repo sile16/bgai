@@ -78,9 +78,11 @@ class GameWorker(BaseWorker):
         # Initialize Redis buffer
         redis_host = self.config.get('redis_host', 'localhost')
         redis_port = self.config.get('redis_port', 6379)
+        redis_password = self.config.get('redis_password', None)
         self.buffer = RedisReplayBuffer(
             host=redis_host,
             port=redis_port,
+            password=redis_password,
             worker_id=self.worker_id,
         )
 

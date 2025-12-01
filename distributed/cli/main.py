@@ -38,6 +38,7 @@ def start_coordinator(args):
     config = {
         'redis_host': args.redis_host,
         'redis_port': args.redis_port,
+        'redis_password': args.redis_password,
         'heartbeat_timeout': args.heartbeat_timeout,
         'heartbeat_interval': args.heartbeat_interval,
         'mcts_simulations': args.mcts_simulations,
@@ -97,6 +98,7 @@ def start_game_worker(args):
         'max_episode_steps': args.max_episode_steps,
         'redis_host': args.redis_host,
         'redis_port': args.redis_port,
+        'redis_password': args.redis_password,
     }
 
     print(f"Starting game worker with config:")
@@ -146,6 +148,7 @@ def start_training_worker(args):
         'checkpoint_dir': args.checkpoint_dir,
         'redis_host': args.redis_host,
         'redis_port': args.redis_port,
+        'redis_password': args.redis_password,
     }
 
     print(f"Starting training worker with config:")
@@ -246,6 +249,12 @@ def main():
         type=int,
         default=6379,
         help='Redis port (default: 6379)'
+    )
+    coord_parser.add_argument(
+        '--redis-password',
+        type=str,
+        default=None,
+        help='Redis password (default: None)'
     )
     coord_parser.add_argument(
         '--heartbeat-timeout',
@@ -353,6 +362,12 @@ def main():
         help='Redis port (default: 6379)'
     )
     game_parser.add_argument(
+        '--redis-password',
+        type=str,
+        default=None,
+        help='Redis password (default: None)'
+    )
+    game_parser.add_argument(
         '--num-iterations',
         type=int,
         default=-1,
@@ -432,6 +447,12 @@ def main():
         type=int,
         default=6379,
         help='Redis port (default: 6379)'
+    )
+    train_parser.add_argument(
+        '--redis-password',
+        type=str,
+        default=None,
+        help='Redis password (default: None)'
     )
     train_parser.add_argument(
         '--num-iterations',
