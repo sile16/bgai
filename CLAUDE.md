@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is a backgammon AI project based on Alpha Zero training methodology. The codebase implements:
 
 - **Core AI Components**: Located in `bgai/` with backgammon-specific environment handling and evaluators
+- **Distributed Training**: Ray-based multi-node training with Redis coordination in `distributed/`
 - **Benchmarking Suite**: Comprehensive performance testing tools in `benchmarks/` for MCTS and StochasticMCTS algorithms
 - **Training Notebooks**: Jupyter notebooks in `notebooks/` for experimental training runs
 
@@ -16,6 +17,7 @@ The project follows a modular design:
 
 - **Environment Integration**: Uses PGX backgammon environment with custom step functions that handle both deterministic and stochastic game states
 - **MCTS Evaluators**: Two main variants - standard MCTS and StochasticMCTS that adapts to the probabilistic nature of dice rolls
+- **Distributed System**: Ray actors for coordination, game workers, and training workers with Redis-backed replay buffer
 - **Benchmarking Framework**: Extensible base classes for performance testing with memory tracking, batch optimization, and profile management
 
 ## Dependencies
@@ -89,7 +91,46 @@ python benchmark.py game-env --discover --verbose
 ## Code Patterns
 
 - Use `jax.jit` for performance-critical functions
-- Vectorize operations with `jax.vmap` for batch processing  
+- Vectorize operations with `jax.vmap` for batch processing
 - Handle stochastic/deterministic branching with `jax.lax.cond`
 - Always call `jax.block_until_ready()` for accurate timing measurements
 - Use the common benchmark framework in `benchmark_common.py` for consistent testing
+
+## Distributed Training
+
+### Starting the Cluster
+
+```bash
+# Start Redis first
+redis-server --daemonize yes --requirepass bgai-password
+
+# Start head node with all services
+./scripts/start_all_head.sh
+
+# Check status
+./scripts/status.sh
+
+# Stop all
+./scripts/stop_all.sh
+```
+
+### Key Components
+
+- **Coordinator** (`distributed/coordinator/`): Manages worker registration and weight distribution
+- **Game Workers** (`distributed/workers/game_worker.py`): Generate self-play games with MCTS
+- **Training Workers** (`distributed/workers/training_worker.py`): Train neural network from replay buffer
+- **Redis Buffer** (`distributed/buffer/redis_buffer.py`): Stores experiences with FIFO eviction and surprise-weighted sampling
+
+### Metrics & Monitoring
+
+Workers expose Prometheus metrics on ports 9100 (game) and 9200 (training):
+- Dynamic discovery via Redis registration
+- Grafana dashboard at `tools/grafana_bgai_dashboard.json`
+- Key metrics: `bgai_training_loss`, `bgai_games_total`, `bgai_surprise_score_*`
+
+### Configuration
+
+Edit `scripts/start_all_head.sh` for training parameters:
+- `GAMES_PER_BATCH`: Games required to trigger training (default: 10)
+- `STEPS_PER_GAME`: Training steps per collected game (default: 10)
+- `SURPRISE_WEIGHT`: Blend of uniform vs surprise-weighted sampling (default: 0.5)
