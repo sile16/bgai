@@ -107,11 +107,12 @@ echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24
 # Start Ray head node
 # =============================================================================
 echo "[2/4] Starting Ray head node..."
+# Bind to 0.0.0.0 to accept connections from both Tailscale and LAN
 RAY_RUNTIME_ENV_CREATE_WORKING_DIR=1 ray start --head \
     --port="$RAY_PORT" \
     --ray-client-server-port="$RAY_CLIENT_PORT" \
     --dashboard-host=0.0.0.0 \
-    --node-ip-address="$HEAD_IP" \
+    --node-ip-address=0.0.0.0 \
     --num-cpus=16 \
     --num-gpus=1
 
