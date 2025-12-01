@@ -659,6 +659,48 @@ class RedisReplayBuffer:
         """Get number of experiences in buffer."""
         return self.redis.llen(self.EXPERIENCE_LIST)
 
+    def get_surprise_stats(self) -> Dict[str, Any]:
+        """Get statistics about surprise scores in the buffer.
+
+        Returns:
+            Dict with surprise score statistics.
+        """
+        # Get count of episodes with surprise scores
+        num_episodes = self.redis.zcard(self.SURPRISE_SORTED_SET)
+
+        if num_episodes == 0:
+            return {
+                'count': 0,
+                'max': 0.0,
+                'min': 0.0,
+                'mean': 0.0,
+            }
+
+        # Get top and bottom scores
+        top_scores = self.redis.zrevrange(
+            self.SURPRISE_SORTED_SET, 0, 0, withscores=True
+        )
+        bottom_scores = self.redis.zrange(
+            self.SURPRISE_SORTED_SET, 0, 0, withscores=True
+        )
+
+        max_score = top_scores[0][1] if top_scores else 0.0
+        min_score = bottom_scores[0][1] if bottom_scores else 0.0
+
+        # Sample to estimate mean (for efficiency, don't scan all)
+        sample_size = min(num_episodes, 100)
+        sample_scores = self.redis.zrevrange(
+            self.SURPRISE_SORTED_SET, 0, sample_size - 1, withscores=True
+        )
+        mean_score = sum(s[1] for s in sample_scores) / len(sample_scores) if sample_scores else 0.0
+
+        return {
+            'count': num_episodes,
+            'max': max_score,
+            'min': min_score,
+            'mean': mean_score,
+        }
+
     def is_ready_for_training(self, min_experiences: int = 1000) -> bool:
         """Check if buffer has enough experiences for training.
 

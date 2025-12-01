@@ -155,6 +155,41 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.buffer_episodes = Gauge(
+            'bgai_buffer_episodes',
+            'Current number of episodes in buffer',
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # Surprise Sampling Metrics
+        # =================================================================
+        self.surprise_score = Histogram(
+            'bgai_surprise_score',
+            'Distribution of episode surprise scores',
+            ['worker_id'],
+            buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0],
+            registry=self.registry,
+        )
+
+        self.surprise_score_max = Gauge(
+            'bgai_surprise_score_max',
+            'Maximum surprise score in buffer',
+            registry=self.registry,
+        )
+
+        self.surprise_score_mean = Gauge(
+            'bgai_surprise_score_mean',
+            'Mean surprise score in buffer',
+            registry=self.registry,
+        )
+
+        self.episodes_with_surprise = Gauge(
+            'bgai_episodes_with_surprise',
+            'Number of episodes with surprise scores',
+            registry=self.registry,
+        )
+
         # =================================================================
         # Model Metrics
         # =================================================================

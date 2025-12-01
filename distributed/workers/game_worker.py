@@ -392,6 +392,10 @@ class GameWorker(BaseWorker):
             actual_outcome = float(final_rewards[0])
             surprise_score = abs(mean_value_pred - actual_outcome)
 
+        # Record surprise score metric
+        metrics = get_metrics()
+        metrics.surprise_score.labels(worker_id=self.worker_id).observe(surprise_score)
+
         # Add to Redis buffer
         try:
             self.buffer.add_episode(

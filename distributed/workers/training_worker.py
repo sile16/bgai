@@ -558,6 +558,17 @@ class TrainingWorker(BaseWorker):
             ).observe(batch_metrics.get('batch_steps', 0))
             metrics.buffer_size.set(buffer_size)
             metrics.buffer_games.set(current_games)
+
+            # Record surprise score metrics
+            try:
+                surprise_stats = self.buffer.get_surprise_stats()
+                metrics.episodes_with_surprise.set(surprise_stats['count'])
+                metrics.surprise_score_max.set(surprise_stats['max'])
+                metrics.surprise_score_mean.set(surprise_stats['mean'])
+                metrics.buffer_episodes.set(self.buffer.redis.llen(self.buffer.EPISODE_LIST))
+            except Exception:
+                pass  # Don't fail training if metrics collection fails
+
             metrics.model_version.labels(
                 worker_id=self.worker_id, worker_type='training'
             ).set(self.current_model_version)

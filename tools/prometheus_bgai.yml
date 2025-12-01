@@ -1,0 +1,27 @@
+# BGAI Prometheus config with custom worker targets
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+# Scrape from each Ray node
+- job_name: 'ray'
+  file_sd_configs:
+  - files:
+    - '/tmp/ray/prom_metrics_service_discovery.json'
+
+# Scrape BGAI game workers
+- job_name: 'bgai_game_workers'
+  static_configs:
+  - targets:
+    - 'localhost:9100'
+    labels:
+      worker_type: 'game'
+
+# Scrape BGAI training workers
+- job_name: 'bgai_training_workers'
+  static_configs:
+  - targets:
+    - 'localhost:9200'
+    labels:
+      worker_type: 'training'

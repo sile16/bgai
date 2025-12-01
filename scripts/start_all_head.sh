@@ -120,12 +120,24 @@ echo "       Workers connect to: ray://$HEAD_IP:$RAY_CLIENT_PORT"
 sleep 3
 
 # =============================================================================
-# Start Prometheus metrics
+# Start Prometheus metrics with custom BGAI config
 # =============================================================================
 echo "       Starting Prometheus metrics..."
-ray metrics launch-prometheus > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
-PROMETHEUS_PID=$!
-echo "       Prometheus PID: $PROMETHEUS_PID"
+PROMETHEUS_BIN="$PROJECT_DIR/prometheus-3.7.3.linux-amd64/prometheus"
+PROMETHEUS_CONFIG="$PROJECT_DIR/tools/prometheus_bgai.yml"
+if [[ -f "$PROMETHEUS_BIN" ]]; then
+    "$PROMETHEUS_BIN" \
+        --config.file "$PROMETHEUS_CONFIG" \
+        --web.enable-lifecycle \
+        > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
+    PROMETHEUS_PID=$!
+    echo "       Prometheus PID: $PROMETHEUS_PID (custom BGAI config)"
+else
+    # Fallback to Ray's built-in Prometheus
+    ray metrics launch-prometheus > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
+    PROMETHEUS_PID=$!
+    echo "       Prometheus PID: $PROMETHEUS_PID (Ray default)"
+fi
 echo "       Prometheus UI: http://$HEAD_IP:9090"
 sleep 2
 
