@@ -202,11 +202,12 @@ def deserialize_rewards(data: bytes) -> np.ndarray:
 # Batch Conversion
 # =============================================================================
 
-def batch_experiences_to_jax(experiences: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Convert a list of experiences to batched JAX arrays.
+def batch_experiences_to_jax(experiences: List[Dict[str, Any]]):
+    """Convert a list of experiences to a batched BaseExperience dataclass.
 
     Takes experiences retrieved from Redis and stacks them into
-    batched arrays suitable for training.
+    batched arrays suitable for training. Returns a BaseExperience
+    dataclass compatible with az_default_loss_fn.
 
     Args:
         experiences: List of experience dicts, each containing:
@@ -215,7 +216,7 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]) -> Dict[str, Any
             - 'model_version': int
 
     Returns:
-        Dict with batched JAX arrays:
+        BaseExperience dataclass with batched JAX arrays:
             - observation_nn: (batch_size, obs_dim)
             - policy_weights: (batch_size, num_actions)
             - policy_mask: (batch_size, num_actions)
@@ -227,6 +228,8 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]) -> Dict[str, Any
         >>> batch = batch_experiences_to_jax(raw_batch)
         >>> loss = train_step(params, batch)
     """
+    from core.memory.replay_memory import BaseExperience
+
     jax, jnp = _get_jax()
 
     # Deserialize all experiences
@@ -248,7 +251,7 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]) -> Dict[str, Any
         deserialized.append(exp_data)
 
     if not deserialized:
-        return {}
+        return None
 
     # Stack into batched arrays
     batch = {}
@@ -270,7 +273,14 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]) -> Dict[str, Any
                 # Keep as-is for other types
                 batch[key] = values
 
-    return batch
+    # Convert dict to BaseExperience dataclass
+    return BaseExperience(
+        observation_nn=batch.get('observation_nn'),
+        policy_weights=batch.get('policy_weights'),
+        policy_mask=batch.get('policy_mask'),
+        cur_player_id=batch.get('cur_player_id'),
+        reward=batch.get('reward'),
+    )
 
 
 def experiences_to_numpy_batch(experiences: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:

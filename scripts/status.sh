@@ -25,5 +25,10 @@ else
 fi
 RAY_CLIENT_PORT="10001"
 
+echo "=== Ray Cluster Status ==="
+ray status 2>/dev/null || echo "Ray cluster not running"
+
+echo ""
+echo "=== Coordinator Status ==="
 python -m distributed.cli.main status \
-    --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT"
+    --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" 2>/dev/null || echo "Coordinator not running (start with ./scripts/start_all_head.sh)"

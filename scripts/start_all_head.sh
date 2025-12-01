@@ -45,12 +45,15 @@ CHECKPOINT_DIR="$PROJECT_DIR/checkpoints"
 LOG_DIR="$PROJECT_DIR/logs"
 
 # GPU/CUDA settings (head node)
-GAME_BATCH_SIZE=64
-TRAIN_BATCH_SIZE=256
-MCTS_SIMULATIONS=200
-MCTS_MAX_NODES=800
+# Note: Smaller values for faster JIT compilation on first run
+# Increase after confirming system works
+GAME_BATCH_SIZE=16         # Reduced from 64 for faster JIT
+TRAIN_BATCH_SIZE=128       # Reduced from 256
+MCTS_SIMULATIONS=100       # Reduced from 200 for faster JIT
+MCTS_MAX_NODES=400         # Reduced from 800
 LEARNING_RATE="3e-4"
-MIN_BUFFER_SIZE=1000
+MIN_BUFFER_SIZE=500        # Reduced from 1000 for faster first train
+MIN_NEW_EXPERIENCES=256    # Min new experiences before pushing weight updates
 WEIGHT_PUSH_INTERVAL=10
 CHECKPOINT_INTERVAL=1000
 
@@ -80,10 +83,24 @@ pkill -f "distributed.cli.main" 2>/dev/null || true
 sleep 2
 
 # =============================================================================
+# Set PYTHONPATH so Ray workers can find the distributed module
+# =============================================================================
+export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
+echo "PYTHONPATH set to: $PYTHONPATH"
+
+# =============================================================================
+# JAX memory configuration - prevent first process from grabbing all GPU RAM
+# Based on benchmarks: game worker ~2GB, training worker ~2GB
+# Set to 25% each (6GB) for headroom (24GB total GPU)
+# =============================================================================
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25
+echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24GB GPU)"
+
+# =============================================================================
 # Start Ray head node
 # =============================================================================
 echo "[2/4] Starting Ray head node..."
-ray start --head \
+RAY_RUNTIME_ENV_CREATE_WORKING_DIR=1 ray start --head \
     --port="$RAY_PORT" \
     --ray-client-server-port="$RAY_CLIENT_PORT" \
     --dashboard-host=0.0.0.0 \
@@ -94,6 +111,37 @@ ray start --head \
 echo "       Ray dashboard: http://$HEAD_IP:8265"
 echo "       Workers connect to: ray://$HEAD_IP:$RAY_CLIENT_PORT"
 sleep 3
+
+# =============================================================================
+# Start Prometheus metrics
+# =============================================================================
+echo "       Starting Prometheus metrics..."
+ray metrics launch-prometheus > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
+PROMETHEUS_PID=$!
+echo "       Prometheus PID: $PROMETHEUS_PID"
+echo "       Prometheus UI: http://$HEAD_IP:9090"
+sleep 2
+
+# =============================================================================
+# Start Grafana for Ray dashboard metrics visualization
+# =============================================================================
+GRAFANA_DIR="$PROJECT_DIR/tools/grafana-11.3.0"
+if [[ -d "$GRAFANA_DIR" ]]; then
+    echo "       Starting Grafana..."
+    pkill -f "grafana-server" 2>/dev/null || true
+    sleep 1
+    "$GRAFANA_DIR/bin/grafana-server" \
+        --homepath="$GRAFANA_DIR" \
+        --config="$GRAFANA_DIR/conf/custom.ini" \
+        > "$LOG_DIR/grafana_$TIMESTAMP.log" 2>&1 &
+    GRAFANA_PID=$!
+    echo "       Grafana PID: $GRAFANA_PID"
+    echo "       Grafana UI: http://$HEAD_IP:3000"
+    sleep 2
+else
+    echo "       WARNING: Grafana not installed. Run ./scripts/setup_grafana.sh first"
+    GRAFANA_PID=""
+fi
 
 # =============================================================================
 # Start Coordinator
@@ -122,7 +170,7 @@ if ! kill -0 $COORD_PID 2>/dev/null; then
 fi
 
 # =============================================================================
-# Start Training Worker
+# Start Training Worker (with GPU - uses 0.5 GPU to share with game worker)
 # =============================================================================
 echo "[4/4] Starting training worker..."
 python -m distributed.cli.main training-worker \
@@ -131,18 +179,20 @@ python -m distributed.cli.main training-worker \
     --learning-rate "$LEARNING_RATE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --min-buffer-size "$MIN_BUFFER_SIZE" \
+    --min-new-experiences "$MIN_NEW_EXPERIENCES" \
     --weight-push-interval "$WEIGHT_PUSH_INTERVAL" \
     --checkpoint-interval "$CHECKPOINT_INTERVAL" \
     --redis-host "$REDIS_HOST" \
     --redis-port "$REDIS_PORT" \
     --redis-password "$REDIS_PASSWORD" \
+    --num-gpus 0.5 \
     > "$LOG_DIR/training_$TIMESTAMP.log" 2>&1 &
 TRAIN_PID=$!
 echo "       Training worker PID: $TRAIN_PID"
 echo "       Log: $LOG_DIR/training_$TIMESTAMP.log"
 
 # =============================================================================
-# Start GPU Game Worker
+# Start GPU Game Worker (uses 0.5 GPU to share with training worker)
 # =============================================================================
 echo "[5/5] Starting GPU game worker..."
 python -m distributed.cli.main game-worker \
@@ -155,6 +205,7 @@ python -m distributed.cli.main game-worker \
     --redis-host "$REDIS_HOST" \
     --redis-port "$REDIS_PORT" \
     --redis-password "$REDIS_PASSWORD" \
+    --num-gpus 0.5 \
     > "$LOG_DIR/game_gpu_$TIMESTAMP.log" 2>&1 &
 GAME_PID=$!
 echo "       Game worker PID: $GAME_PID"
@@ -169,11 +220,24 @@ echo "  All services started!"
 echo "=============================================="
 echo ""
 echo "PIDs:"
+echo "  Prometheus:      $PROMETHEUS_PID"
+if [[ -n "$GRAFANA_PID" ]]; then
+echo "  Grafana:         $GRAFANA_PID"
+fi
 echo "  Coordinator:     $COORD_PID"
 echo "  Training worker: $TRAIN_PID"
 echo "  Game worker:     $GAME_PID"
 echo ""
+echo "Dashboards:"
+echo "  Ray Dashboard:   http://$HEAD_IP:8265"
+echo "  Grafana:         http://$HEAD_IP:3000"
+echo "  Prometheus:      http://$HEAD_IP:9090"
+echo ""
 echo "Logs:"
+echo "  tail -f $LOG_DIR/prometheus_$TIMESTAMP.log"
+if [[ -n "$GRAFANA_PID" ]]; then
+echo "  tail -f $LOG_DIR/grafana_$TIMESTAMP.log"
+fi
 echo "  tail -f $LOG_DIR/coordinator_$TIMESTAMP.log"
 echo "  tail -f $LOG_DIR/training_$TIMESTAMP.log"
 echo "  tail -f $LOG_DIR/game_gpu_$TIMESTAMP.log"

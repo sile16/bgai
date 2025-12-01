@@ -257,6 +257,30 @@ class GameWorker(BaseWorker):
             self._nn_params = deserialize_weights(weights_bytes)
             print(f"Worker {self.worker_id}: Updated to model version {new_version}")
 
+    def _setup_batched_step(self) -> None:
+        """Create and cache the JIT-compiled batched step function."""
+        # Create step function partial
+        step_fn = partial(
+            step_env_and_evaluator,
+            evaluator=self._evaluator,
+            env_step_fn=self._env_step_fn,
+            env_init_fn=self._env_init_fn,
+            max_steps=self.max_episode_steps
+        )
+
+        # Vectorize the step function
+        def batched_step(env_state, metadata, eval_state, params, key):
+            return step_fn(
+                key=key,
+                env_state=env_state,
+                env_state_metadata=metadata,
+                eval_state=eval_state,
+                params=params
+            )
+
+        # JIT compile the vmapped function (compiled once, reused every step)
+        self._jitted_batched_step = jax.jit(jax.vmap(batched_step, in_axes=(0, 0, 0, None, 0)))
+
     def _collect_step(self) -> int:
         """Run one step of game collection across all batch environments.
 
@@ -270,31 +294,10 @@ class GameWorker(BaseWorker):
         metadatas = state['metadatas']
         eval_states = state['eval_states']
 
-        # Create step function
-        step_fn = partial(
-            step_env_and_evaluator,
-            evaluator=self._evaluator,
-            env_step_fn=self._env_step_fn,
-            env_init_fn=self._env_init_fn,
-            max_steps=self.max_episode_steps
-        )
-
         # Step all environments
         step_keys = jax.random.split(key, self.batch_size)
 
-        # Vectorize the step function
-        def batched_step(env_state, metadata, eval_state, params, key):
-            return step_fn(
-                key=key,
-                env_state=env_state,
-                env_state_metadata=metadata,
-                eval_state=eval_state,
-                params=params
-            )
-
-        vmapped_step = jax.vmap(batched_step, in_axes=(0, 0, 0, None, 0))
-
-        eval_outputs, new_env_states, new_metadatas, terminateds, truncateds, rewards_batch = vmapped_step(
+        eval_outputs, new_env_states, new_metadatas, terminateds, truncateds, rewards_batch = self._jitted_batched_step(
             env_states,
             metadatas,
             eval_states,
@@ -398,6 +401,10 @@ class GameWorker(BaseWorker):
         # Initialize collection state
         print(f"Worker {self.worker_id}: Initializing {self.batch_size} parallel environments...")
         self._collection_state = self._init_collection_state()
+
+        # Setup and JIT compile the batched step function (compile once)
+        print(f"Worker {self.worker_id}: JIT compiling batched step function...")
+        self._setup_batched_step()
 
         print(f"Worker {self.worker_id}: Starting game collection loop...")
 

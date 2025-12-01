@@ -25,14 +25,21 @@ import ray
 
 def start_coordinator(args):
     """Start the coordinator (head node)."""
+    import os
     from ..coordinator.head_node import create_coordinator
+
+    # Get project directory for runtime environment
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # Initialize Ray (head node)
     print("Initializing Ray head node...")
+    print(f"Project directory: {project_dir}")
     ray.init(
         address=args.ray_address if args.ray_address else None,
         dashboard_host='0.0.0.0' if args.dashboard else None,
         include_dashboard=args.dashboard,
+        namespace="bgai",  # Use consistent namespace for all workers
+        runtime_env={"env_vars": {"PYTHONPATH": project_dir}},
     )
 
     config = {
@@ -77,12 +84,27 @@ def start_coordinator(args):
 
 def start_game_worker(args):
     """Start a game generation worker."""
+    import os
     from ..workers.game_worker import GameWorker
     from ..coordinator.head_node import get_coordinator
 
+    # Get project directory for runtime environment
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     # Connect to Ray cluster
     print(f"Connecting to Ray cluster at {args.coordinator_address}...")
-    ray.init(address=args.coordinator_address)
+    ray.init(
+        address=args.coordinator_address,
+        namespace="bgai",
+        runtime_env={
+            "env_vars": {
+                "PYTHONPATH": project_dir,
+                # Limit JAX memory to allow multiple workers on same GPU
+                # Based on benchmarks: ~2GB per worker, 25% = 6GB headroom on 24GB GPU
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
+            }
+        },
+    )
 
     # Get coordinator handle
     coordinator = get_coordinator('coordinator')
@@ -105,11 +127,21 @@ def start_game_worker(args):
     for k, v in config.items():
         print(f"  {k}: {v}")
 
-    worker = GameWorker.remote(
-        coordinator_handle=coordinator,
-        worker_id=args.worker_id,
-        config=config,
-    )
+    # Create worker with optional GPU resources
+    num_gpus = args.num_gpus if hasattr(args, 'num_gpus') else 0
+    if num_gpus > 0:
+        print(f"Requesting {num_gpus} GPU(s)")
+        worker = GameWorker.options(num_gpus=num_gpus).remote(
+            coordinator_handle=coordinator,
+            worker_id=args.worker_id,
+            config=config,
+        )
+    else:
+        worker = GameWorker.remote(
+            coordinator_handle=coordinator,
+            worker_id=args.worker_id,
+            config=config,
+        )
 
     # Run worker
     print("\nGame worker running. Press Ctrl+C to stop.")
@@ -125,12 +157,27 @@ def start_game_worker(args):
 
 def start_training_worker(args):
     """Start a training worker."""
+    import os
     from ..workers.training_worker import TrainingWorker
     from ..coordinator.head_node import get_coordinator
 
+    # Get project directory for runtime environment
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     # Connect to Ray cluster
     print(f"Connecting to Ray cluster at {args.coordinator_address}...")
-    ray.init(address=args.coordinator_address)
+    ray.init(
+        address=args.coordinator_address,
+        namespace="bgai",
+        runtime_env={
+            "env_vars": {
+                "PYTHONPATH": project_dir,
+                # Limit JAX memory to allow multiple workers on same GPU
+                # Based on benchmarks: ~2GB per worker, 25% = 6GB headroom on 24GB GPU
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
+            }
+        },
+    )
 
     # Get coordinator handle
     coordinator = get_coordinator('coordinator')
@@ -145,6 +192,7 @@ def start_training_worker(args):
         'weight_push_interval': args.weight_push_interval,
         'checkpoint_interval': args.checkpoint_interval,
         'min_buffer_size': args.min_buffer_size,
+        'min_new_experiences': args.min_new_experiences,
         'checkpoint_dir': args.checkpoint_dir,
         'redis_host': args.redis_host,
         'redis_port': args.redis_port,
@@ -155,11 +203,21 @@ def start_training_worker(args):
     for k, v in config.items():
         print(f"  {k}: {v}")
 
-    worker = TrainingWorker.remote(
-        coordinator_handle=coordinator,
-        worker_id=args.worker_id,
-        config=config,
-    )
+    # Create worker with optional GPU resources
+    num_gpus = args.num_gpus if hasattr(args, 'num_gpus') else 0
+    if num_gpus > 0:
+        print(f"Requesting {num_gpus} GPU(s)")
+        worker = TrainingWorker.options(num_gpus=num_gpus).remote(
+            coordinator_handle=coordinator,
+            worker_id=args.worker_id,
+            config=config,
+        )
+    else:
+        worker = TrainingWorker.remote(
+            coordinator_handle=coordinator,
+            worker_id=args.worker_id,
+            config=config,
+        )
 
     # Run worker
     print("\nTraining worker running. Press Ctrl+C to stop.")
@@ -175,10 +233,18 @@ def start_training_worker(args):
 
 def show_status(args):
     """Show cluster status."""
+    import os
     from ..coordinator.head_node import get_coordinator
 
+    # Get project directory for runtime environment
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     # Connect to Ray cluster
-    ray.init(address=args.coordinator_address)
+    ray.init(
+        address=args.coordinator_address,
+        namespace="bgai",
+        runtime_env={"env_vars": {"PYTHONPATH": project_dir}},
+    )
 
     coordinator = get_coordinator('coordinator')
     if coordinator is None:
@@ -373,6 +439,12 @@ def main():
         default=-1,
         help='Number of iterations (-1 for infinite, default: -1)'
     )
+    game_parser.add_argument(
+        '--num-gpus',
+        type=float,
+        default=0,
+        help='Number of GPUs to request (0 for CPU only, default: 0)'
+    )
     game_parser.set_defaults(func=start_game_worker)
 
     # =========================================================================
@@ -431,6 +503,12 @@ def main():
         help='Minimum buffer size before training (default: 1000)'
     )
     train_parser.add_argument(
+        '--min-new-experiences',
+        type=int,
+        default=256,
+        help='Minimum new experiences before pushing weight updates (default: 256)'
+    )
+    train_parser.add_argument(
         '--checkpoint-dir',
         type=str,
         default='/tmp/distributed_ckpts',
@@ -459,6 +537,12 @@ def main():
         type=int,
         default=-1,
         help='Number of training steps (-1 for infinite, default: -1)'
+    )
+    train_parser.add_argument(
+        '--num-gpus',
+        type=float,
+        default=0,
+        help='Number of GPUs to request (0 for CPU only, default: 0)'
     )
     train_parser.set_defaults(func=start_training_worker)
 

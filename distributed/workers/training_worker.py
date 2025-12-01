@@ -59,6 +59,7 @@ class TrainingWorker(BaseWorker):
                 - weight_push_interval: Steps between weight pushes (default: 10)
                 - checkpoint_interval: Steps between checkpoints (default: 1000)
                 - min_buffer_size: Minimum buffer size before training (default: 1000)
+                - min_new_experiences: Min new experiences before pushing weights (default: 256)
                 - redis_host: Redis server host (default: 'localhost')
                 - redis_port: Redis server port (default: 6379)
                 - checkpoint_dir: Directory for saving checkpoints (default: '/tmp/distributed_ckpts')
@@ -73,6 +74,9 @@ class TrainingWorker(BaseWorker):
         self.checkpoint_interval = self.config.get('checkpoint_interval', 1000)
         self.min_buffer_size = self.config.get('min_buffer_size', 1000)
         self.checkpoint_dir = self.config.get('checkpoint_dir', '/tmp/distributed_ckpts')
+        # Minimum new experiences required before pushing new weights
+        # This prevents training repeatedly on the same small set of games
+        self.min_new_experiences_for_update = self.config.get('min_new_experiences', 256)
 
         # Initialize Redis buffer
         redis_host = self.config.get('redis_host', 'localhost')
@@ -96,6 +100,7 @@ class TrainingWorker(BaseWorker):
         # Training state
         self._total_steps = 0
         self._rng_key = jax.random.PRNGKey(int(time.time() * 1000) % (2**31))
+        self._last_update_buffer_size = 0  # Track buffer size at last weight push
 
     @property
     def worker_type(self) -> str:
@@ -294,11 +299,16 @@ class TrainingWorker(BaseWorker):
         if len(batch_data) < self.train_batch_size:
             return None
 
-        # Convert to JAX arrays
+        # Convert to JAX arrays (returns BaseExperience dataclass)
         try:
             jax_batch = batch_experiences_to_jax(batch_data)
+            if jax_batch is None:
+                print(f"Worker {self.worker_id}: Empty batch after conversion")
+                return None
         except Exception as e:
             print(f"Worker {self.worker_id}: Error converting batch: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
         # Perform training step
@@ -359,9 +369,14 @@ class TrainingWorker(BaseWorker):
             wait_logged = False
             accumulated_metrics.append(metrics)
 
-            # Push weights periodically
+            # Push weights periodically, but only if enough new experiences
             if self._total_steps % self.weight_push_interval == 0:
-                self._push_weights_to_coordinator()
+                current_buffer_size = self.buffer.get_size()
+                new_experiences = current_buffer_size - self._last_update_buffer_size
+
+                if new_experiences >= self.min_new_experiences_for_update:
+                    self._push_weights_to_coordinator()
+                    self._last_update_buffer_size = current_buffer_size
 
             # Save checkpoint periodically
             if self._total_steps % self.checkpoint_interval == 0:
