@@ -163,6 +163,27 @@ else
 fi
 
 # =============================================================================
+# Start Prometheus discovery updater (watches Redis for worker registrations)
+# =============================================================================
+echo "       Starting Prometheus discovery updater..."
+python -c "
+from distributed.metrics import start_discovery_updater
+updater = start_discovery_updater(
+    redis_host='$REDIS_HOST',
+    redis_port=$REDIS_PORT,
+    redis_password='$REDIS_PASSWORD',
+    update_interval=15,
+)
+print('Discovery updater started')
+import time
+while True:
+    time.sleep(3600)  # Keep running
+" > "$LOG_DIR/discovery_updater_$TIMESTAMP.log" 2>&1 &
+DISCOVERY_PID=$!
+echo "       Discovery updater PID: $DISCOVERY_PID"
+sleep 2
+
+# =============================================================================
 # Start Coordinator
 # =============================================================================
 echo "[3/4] Starting coordinator..."

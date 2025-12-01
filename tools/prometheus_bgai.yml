@@ -1,27 +1,23 @@
-# BGAI Prometheus config with custom worker targets
+# BGAI Prometheus config with dynamic worker discovery
+#
+# Workers register their metrics endpoints in Redis.
+# A background thread on the head node writes the discovery file.
+# Prometheus auto-reloads targets every 15 seconds.
+
 global:
   scrape_interval: 10s
   evaluation_interval: 10s
 
 scrape_configs:
-# Scrape from each Ray node
+# Scrape from each Ray node (Ray's own metrics)
 - job_name: 'ray'
   file_sd_configs:
   - files:
     - '/tmp/ray/prom_metrics_service_discovery.json'
 
-# Scrape BGAI game workers
-- job_name: 'bgai_game_workers'
-  static_configs:
-  - targets:
-    - 'localhost:9100'
-    labels:
-      worker_type: 'game'
-
-# Scrape BGAI training workers
-- job_name: 'bgai_training_workers'
-  static_configs:
-  - targets:
-    - 'localhost:9200'
-    labels:
-      worker_type: 'training'
+# Scrape BGAI workers (dynamically discovered via Redis)
+- job_name: 'bgai_workers'
+  file_sd_configs:
+  - files:
+    - '/tmp/bgai_prometheus_targets.json'
+    refresh_interval: 15s

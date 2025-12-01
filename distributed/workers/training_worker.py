@@ -33,7 +33,7 @@ from ..serialization import (
     batch_experiences_to_jax,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
 
 
 @dataclass
@@ -453,6 +453,15 @@ class TrainingWorker(BaseWorker):
         start_metrics_server(metrics_port)
         metrics = get_metrics()
 
+        # Register metrics endpoint for dynamic discovery
+        register_metrics_endpoint(
+            self.buffer.redis,
+            worker_id=self.worker_id,
+            worker_type='training',
+            port=metrics_port,
+            ttl_seconds=60,
+        )
+
         # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
             'type': 'training',
@@ -575,6 +584,15 @@ class TrainingWorker(BaseWorker):
             metrics.weight_updates_total.labels(
                 worker_id=self.worker_id
             ).inc()
+
+            # Refresh metrics registration heartbeat
+            register_metrics_endpoint(
+                self.buffer.redis,
+                worker_id=self.worker_id,
+                worker_type='training',
+                port=metrics_port,
+                ttl_seconds=60,
+            )
 
             print(
                 f"Worker {self.worker_id}: Batch complete! "

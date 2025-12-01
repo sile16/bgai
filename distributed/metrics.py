@@ -4,11 +4,15 @@ This module provides Prometheus metrics that can be scraped by the existing
 Prometheus instance started by Ray. Metrics are exposed on a separate HTTP
 port from each worker.
 
+Workers register their metrics endpoints in Redis for dynamic discovery.
+A background thread updates the Prometheus service discovery file.
+
 Usage:
     from distributed.metrics import get_metrics, start_metrics_server
 
     # Start metrics server on worker initialization
-    start_metrics_server(port=9100)
+    start_metrics_server(port=9100, worker_id='gpu-0', worker_type='game',
+                         redis_host='localhost', redis_port=6379)
 
     # Get metrics instance and record values
     metrics = get_metrics()
@@ -16,8 +20,12 @@ Usage:
     metrics.training_loss.set(0.5)
 """
 
+import json
+import os
+import socket
 import threading
-from typing import Optional
+import time
+from typing import Optional, Dict, Any
 from prometheus_client import (
     Counter,
     Gauge,
@@ -283,3 +291,235 @@ def reset_metrics():
     with _metrics_lock:
         _metrics = None
         _server_started = False
+
+
+# =============================================================================
+# Worker Registration for Dynamic Discovery
+# =============================================================================
+
+WORKER_REGISTRY_KEY = "bgai:metrics:workers"
+DISCOVERY_FILE_PATH = "/tmp/bgai_prometheus_targets.json"
+
+
+def _get_worker_ip() -> str:
+    """Get the IP address of this worker."""
+    try:
+        # Try to get the IP that would be used to connect to an external host
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def register_metrics_endpoint(
+    redis_client,
+    worker_id: str,
+    worker_type: str,
+    port: int,
+    ttl_seconds: int = 60,
+) -> None:
+    """Register this worker's metrics endpoint in Redis.
+
+    Args:
+        redis_client: Redis client instance.
+        worker_id: Unique worker identifier.
+        worker_type: Type of worker ('game' or 'training').
+        port: Port the metrics server is listening on.
+        ttl_seconds: Time-to-live for the registration (for cleanup).
+    """
+    ip = _get_worker_ip()
+    endpoint = f"{ip}:{port}"
+
+    worker_info = {
+        "worker_id": worker_id,
+        "worker_type": worker_type,
+        "endpoint": endpoint,
+        "registered_at": time.time(),
+    }
+
+    # Store in Redis hash with TTL-based cleanup
+    redis_client.hset(WORKER_REGISTRY_KEY, worker_id, json.dumps(worker_info))
+
+    # Also set an expiring key for heartbeat tracking
+    redis_client.setex(f"bgai:metrics:heartbeat:{worker_id}", ttl_seconds, endpoint)
+
+
+def unregister_metrics_endpoint(redis_client, worker_id: str) -> None:
+    """Unregister this worker's metrics endpoint from Redis.
+
+    Args:
+        redis_client: Redis client instance.
+        worker_id: Unique worker identifier.
+    """
+    redis_client.hdel(WORKER_REGISTRY_KEY, worker_id)
+    redis_client.delete(f"bgai:metrics:heartbeat:{worker_id}")
+
+
+def get_registered_workers(redis_client) -> Dict[str, Any]:
+    """Get all registered worker metrics endpoints.
+
+    Args:
+        redis_client: Redis client instance.
+
+    Returns:
+        Dict mapping worker_id to worker info.
+    """
+    workers = {}
+    all_workers = redis_client.hgetall(WORKER_REGISTRY_KEY)
+
+    for worker_id_bytes, info_bytes in all_workers.items():
+        worker_id = worker_id_bytes.decode() if isinstance(worker_id_bytes, bytes) else worker_id_bytes
+        info_str = info_bytes.decode() if isinstance(info_bytes, bytes) else info_bytes
+
+        try:
+            info = json.loads(info_str)
+
+            # Check if heartbeat is still alive
+            heartbeat_key = f"bgai:metrics:heartbeat:{worker_id}"
+            if redis_client.exists(heartbeat_key):
+                workers[worker_id] = info
+            else:
+                # Cleanup stale registration
+                redis_client.hdel(WORKER_REGISTRY_KEY, worker_id)
+        except json.JSONDecodeError:
+            continue
+
+    return workers
+
+
+def update_prometheus_discovery_file(
+    redis_client,
+    output_path: str = DISCOVERY_FILE_PATH,
+) -> int:
+    """Update the Prometheus file-based service discovery file.
+
+    Args:
+        redis_client: Redis client instance.
+        output_path: Path to write the discovery JSON file.
+
+    Returns:
+        Number of workers in the discovery file.
+    """
+    workers = get_registered_workers(redis_client)
+
+    # Group by worker type
+    game_targets = []
+    training_targets = []
+
+    for worker_id, info in workers.items():
+        endpoint = info.get("endpoint", "")
+        worker_type = info.get("worker_type", "unknown")
+
+        if worker_type == "game":
+            game_targets.append(endpoint)
+        elif worker_type == "training":
+            training_targets.append(endpoint)
+
+    # Build Prometheus file_sd_configs format
+    discovery = []
+
+    if game_targets:
+        discovery.append({
+            "labels": {"job": "bgai_game_workers", "worker_type": "game"},
+            "targets": game_targets,
+        })
+
+    if training_targets:
+        discovery.append({
+            "labels": {"job": "bgai_training_workers", "worker_type": "training"},
+            "targets": training_targets,
+        })
+
+    # Write atomically
+    temp_path = output_path + ".tmp"
+    with open(temp_path, "w") as f:
+        json.dump(discovery, f, indent=2)
+    os.replace(temp_path, output_path)
+
+    return len(workers)
+
+
+class MetricsDiscoveryUpdater(threading.Thread):
+    """Background thread that periodically updates the Prometheus discovery file."""
+
+    def __init__(
+        self,
+        redis_host: str,
+        redis_port: int,
+        redis_password: Optional[str] = None,
+        update_interval: int = 15,
+        output_path: str = DISCOVERY_FILE_PATH,
+    ):
+        super().__init__(daemon=True)
+        self.redis_host = redis_host
+        self.redis_port = redis_port
+        self.redis_password = redis_password
+        self.update_interval = update_interval
+        self.output_path = output_path
+        self._stop_event = threading.Event()
+        self._redis = None
+
+    def _get_redis(self):
+        if self._redis is None:
+            import redis
+            self._redis = redis.Redis(
+                host=self.redis_host,
+                port=self.redis_port,
+                password=self.redis_password,
+            )
+        return self._redis
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                redis_client = self._get_redis()
+                num_workers = update_prometheus_discovery_file(
+                    redis_client, self.output_path
+                )
+                # print(f"Updated Prometheus discovery: {num_workers} workers")
+            except Exception as e:
+                print(f"Error updating Prometheus discovery: {e}")
+
+            self._stop_event.wait(self.update_interval)
+
+    def stop(self):
+        self._stop_event.set()
+
+
+# Global discovery updater instance
+_discovery_updater: Optional[MetricsDiscoveryUpdater] = None
+
+
+def start_discovery_updater(
+    redis_host: str,
+    redis_port: int,
+    redis_password: Optional[str] = None,
+    update_interval: int = 15,
+) -> MetricsDiscoveryUpdater:
+    """Start the background discovery updater thread.
+
+    Args:
+        redis_host: Redis server hostname.
+        redis_port: Redis server port.
+        redis_password: Optional Redis password.
+        update_interval: Seconds between updates.
+
+    Returns:
+        The MetricsDiscoveryUpdater thread.
+    """
+    global _discovery_updater
+
+    if _discovery_updater is not None and _discovery_updater.is_alive():
+        return _discovery_updater
+
+    _discovery_updater = MetricsDiscoveryUpdater(
+        redis_host=redis_host,
+        redis_port=redis_port,
+        redis_password=redis_password,
+        update_interval=update_interval,
+    )
+    _discovery_updater.start()
+    return _discovery_updater

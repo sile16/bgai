@@ -28,7 +28,7 @@ from ..serialization import (
     deserialize_weights,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
 
 
 @ray.remote
@@ -441,6 +441,15 @@ class GameWorker(BaseWorker):
         start_metrics_server(metrics_port)
         metrics = get_metrics()
 
+        # Register metrics endpoint for dynamic discovery
+        register_metrics_endpoint(
+            self.buffer.redis,
+            worker_id=self.worker_id,
+            worker_type='game',
+            port=metrics_port,
+            ttl_seconds=60,
+        )
+
         # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
             'type': 'game',
@@ -493,6 +502,15 @@ class GameWorker(BaseWorker):
                 metrics.model_version.labels(
                     worker_id=self.worker_id, worker_type='game'
                 ).set(self.current_model_version)
+
+                # Refresh metrics registration heartbeat
+                register_metrics_endpoint(
+                    self.buffer.redis,
+                    worker_id=self.worker_id,
+                    worker_type='game',
+                    port=metrics_port,
+                    ttl_seconds=60,
+                )
 
                 print(
                     f"Worker {self.worker_id}: "
