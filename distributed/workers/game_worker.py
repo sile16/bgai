@@ -248,6 +248,7 @@ class GameWorker(BaseWorker):
             'metadatas': metadatas,
             'eval_states': eval_states,
             'episode_experiences': [[] for _ in range(self.batch_size)],
+            'episode_value_preds': [[] for _ in range(self.batch_size)],  # Track value predictions
             'episode_ids': [None] * self.batch_size,
         }
 
@@ -325,6 +326,12 @@ class GameWorker(BaseWorker):
                 }
                 state['episode_experiences'][i].append(exp)
 
+                # Track value prediction for surprise scoring
+                # Get value from evaluator state (MCTS root value)
+                eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
+                value_pred = float(self._evaluator.get_value(eval_state_i))
+                state['episode_value_preds'][i].append(value_pred)
+
             terminated = terminateds[i]
             truncated = truncateds[i]
 
@@ -334,12 +341,14 @@ class GameWorker(BaseWorker):
                     self._send_episode_to_buffer(
                         state['episode_experiences'][i],
                         rewards_batch[i],
+                        state['episode_value_preds'][i],
                     )
                     completed_episodes += 1
                     self.stats.games_generated += 1
 
                 # Reset episode state
                 state['episode_experiences'][i] = []
+                state['episode_value_preds'][i] = []
                 state['episode_ids'][i] = None
 
         # Update collection state
@@ -353,12 +362,14 @@ class GameWorker(BaseWorker):
         self,
         experiences: list,
         final_rewards: jnp.ndarray,
+        value_predictions: list,
     ) -> None:
         """Send a completed episode to the Redis buffer.
 
         Args:
             experiences: List of experience dicts from the episode.
             final_rewards: Final rewards for each player.
+            value_predictions: List of value predictions from each step.
         """
         # Serialize experiences
         serialized_exps = []
@@ -369,6 +380,18 @@ class GameWorker(BaseWorker):
         # Serialize rewards
         rewards_bytes = serialize_rewards(final_rewards)
 
+        # Compute surprise score: |mean_value_pred - actual_outcome|
+        # Value predictions are from current player's perspective
+        # Final reward is [player0_reward, player1_reward]
+        surprise_score = 0.0
+        if value_predictions:
+            # Average value prediction across episode
+            mean_value_pred = sum(value_predictions) / len(value_predictions)
+            # For simplicity, use player 0's final reward as the outcome
+            # Value predictions are typically in [-1, 1] range
+            actual_outcome = float(final_rewards[0])
+            surprise_score = abs(mean_value_pred - actual_outcome)
+
         # Add to Redis buffer
         try:
             self.buffer.add_episode(
@@ -378,7 +401,9 @@ class GameWorker(BaseWorker):
                 metadata={
                     'worker_id': self.worker_id,
                     'episode_length': len(experiences),
-                }
+                    'mean_value_pred': float(sum(value_predictions) / len(value_predictions)) if value_predictions else 0.0,
+                },
+                surprise_score=surprise_score,
             )
         except Exception as e:
             print(f"Worker {self.worker_id}: Error sending episode to buffer: {e}")

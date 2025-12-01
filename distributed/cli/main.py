@@ -198,6 +198,8 @@ def start_training_worker(args):
         # Collection-gated training settings
         'games_per_training_batch': args.games_per_batch,
         'steps_per_game': args.steps_per_game,
+        # Surprise-weighted sampling
+        'surprise_weight': args.surprise_weight,
     }
 
     print(f"Starting training worker with config:")
@@ -496,6 +498,12 @@ def main():
         type=int,
         default=10,
         help='Training steps to run per collected game (default: 10)'
+    )
+    train_parser.add_argument(
+        '--surprise-weight',
+        type=float,
+        default=0.5,
+        help='Weight for surprise-based sampling (0=uniform, 1=fully surprise-weighted, default: 0.5)'
     )
     train_parser.add_argument(
         '--checkpoint-interval',

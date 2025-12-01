@@ -60,6 +60,10 @@ CHECKPOINT_INTERVAL=1000
 GAMES_PER_BATCH=10         # New games required to trigger training batch
 STEPS_PER_GAME=10          # Training steps per collected game (e.g., 10 games -> 100 steps)
 
+# Surprise-weighted sampling (0=uniform, 1=fully surprise-weighted)
+# Higher weights focus training on games where model predictions differed from actual outcome
+SURPRISE_WEIGHT=0.5
+
 # =============================================================================
 # Setup
 # =============================================================================
@@ -185,6 +189,7 @@ python -m distributed.cli.main training-worker \
     --min-buffer-size "$MIN_BUFFER_SIZE" \
     --games-per-batch "$GAMES_PER_BATCH" \
     --steps-per-game "$STEPS_PER_GAME" \
+    --surprise-weight "$SURPRISE_WEIGHT" \
     --checkpoint-interval "$CHECKPOINT_INTERVAL" \
     --redis-host "$REDIS_HOST" \
     --redis-port "$REDIS_PORT" \

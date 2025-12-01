@@ -107,6 +107,10 @@ class TrainingWorker(BaseWorker):
         # Number of training steps to run per collected game
         self.steps_per_game = self.config.get('steps_per_game', 10)
 
+        # Surprise-weighted sampling configuration
+        # 0 = uniform sampling, 1 = fully surprise-weighted
+        self.surprise_weight = self.config.get('surprise_weight', 0.5)
+
         # Initialize Redis buffer
         redis_host = self.config.get('redis_host', 'localhost')
         redis_port = self.config.get('redis_port', 6379)
@@ -320,12 +324,23 @@ class TrainingWorker(BaseWorker):
         if buffer_size < self.min_buffer_size:
             return None
 
-        # Sample batch from Redis
-        batch_data = self.buffer.sample_batch(
-            self.train_batch_size,
-            min_model_version=max(0, self.current_model_version - 10),  # Allow slightly old experiences
-            require_rewards=True,
-        )
+        # Sample batch from Redis with surprise-weighted sampling
+        min_version = max(0, self.current_model_version - 10)  # Allow slightly old experiences
+
+        if self.surprise_weight > 0:
+            # Use surprise-weighted sampling
+            batch_data = self.buffer.sample_batch_surprise_weighted(
+                self.train_batch_size,
+                surprise_weight=self.surprise_weight,
+                min_model_version=min_version,
+            )
+        else:
+            # Uniform sampling
+            batch_data = self.buffer.sample_batch(
+                self.train_batch_size,
+                min_model_version=min_version,
+                require_rewards=True,
+            )
 
         if len(batch_data) < self.train_batch_size:
             return None

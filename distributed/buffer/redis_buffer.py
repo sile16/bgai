@@ -29,6 +29,7 @@ class BufferStats:
     oldest_timestamp: Optional[float]
     newest_timestamp: Optional[float]
     experiences_with_rewards_pct: float
+    avg_surprise_score: Optional[float] = None
 
 
 class RedisReplayBuffer:
@@ -52,6 +53,7 @@ class RedisReplayBuffer:
     EXPERIENCE_LIST = "bgai:buffer:experiences"
     EPISODE_LIST = "bgai:buffer:episodes"
     METADATA_KEY = "bgai:buffer:metadata"
+    SURPRISE_SORTED_SET = "bgai:buffer:surprise"  # Sorted set for surprise-weighted sampling
 
     def __init__(
         self,
@@ -161,6 +163,7 @@ class RedisReplayBuffer:
         final_rewards: bytes,
         model_version: int,
         metadata: Optional[Dict[str, Any]] = None,
+        surprise_score: Optional[float] = None,
     ) -> str:
         """Add a complete episode with all experiences.
 
@@ -171,6 +174,9 @@ class RedisReplayBuffer:
             final_rewards: Serialized final rewards for the episode.
             model_version: Model version used for this episode.
             metadata: Optional episode metadata (game_length, winner, etc.)
+            surprise_score: Optional surprise score for prioritized sampling.
+                Higher scores indicate more "surprising" games where the outcome
+                differed significantly from value predictions.
 
         Returns:
             Episode ID.
@@ -178,7 +184,7 @@ class RedisReplayBuffer:
         Example:
             >>> exp_list = [serialize_experience(e) for e in episode_exps]
             >>> rewards = serialize_rewards(jnp.array([1.0, -1.0]))
-            >>> episode_id = buffer.add_episode(exp_list, rewards, model_version=5)
+            >>> episode_id = buffer.add_episode(exp_list, rewards, model_version=5, surprise_score=0.8)
         """
         episode_id = self._generate_id()
         timestamp = time.time()
@@ -209,6 +215,8 @@ class RedisReplayBuffer:
             b'model_version': str(model_version).encode(),
             b'timestamp': str(timestamp).encode(),
         }
+        if surprise_score is not None:
+            episode_data[b'surprise_score'] = str(surprise_score).encode()
         if metadata:
             import msgpack
             episode_data[b'metadata'] = msgpack.packb(metadata)
@@ -216,10 +224,17 @@ class RedisReplayBuffer:
         pipe.hset(episode_key, mapping=episode_data)
         pipe.lpush(self.EPISODE_LIST, episode_id.encode())
 
+        # Add to surprise sorted set for weighted sampling
+        # Use surprise_score as the score (higher = more interesting)
+        # Add small random jitter to break ties
+        score = (surprise_score or 0.0) + np.random.uniform(0, 0.001)
+        pipe.zadd(self.SURPRISE_SORTED_SET, {episode_id: score})
+
         pipe.execute()
 
-        # Enforce capacity
+        # Enforce capacity (both experiences and episodes)
         self._enforce_capacity()
+        self._enforce_episode_capacity()
 
         return episode_id
 
@@ -399,6 +414,110 @@ class RedisReplayBuffer:
 
         return batch
 
+    def sample_batch_surprise_weighted(
+        self,
+        batch_size: int,
+        surprise_weight: float = 0.5,
+        min_model_version: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Sample a batch with surprise-weighted episode selection.
+
+        Episodes with higher surprise scores (where outcome differed from
+        predictions) are sampled more frequently.
+
+        Args:
+            batch_size: Number of experiences to sample.
+            surprise_weight: Weight for surprise-based sampling (0-1).
+                0 = uniform sampling, 1 = fully surprise-weighted.
+            min_model_version: Only sample from this version or newer.
+
+        Returns:
+            List of experience dicts.
+        """
+        # Get episodes with high surprise scores
+        # ZREVRANGE returns highest scores first
+        num_episodes_to_consider = min(100, self.redis.zcard(self.SURPRISE_SORTED_SET))
+        if num_episodes_to_consider == 0:
+            return self.sample_batch(batch_size, min_model_version)
+
+        # Get top surprising episodes
+        high_surprise_episodes = self.redis.zrevrange(
+            self.SURPRISE_SORTED_SET, 0, num_episodes_to_consider - 1, withscores=True
+        )
+
+        if not high_surprise_episodes:
+            return self.sample_batch(batch_size, min_model_version)
+
+        # Filter by model version and build weighted list
+        valid_episodes = []
+        weights = []
+        for ep_id_bytes, score in high_surprise_episodes:
+            ep_id = ep_id_bytes.decode() if isinstance(ep_id_bytes, bytes) else ep_id_bytes
+            episode_key = f"{self.EPISODE_KEY}{ep_id}"
+
+            model_ver_bytes = self.redis.hget(episode_key, b'model_version')
+            if model_ver_bytes:
+                model_ver = int(model_ver_bytes)
+                if model_ver >= min_model_version:
+                    valid_episodes.append(ep_id)
+                    # Blend uniform and surprise-weighted
+                    # Higher score = more likely to sample
+                    blended_weight = (1 - surprise_weight) + surprise_weight * (score + 0.1)
+                    weights.append(blended_weight)
+
+        if not valid_episodes:
+            return self.sample_batch(batch_size, min_model_version)
+
+        # Normalize weights
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+
+        # Sample episodes weighted by surprise
+        num_episodes = min(len(valid_episodes), batch_size // 10 + 1)  # Sample from multiple episodes
+        sampled_episode_indices = np.random.choice(
+            len(valid_episodes), size=num_episodes, replace=True, p=weights
+        )
+        sampled_episodes = [valid_episodes[i] for i in sampled_episode_indices]
+
+        # Get experiences from sampled episodes
+        all_exp_ids = []
+        for ep_id in sampled_episodes:
+            # Get experience count for this episode
+            episode_key = f"{self.EPISODE_KEY}{ep_id}"
+            num_exp_bytes = self.redis.hget(episode_key, b'num_experiences')
+            if num_exp_bytes:
+                num_exp = int(num_exp_bytes)
+                # Add all experience IDs from this episode
+                for i in range(num_exp):
+                    all_exp_ids.append(f"{ep_id}:{i}")
+
+        if not all_exp_ids:
+            return self.sample_batch(batch_size, min_model_version)
+
+        # Sample experiences from the collected episode experiences
+        if len(all_exp_ids) <= batch_size:
+            sampled_ids = all_exp_ids
+        else:
+            sampled_ids = list(np.random.choice(all_exp_ids, size=batch_size, replace=False))
+
+        # Fetch experience data
+        batch = []
+        pipe = self.redis.pipeline()
+        for exp_id in sampled_ids:
+            pipe.hgetall(f"{self.EXPERIENCE_KEY}{exp_id}")
+
+        results = pipe.execute()
+
+        for result in results:
+            if result and result.get(b'data'):
+                batch.append({
+                    'data': result.get(b'data', b''),
+                    'model_version': int(result.get(b'model_version', b'0')),
+                    'final_rewards': result.get(b'final_rewards', b''),
+                })
+
+        return batch
+
     # =========================================================================
     # Capacity Management
     # =========================================================================
@@ -419,6 +538,41 @@ class RedisReplayBuffer:
                     exp_id = exp_id_bytes.decode() if isinstance(exp_id_bytes, bytes) else exp_id_bytes
                     pipe.delete(f"{self.EXPERIENCE_KEY}{exp_id}")
             pipe.execute()
+
+    def _enforce_episode_capacity(self) -> None:
+        """Remove old episodes when episode capacity is exceeded (FIFO)."""
+        current_episodes = self.redis.llen(self.EPISODE_LIST)
+
+        if current_episodes > self.episode_capacity:
+            num_to_remove = current_episodes - self.episode_capacity
+
+            for _ in range(num_to_remove):
+                # Pop oldest episode from the end
+                episode_id_bytes = self.redis.rpop(self.EPISODE_LIST)
+                if episode_id_bytes:
+                    episode_id = episode_id_bytes.decode() if isinstance(episode_id_bytes, bytes) else episode_id_bytes
+                    self._delete_episode(episode_id)
+
+    def _delete_episode(self, episode_id: str) -> None:
+        """Delete an episode and all its experiences."""
+        pipe = self.redis.pipeline()
+
+        # Delete episode metadata
+        pipe.delete(f"{self.EPISODE_KEY}{episode_id}")
+
+        # Remove from surprise sorted set
+        pipe.zrem(self.SURPRISE_SORTED_SET, episode_id)
+
+        # Find and delete all experiences for this episode
+        pattern = f"{self.EXPERIENCE_KEY}{episode_id}:*"
+        exp_keys = list(self.redis.scan_iter(match=pattern, count=1000))
+        for key in exp_keys:
+            pipe.delete(key)
+            # Also remove from experience list
+            exp_id = key.decode().replace(self.EXPERIENCE_KEY, "")
+            pipe.lrem(self.EXPERIENCE_LIST, 0, exp_id.encode())
+
+        pipe.execute()
 
     def trim_old_experiences(self, max_age_seconds: float) -> int:
         """Remove experiences older than max_age_seconds.
