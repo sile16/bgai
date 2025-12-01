@@ -251,7 +251,7 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]):
         deserialized.append(exp_data)
 
     if not deserialized:
-        return None
+        return {}
 
     # Stack into batched arrays
     batch = {}
