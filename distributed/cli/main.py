@@ -234,6 +234,85 @@ def start_training_worker(args):
     ray.shutdown()
 
 
+def start_eval_worker(args):
+    """Start an evaluation worker."""
+    import os
+    from ..workers.eval_worker import EvalWorker
+    from ..coordinator.head_node import get_coordinator
+
+    # Get project directory for runtime environment
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    # Connect to Ray cluster
+    print(f"Connecting to Ray cluster at {args.coordinator_address}...")
+    ray.init(
+        address=args.coordinator_address,
+        namespace="bgai",
+        runtime_env={
+            "env_vars": {
+                "PYTHONPATH": project_dir,
+                # Limit JAX memory to allow multiple workers on same GPU
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
+            }
+        },
+    )
+
+    # Get coordinator handle
+    coordinator = get_coordinator('coordinator')
+    if coordinator is None:
+        print("ERROR: Could not find coordinator. Make sure it's running.")
+        sys.exit(1)
+
+    # Parse eval types
+    eval_types = None
+    if args.eval_types:
+        eval_types = [t.strip() for t in args.eval_types.split(',')]
+
+    config = {
+        'eval_games': args.eval_games,
+        'batch_size': args.batch_size,
+        'num_simulations': args.mcts_simulations,
+        'max_nodes': args.mcts_max_nodes,
+        'eval_interval': args.eval_interval,
+        'eval_types': eval_types,
+        'redis_host': args.redis_host,
+        'redis_port': args.redis_port,
+        'redis_password': args.redis_password,
+    }
+
+    print(f"Starting evaluation worker with config:")
+    for k, v in config.items():
+        if v is not None:
+            print(f"  {k}: {v}")
+
+    # Create worker with optional GPU resources
+    num_gpus = args.num_gpus if hasattr(args, 'num_gpus') else 0
+    if num_gpus > 0:
+        print(f"Requesting {num_gpus} GPU(s)")
+        worker = EvalWorker.options(num_gpus=num_gpus).remote(
+            coordinator_handle=coordinator,
+            worker_id=args.worker_id,
+            config=config,
+        )
+    else:
+        worker = EvalWorker.remote(
+            coordinator_handle=coordinator,
+            worker_id=args.worker_id,
+            config=config,
+        )
+
+    # Run worker
+    print("\nEvaluation worker running. Press Ctrl+C to stop.")
+    try:
+        result = ray.get(worker.run.remote(num_iterations=args.num_iterations))
+        print(f"Worker finished: {result}")
+    except KeyboardInterrupt:
+        print("\nStopping worker...")
+        ray.get(worker.stop.remote())
+
+    ray.shutdown()
+
+
 def show_status(args):
     """Show cluster status."""
     import os
@@ -554,6 +633,93 @@ def main():
         help='Number of GPUs to request (0 for CPU only, default: 0)'
     )
     train_parser.set_defaults(func=start_training_worker)
+
+    # =========================================================================
+    # Evaluation worker command
+    # =========================================================================
+    eval_parser = subparsers.add_parser(
+        'eval-worker',
+        help='Start an evaluation worker'
+    )
+    eval_parser.add_argument(
+        '--coordinator-address',
+        type=str,
+        required=True,
+        help='Ray cluster address (e.g., ray://host:10001)'
+    )
+    eval_parser.add_argument(
+        '--worker-id',
+        type=str,
+        default=None,
+        help='Worker ID (auto-generated if not provided)'
+    )
+    eval_parser.add_argument(
+        '--eval-games',
+        type=int,
+        default=100,
+        help='Number of games per evaluation (default: 100)'
+    )
+    eval_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=16,
+        help='Number of parallel games (default: 16)'
+    )
+    eval_parser.add_argument(
+        '--mcts-simulations',
+        type=int,
+        default=200,
+        help='MCTS simulations per move for evaluation (default: 200)'
+    )
+    eval_parser.add_argument(
+        '--mcts-max-nodes',
+        type=int,
+        default=800,
+        help='Maximum MCTS tree nodes (default: 800)'
+    )
+    eval_parser.add_argument(
+        '--eval-interval',
+        type=int,
+        default=300,
+        help='Seconds between evaluation checks (default: 300)'
+    )
+    eval_parser.add_argument(
+        '--eval-types',
+        type=str,
+        default=None,
+        help='Comma-separated list of eval types: gnubg,random,self_play (default: all)'
+    )
+    eval_parser.add_argument(
+        '--redis-host',
+        type=str,
+        default='localhost',
+        help='Redis host (default: localhost)'
+    )
+    eval_parser.add_argument(
+        '--redis-port',
+        type=int,
+        default=6379,
+        help='Redis port (default: 6379)'
+    )
+    eval_parser.add_argument(
+        '--redis-password',
+        type=str,
+        default=None,
+        help='Redis password (default: None)'
+    )
+    eval_parser.add_argument(
+        '--num-iterations',
+        type=int,
+        default=-1,
+        help='Number of evaluation runs (-1 for infinite, default: -1)'
+    )
+    eval_parser.add_argument(
+        '--num-gpus',
+        type=float,
+        default=0,
+        help='Number of GPUs to request (0 for CPU only, default: 0)'
+    )
+    eval_parser.set_defaults(func=start_eval_worker)
 
     # =========================================================================
     # Status command

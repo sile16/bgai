@@ -48,6 +48,7 @@ LOG_DIR="$PROJECT_DIR/logs"
 # Evaluation settings
 EVAL_GAMES=100          # Games per evaluation round
 EVAL_INTERVAL=300       # Seconds between evaluations
+EVAL_TYPES="${EVAL_TYPES:-gnubg,random,self_play}"  # Comma-separated eval types
 
 # =============================================================================
 # Auto-detect platform and set appropriate parameters
@@ -139,6 +140,7 @@ echo "Batch size:    $BATCH_SIZE"
 echo "MCTS sims:     $MCTS_SIMULATIONS"
 echo "Eval games:    $EVAL_GAMES"
 echo "Eval interval: ${EVAL_INTERVAL}s"
+echo "Eval types:    $EVAL_TYPES"
 echo "Head node:     $HEAD_IP:$RAY_CLIENT_PORT"
 echo "Log file:      $LOG_FILE"
 echo ""
@@ -160,6 +162,7 @@ if python -m distributed.cli.main --help 2>&1 | grep -q "eval-worker"; then
         --mcts-max-nodes "$MCTS_MAX_NODES" \
         --eval-games "$EVAL_GAMES" \
         --eval-interval "$EVAL_INTERVAL" \
+        --eval-types "$EVAL_TYPES" \
         --redis-host "$REDIS_HOST" \
         --redis-port "$REDIS_PORT" \
         --redis-password "$REDIS_PASSWORD" \

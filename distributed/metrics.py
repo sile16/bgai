@@ -216,6 +216,59 @@ class BGAIMetrics:
         )
 
         # =================================================================
+        # Evaluation Metrics
+        # =================================================================
+        self.eval_games_total = Counter(
+            'bgai_eval_games_total',
+            'Total evaluation games played',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_win_rate = Gauge(
+            'bgai_eval_win_rate',
+            'Win rate from most recent evaluation',
+            ['eval_type', 'model_version'],
+            registry=self.registry,
+        )
+
+        self.eval_wins = Counter(
+            'bgai_eval_wins_total',
+            'Total evaluation wins',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_losses = Counter(
+            'bgai_eval_losses_total',
+            'Total evaluation losses',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_duration = Histogram(
+            'bgai_eval_duration_seconds',
+            'Duration of evaluation runs',
+            ['worker_id', 'eval_type'],
+            buckets=[10, 30, 60, 120, 300, 600, 1200, 1800],
+            registry=self.registry,
+        )
+
+        self.eval_avg_game_length = Gauge(
+            'bgai_eval_avg_game_length',
+            'Average game length in most recent evaluation',
+            ['eval_type', 'model_version'],
+            registry=self.registry,
+        )
+
+        self.eval_runs_total = Counter(
+            'bgai_eval_runs_total',
+            'Total evaluation runs completed',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        # =================================================================
         # Worker Info
         # =================================================================
         self.worker_info = Info(
