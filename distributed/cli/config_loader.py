@@ -4,9 +4,64 @@ Loads configuration from YAML file and applies device-specific overrides.
 """
 
 import os
+import socket
 from pathlib import Path
 from typing import Dict, Any, Optional
 import yaml
+
+
+def is_host_reachable(host: str, port: int = 6379, timeout: float = 1.0) -> bool:
+    """Check if a host:port is reachable.
+
+    Args:
+        host: Hostname or IP address.
+        port: Port number to check.
+        timeout: Connection timeout in seconds.
+
+    Returns:
+        True if reachable, False otherwise.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except (socket.error, socket.timeout):
+        return False
+
+
+def detect_redis_host(config: Dict[str, Any]) -> str:
+    """Auto-detect the reachable Redis host.
+
+    Tries Tailscale IP first (ray.head_ip), falls back to local IP (ray.head_ip_local),
+    then finally to redis.host config.
+
+    Args:
+        config: Full configuration dictionary.
+
+    Returns:
+        Reachable Redis host IP/hostname.
+    """
+    ray = config.get('ray', {})
+    redis = config.get('redis', {})
+    redis_port = redis.get('port', 6379)
+
+    # Get candidate IPs
+    tailscale_ip = ray.get('head_ip')
+    local_ip = ray.get('head_ip_local')
+    config_host = redis.get('host', 'localhost')
+
+    # Try Tailscale IP first (VPN)
+    if tailscale_ip and is_host_reachable(tailscale_ip, redis_port):
+        return tailscale_ip
+
+    # Try local LAN IP
+    if local_ip and is_host_reachable(local_ip, redis_port):
+        return local_ip
+
+    # Fall back to config host
+    return config_host
 
 
 def find_config_file() -> Optional[Path]:
@@ -130,7 +185,7 @@ def get_coordinator_config(config: Dict[str, Any]) -> Dict[str, Any]:
     coord = config.get('coordinator', {})
 
     return {
-        'redis_host': redis.get('host', 'localhost'),
+        'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
         'heartbeat_timeout': coord.get('heartbeat_timeout', 30.0),
@@ -180,7 +235,7 @@ def get_game_worker_config(
         'max_nodes': mcts.get('max_nodes', 400),
         'temperature': mcts.get('temperature', 1.0),
         'max_episode_steps': game.get('max_episode_steps', 500),
-        'redis_host': redis.get('host', 'localhost'),
+        'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
     }
@@ -221,7 +276,7 @@ def get_training_worker_config(
         'checkpoint_interval': training.get('checkpoint_interval', 1000),
         'min_buffer_size': 1000,  # Could add to config
         'checkpoint_dir': config.get('checkpoint_dir', './checkpoints'),
-        'redis_host': redis.get('host', 'localhost'),
+        'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
         'games_per_training_batch': training.get('games_per_batch', 10),
@@ -262,7 +317,7 @@ def get_eval_worker_config(
         'batch_size': batch_size,
         'num_simulations': mcts.get('simulations', 100),
         'max_nodes': mcts.get('max_nodes', 400),
-        'redis_host': redis.get('host', 'localhost'),
+        'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
     }
@@ -291,9 +346,12 @@ def print_config_summary(config: Dict[str, Any], device_type: str):
     """Print a summary of the loaded configuration."""
     mcts = config.get('mcts', {})
     device_cfg = get_device_config(config, device_type)
+    redis_host = detect_redis_host(config)
+    redis_port = config.get('redis', {}).get('port', 6379)
 
     print(f"\n=== Configuration Summary ===")
     print(f"Device type: {device_type}")
+    print(f"Redis host: {redis_host}:{redis_port} (auto-detected)")
     print(f"MCTS simulations: {mcts.get('simulations', 100)} (global)")
     print(f"MCTS max nodes: {mcts.get('max_nodes', 400)} (global)")
     print(f"Game batch size: {device_cfg.get('game_batch_size', 'default')}")
