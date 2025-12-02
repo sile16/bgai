@@ -186,7 +186,7 @@ connect_ray_cluster() {
 
     # Check if already connected to the correct cluster
     if ray status &>/dev/null; then
-        CURRENT_HEAD=$(ray status 2>/dev/null | grep -oP 'address.*:\K[0-9.]+' | head -1 || echo "")
+        CURRENT_HEAD=$(ray status 2>/dev/null | grep -o 'address[^:]*:[0-9.]*' | sed 's/.*://' | head -1 || echo "")
         if [[ "$CURRENT_HEAD" == "$HEAD_IP" ]] || [[ "$CURRENT_HEAD" == "0.0.0.0" ]]; then
             echo "Already connected to Ray cluster"
             return 0
