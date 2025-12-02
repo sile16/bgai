@@ -1,87 +1,120 @@
 # Distributed AlphaZero Training Configuration
 # =============================================
+#
+# ARCHITECTURE:
+# - Head node: Ray cluster, Redis, Grafana, Prometheus, Training worker
+# - Remote workers: Macs, TPUs join for game collection and evaluation
+#
+# CONFIG HIERARCHY:
+# 1. Global settings (MCTS simulations, max_nodes) - same for all workers
+# 2. Device-specific batch sizes - optimized per hardware type
+# 3. Local overrides - via CLI flags (--batch-size) for unique machines
 
-# MCTS Evaluator Settings
+# =============================================================================
+# GLOBAL TRAINING SETTINGS (applies to ALL workers)
+# =============================================================================
+
 mcts:
-  simulations: 100        # MCTS iterations per move
-  max_nodes: 400          # Maximum tree size
+  simulations: 100        # MCTS iterations per move (GLOBAL)
+  max_nodes: 400          # Maximum tree size (GLOBAL)
   temperature: 1.0        # Exploration temperature
   discount: -1.0          # -1 for two-player zero-sum games
   persist_tree: true      # Keep tree between moves
 
-# Neural Network Training
 training:
   batch_size: 128         # Samples per training step
   learning_rate: 0.0003   # Adam learning rate
   l2_reg_lambda: 0.0001   # L2 regularization
+  games_per_batch: 10     # New games before training step
+  steps_per_game: 10      # Training steps per collected game
+  surprise_weight: 0.5    # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_interval: 1000
   max_checkpoints: 5
 
-# Self-Play Game Generation
 game:
-  batch_size: 16          # Parallel games per worker
   max_episode_steps: 500  # Max moves per game
   temperature_start: 1.0  # Initial exploration
   temperature_end: 0.2    # Final exploitation
 
-# Redis Replay Buffer
+# =============================================================================
+# INFRASTRUCTURE
+# =============================================================================
+
 redis:
-  host: "localhost"
+  host: "100.105.50.111"  # Head node (Tailscale IP)
   port: 6379
-  db: 0
-  password: null
+  password: "bgai-password"
   buffer_capacity: 100000   # Max experiences
   episode_capacity: 5000    # Max episodes
 
-# Coordinator (Ray Head Node)
+ray:
+  head_ip: "100.105.50.111"  # Tailscale IP
+  head_ip_local: "192.168.20.40"  # LAN fallback
+  gcs_port: 6380            # Ray GCS server
+  client_port: 10001        # Ray client
+  dashboard_port: 8265
+
 coordinator:
   heartbeat_timeout: 30.0   # Seconds before worker considered dead
   heartbeat_interval: 10.0  # Seconds between heartbeats
   weight_push_interval: 10  # Push weights every N training steps
-  ray_port: 10001
-  dashboard_port: 8265
 
-# Worker Settings
-worker:
-  worker_type: "game"       # 'game', 'training', 'evaluation'
-  prefer_gpu: true
-  auto_config: true         # Auto-configure based on device
+# =============================================================================
+# NEURAL NETWORK ARCHITECTURE
+# =============================================================================
 
-# Neural Network Architecture
 network:
   hidden_dim: 256
   num_blocks: 6
   num_actions: 156          # Backgammon action space
 
-# Paths
+# =============================================================================
+# DEVICE-SPECIFIC BATCH SIZES
+# =============================================================================
+# These are applied automatically based on detected hardware.
+# Only batch sizes vary - MCTS settings remain global.
+# Workers can override batch_size via --batch-size CLI flag.
+
+device_configs:
+  cuda:
+    # NVIDIA GPUs (RTX 4090, etc.)
+    game_batch_size: 64
+    train_batch_size: 256
+    eval_batch_size: 32
+    gpu_memory_fraction: 0.25  # Allow multiple workers per GPU
+
+  metal:
+    # Apple Silicon (M1, M2, M3)
+    game_batch_size: 16
+    train_batch_size: 128
+    eval_batch_size: 8
+
+  tpu:
+    # Google Cloud TPUs
+    game_batch_size: 128
+    train_batch_size: 512
+    eval_batch_size: 64
+
+  cpu:
+    # CPU-only fallback
+    game_batch_size: 4
+    train_batch_size: 64
+    eval_batch_size: 4
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
 checkpoint_dir: "./checkpoints"
 log_dir: "./logs"
 
-# Device-Specific Overrides
-# Applied automatically based on detected hardware
-cuda_overrides:
-  mcts:
-    simulations: 200
-    max_nodes: 800
-  game:
-    batch_size: 64
-  training:
-    batch_size: 256
+# =============================================================================
+# MONITORING
+# =============================================================================
 
-metal_overrides:
-  mcts:
-    simulations: 100
-    max_nodes: 400
-  game:
-    batch_size: 16
-  training:
-    batch_size: 128
+prometheus:
+  port: 9090
+  scrape_interval: 15
 
-cpu_overrides:
-  mcts:
-    simulations: 50
-    max_nodes: 200
-  game:
-    batch_size: 4
-  training:
-    batch_size: 64
+grafana:
+  port: 3000

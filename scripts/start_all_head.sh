@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start all head node services (coordinator, training worker, game worker)
-# Everything runs in background with logs to files
+# Configuration is loaded from configs/distributed.yaml
 #
 # Usage: ./scripts/start_all_head.sh
 
@@ -23,12 +23,32 @@ fi
 echo "Using Python: $(which python)"
 
 # =============================================================================
-# Configuration
+# Load configuration from YAML file
 # =============================================================================
-# Try Tailscale IP first, fallback to local IP
-TAILSCALE_IP="100.105.50.111"
-LOCAL_IP="192.168.20.40"
+CONFIG_FILE="$PROJECT_DIR/configs/distributed.yaml"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: Config file not found: $CONFIG_FILE"
+    exit 1
+fi
+echo "Loading config from: $CONFIG_FILE"
 
+# Parse values from config (simple grep/sed approach)
+TAILSCALE_IP=$(grep "head_ip:" "$CONFIG_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+LOCAL_IP=$(grep "head_ip_local:" "$CONFIG_FILE" | sed 's/.*: *"\([^"]*\)".*/\1/')
+RAY_PORT=$(grep "gcs_port:" "$CONFIG_FILE" | sed 's/.*: *\([0-9]*\).*/\1/')
+RAY_CLIENT_PORT=$(grep "client_port:" "$CONFIG_FILE" | sed 's/.*: *\([0-9]*\).*/\1/')
+REDIS_PORT=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "port:" | sed 's/.*: *\([0-9]*\).*/\1/')
+REDIS_PASSWORD=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "password:" | sed 's/.*: *"\([^"]*\)".*/\1/')
+
+# Fallback defaults
+TAILSCALE_IP="${TAILSCALE_IP:-100.105.50.111}"
+LOCAL_IP="${LOCAL_IP:-192.168.20.40}"
+RAY_PORT="${RAY_PORT:-6380}"
+RAY_CLIENT_PORT="${RAY_CLIENT_PORT:-10001}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_PASSWORD="${REDIS_PASSWORD:-bgai-password}"
+
+# Try Tailscale IP first, fallback to local IP
 if ping -c 1 -W 1 "$TAILSCALE_IP" &>/dev/null; then
     HEAD_IP="$TAILSCALE_IP"
     echo "Using Tailscale IP: $HEAD_IP"
@@ -37,32 +57,9 @@ else
     echo "Tailscale unavailable, using local IP: $HEAD_IP"
 fi
 REDIS_HOST="$HEAD_IP"
-REDIS_PORT="6379"
-REDIS_PASSWORD="bgai-password"
-RAY_PORT="6380"
-RAY_CLIENT_PORT="10001"
+
 CHECKPOINT_DIR="$PROJECT_DIR/checkpoints"
 LOG_DIR="$PROJECT_DIR/logs"
-
-# GPU/CUDA settings (head node)
-# Note: Smaller values for faster JIT compilation on first run
-# Increase after confirming system works
-GAME_BATCH_SIZE=16         # Reduced from 64 for faster JIT
-TRAIN_BATCH_SIZE=128       # Reduced from 256
-MCTS_SIMULATIONS=100       # Reduced from 200 for faster JIT
-MCTS_MAX_NODES=400         # Reduced from 800
-LEARNING_RATE="3e-4"
-MIN_BUFFER_SIZE=500        # Reduced from 1000 for faster first train
-CHECKPOINT_INTERVAL=1000
-
-# Collection-gated training settings
-# Training triggers after GAMES_PER_BATCH new games, then runs STEPS_PER_GAME * new_games steps
-GAMES_PER_BATCH=10         # New games required to trigger training batch
-STEPS_PER_GAME=10          # Training steps per collected game (e.g., 10 games -> 100 steps)
-
-# Surprise-weighted sampling (0=uniform, 1=fully surprise-weighted)
-# Higher weights focus training on games where model predictions differed from actual outcome
-SURPRISE_WEIGHT=0.5
 
 # =============================================================================
 # Setup
@@ -76,6 +73,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 echo "=============================================="
 echo "  BGAI Distributed Training - Head Node"
 echo "=============================================="
+echo "Config file: $CONFIG_FILE"
 echo "Project dir: $PROJECT_DIR"
 echo "Logs dir:    $LOG_DIR"
 echo "Checkpoints: $CHECKPOINT_DIR"
@@ -84,7 +82,7 @@ echo ""
 # =============================================================================
 # Stop existing processes
 # =============================================================================
-echo "[1/4] Stopping any existing Ray cluster..."
+echo "[1/5] Stopping any existing Ray cluster..."
 ray stop --force 2>/dev/null || true
 pkill -f "distributed.cli.main" 2>/dev/null || true
 sleep 2
@@ -106,7 +104,7 @@ echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24
 # =============================================================================
 # Start Ray head node
 # =============================================================================
-echo "[2/4] Starting Ray head node..."
+echo "[2/5] Starting Ray head node..."
 # Bind to 0.0.0.0 to accept connections from both Tailscale and LAN
 RAY_RUNTIME_ENV_CREATE_WORKING_DIR=1 ray start --head \
     --port="$RAY_PORT" \
@@ -124,8 +122,14 @@ sleep 3
 # Start Prometheus metrics with custom BGAI config
 # =============================================================================
 echo "       Starting Prometheus metrics..."
-PROMETHEUS_BIN="$PROJECT_DIR/prometheus-3.7.3.linux-amd64/prometheus"
+PROMETHEUS_BIN="$PROJECT_DIR/tools/prometheus/prometheus"
 PROMETHEUS_CONFIG="$PROJECT_DIR/tools/prometheus_bgai.yml"
+
+# Find prometheus binary
+if [[ ! -f "$PROMETHEUS_BIN" ]]; then
+    PROMETHEUS_BIN=$(find "$PROJECT_DIR" -name "prometheus" -type f -executable 2>/dev/null | head -1)
+fi
+
 if [[ -f "$PROMETHEUS_BIN" ]]; then
     "$PROMETHEUS_BIN" \
         --config.file "$PROMETHEUS_CONFIG" \
@@ -169,6 +173,7 @@ fi
 echo "       Starting Prometheus discovery updater..."
 python -c "
 from distributed.metrics import start_discovery_updater
+import time
 updater = start_discovery_updater(
     redis_host='$REDIS_HOST',
     redis_port=$REDIS_PORT,
@@ -176,27 +181,20 @@ updater = start_discovery_updater(
     update_interval=15,
 )
 print('Discovery updater started')
-import time
 while True:
-    time.sleep(3600)  # Keep running
+    time.sleep(3600)
 " > "$LOG_DIR/discovery_updater_$TIMESTAMP.log" 2>&1 &
 DISCOVERY_PID=$!
 echo "       Discovery updater PID: $DISCOVERY_PID"
 sleep 2
 
 # =============================================================================
-# Start Coordinator
+# Start Coordinator (uses config file for all settings)
 # =============================================================================
-echo "[3/4] Starting coordinator..."
+echo "[3/5] Starting coordinator..."
 python -m distributed.cli.main coordinator \
+    --config-file "$CONFIG_FILE" \
     --dashboard \
-    --redis-host "$REDIS_HOST" \
-    --redis-port "$REDIS_PORT" \
-    --redis-password "$REDIS_PASSWORD" \
-    --mcts-simulations "$MCTS_SIMULATIONS" \
-    --mcts-max-nodes "$MCTS_MAX_NODES" \
-    --train-batch-size "$TRAIN_BATCH_SIZE" \
-    --game-batch-size "$GAME_BATCH_SIZE" \
     > "$LOG_DIR/coordinator_$TIMESTAMP.log" 2>&1 &
 COORD_PID=$!
 echo "       Coordinator PID: $COORD_PID"
@@ -211,23 +209,12 @@ if ! kill -0 $COORD_PID 2>/dev/null; then
 fi
 
 # =============================================================================
-# Start Training Worker (with GPU - uses 0.5 GPU to share with game worker)
-# Collection-gated: waits for new games before training
+# Start Training Worker (uses config file, 0.5 GPU to share with game worker)
 # =============================================================================
-echo "[4/4] Starting training worker..."
+echo "[4/5] Starting training worker..."
 python -m distributed.cli.main training-worker \
-    --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
-    --batch-size "$TRAIN_BATCH_SIZE" \
-    --learning-rate "$LEARNING_RATE" \
+    --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --min-buffer-size "$MIN_BUFFER_SIZE" \
-    --games-per-batch "$GAMES_PER_BATCH" \
-    --steps-per-game "$STEPS_PER_GAME" \
-    --surprise-weight "$SURPRISE_WEIGHT" \
-    --checkpoint-interval "$CHECKPOINT_INTERVAL" \
-    --redis-host "$REDIS_HOST" \
-    --redis-port "$REDIS_PORT" \
-    --redis-password "$REDIS_PASSWORD" \
     --num-gpus 0.5 \
     > "$LOG_DIR/training_$TIMESTAMP.log" 2>&1 &
 TRAIN_PID=$!
@@ -235,19 +222,12 @@ echo "       Training worker PID: $TRAIN_PID"
 echo "       Log: $LOG_DIR/training_$TIMESTAMP.log"
 
 # =============================================================================
-# Start GPU Game Worker (uses 0.5 GPU to share with training worker)
+# Start GPU Game Worker (uses config file, 0.5 GPU to share with training worker)
 # =============================================================================
 echo "[5/5] Starting GPU game worker..."
 python -m distributed.cli.main game-worker \
-    --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
+    --config-file "$CONFIG_FILE" \
     --worker-id "gpu-head" \
-    --batch-size "$GAME_BATCH_SIZE" \
-    --mcts-simulations "$MCTS_SIMULATIONS" \
-    --mcts-max-nodes "$MCTS_MAX_NODES" \
-    --temperature 1.0 \
-    --redis-host "$REDIS_HOST" \
-    --redis-port "$REDIS_PORT" \
-    --redis-password "$REDIS_PASSWORD" \
     --num-gpus 0.5 \
     > "$LOG_DIR/game_gpu_$TIMESTAMP.log" 2>&1 &
 GAME_PID=$!

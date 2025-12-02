@@ -2,17 +2,20 @@
 """CLI for distributed backgammon AI training.
 
 Usage:
-    # Start coordinator (head node)
-    python -m distributed.cli.main coordinator --redis-host localhost
+    # Start coordinator (head node) - uses config file
+    python -m distributed.cli.main coordinator
 
-    # Start game worker
-    python -m distributed.cli.main game-worker --coordinator-address ray://head:10001
+    # Start game worker - auto-detects device, uses config
+    python -m distributed.cli.main game-worker
+
+    # Start with local batch size override
+    python -m distributed.cli.main game-worker --batch-size 32
 
     # Start training worker
-    python -m distributed.cli.main training-worker --coordinator-address ray://head:10001
+    python -m distributed.cli.main training-worker
 
     # Check cluster status
-    python -m distributed.cli.main status --coordinator-address ray://head:10001
+    python -m distributed.cli.main status
 """
 
 import argparse
@@ -22,11 +25,26 @@ from typing import Optional
 
 import ray
 
+from .config_loader import (
+    load_yaml_config,
+    detect_device_type,
+    get_coordinator_config,
+    get_game_worker_config,
+    get_training_worker_config,
+    get_eval_worker_config,
+    get_ray_config,
+    print_config_summary,
+)
+
 
 def start_coordinator(args):
     """Start the coordinator (head node)."""
     import os
     from ..coordinator.head_node import create_coordinator
+
+    # Load configuration from file
+    yaml_config = load_yaml_config(args.config_file)
+    file_config = get_coordinator_config(yaml_config)
 
     # Get project directory for runtime environment
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,22 +60,23 @@ def start_coordinator(args):
         runtime_env={"env_vars": {"PYTHONPATH": project_dir}},
     )
 
-    config = {
-        'redis_host': args.redis_host,
-        'redis_port': args.redis_port,
-        'redis_password': args.redis_password,
-        'heartbeat_timeout': args.heartbeat_timeout,
-        'heartbeat_interval': args.heartbeat_interval,
-        'mcts_simulations': args.mcts_simulations,
-        'mcts_max_nodes': args.mcts_max_nodes,
-        'train_batch_size': args.train_batch_size,
-        'game_batch_size': args.game_batch_size,
-        'learning_rate': args.learning_rate,
-    }
+    # Merge: file config <- CLI overrides (CLI takes precedence if specified)
+    config = file_config.copy()
+    if args.redis_host != 'localhost':  # Only override if explicitly set
+        config['redis_host'] = args.redis_host
+    if args.redis_port != 6379:
+        config['redis_port'] = args.redis_port
+    if args.redis_password is not None:
+        config['redis_password'] = args.redis_password
+    if args.mcts_simulations != 100:
+        config['mcts_simulations'] = args.mcts_simulations
+    if args.mcts_max_nodes != 400:
+        config['mcts_max_nodes'] = args.mcts_max_nodes
 
     print(f"Creating coordinator with config:")
     for k, v in config.items():
-        print(f"  {k}: {v}")
+        if k != 'device_configs':  # Don't print the large device_configs dict
+            print(f"  {k}: {v}")
 
     coordinator = create_coordinator(config, name='coordinator')
     print(f"Coordinator started. Dashboard available at http://127.0.0.1:8265")
@@ -87,6 +106,17 @@ def start_game_worker(args):
     import os
     from ..workers.game_worker import GameWorker
     from ..coordinator.head_node import get_coordinator
+
+    # Load configuration from file
+    yaml_config = load_yaml_config(args.config_file)
+    device_type = detect_device_type()
+
+    # Get device-specific config with optional batch size override
+    batch_override = args.batch_size if args.batch_size != 16 else None
+    config = get_game_worker_config(yaml_config, device_type, batch_override)
+
+    # Print config summary
+    print_config_summary(yaml_config, device_type)
 
     # Get project directory for runtime environment
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -119,17 +149,6 @@ def start_game_worker(args):
     if coordinator is None:
         print("ERROR: Could not find coordinator. Make sure it's running.")
         sys.exit(1)
-
-    config = {
-        'batch_size': args.batch_size,
-        'num_simulations': args.mcts_simulations,
-        'max_nodes': args.mcts_max_nodes,
-        'temperature': args.temperature,
-        'max_episode_steps': args.max_episode_steps,
-        'redis_host': args.redis_host,
-        'redis_port': args.redis_port,
-        'redis_password': args.redis_password,
-    }
 
     print(f"Starting game worker with config:")
     for k, v in config.items():
@@ -169,6 +188,17 @@ def start_training_worker(args):
     from ..workers.training_worker import TrainingWorker
     from ..coordinator.head_node import get_coordinator
 
+    # Load configuration from file
+    yaml_config = load_yaml_config(args.config_file)
+    device_type = detect_device_type()
+
+    # Get device-specific config with optional batch size override
+    batch_override = args.batch_size if args.batch_size != 128 else None
+    config = get_training_worker_config(yaml_config, device_type, batch_override)
+
+    # Print config summary
+    print_config_summary(yaml_config, device_type)
+
     # Get project directory for runtime environment
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -199,23 +229,6 @@ def start_training_worker(args):
     if coordinator is None:
         print("ERROR: Could not find coordinator. Make sure it's running.")
         sys.exit(1)
-
-    config = {
-        'train_batch_size': args.batch_size,
-        'learning_rate': args.learning_rate,
-        'l2_reg_lambda': args.l2_reg,
-        'checkpoint_interval': args.checkpoint_interval,
-        'min_buffer_size': args.min_buffer_size,
-        'checkpoint_dir': args.checkpoint_dir,
-        'redis_host': args.redis_host,
-        'redis_port': args.redis_port,
-        'redis_password': args.redis_password,
-        # Collection-gated training settings
-        'games_per_training_batch': args.games_per_batch,
-        'steps_per_game': args.steps_per_game,
-        # Surprise-weighted sampling
-        'surprise_weight': args.surprise_weight,
-    }
 
     print(f"Starting training worker with config:")
     for k, v in config.items():
@@ -255,6 +268,25 @@ def start_eval_worker(args):
     from ..workers.eval_worker import EvalWorker
     from ..coordinator.head_node import get_coordinator
 
+    # Load configuration from file
+    yaml_config = load_yaml_config(args.config_file)
+    device_type = detect_device_type()
+
+    # Get device-specific config with optional batch size override
+    batch_override = args.batch_size if args.batch_size != 16 else None
+    config = get_eval_worker_config(yaml_config, device_type, batch_override)
+
+    # Add eval-specific settings
+    config['eval_games'] = args.eval_games
+    config['eval_interval'] = args.eval_interval
+
+    # Only add eval_types if explicitly specified (else use worker default)
+    if args.eval_types:
+        config['eval_types'] = [t.strip() for t in args.eval_types.split(',')]
+
+    # Print config summary
+    print_config_summary(yaml_config, device_type)
+
     # Get project directory for runtime environment
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -285,22 +317,6 @@ def start_eval_worker(args):
     if coordinator is None:
         print("ERROR: Could not find coordinator. Make sure it's running.")
         sys.exit(1)
-
-    # Parse eval types
-    config = {
-        'eval_games': args.eval_games,
-        'batch_size': args.batch_size,
-        'num_simulations': args.mcts_simulations,
-        'max_nodes': args.mcts_max_nodes,
-        'eval_interval': args.eval_interval,
-        'redis_host': args.redis_host,
-        'redis_port': args.redis_port,
-        'redis_password': args.redis_password,
-    }
-
-    # Only add eval_types if explicitly specified (else use worker default)
-    if args.eval_types:
-        config['eval_types'] = [t.strip() for t in args.eval_types.split(',')]
 
     print(f"Starting evaluation worker with config:")
     for k, v in config.items():
@@ -343,12 +359,22 @@ def show_status(args):
     import os
     from ..coordinator.head_node import get_coordinator
 
+    # Load configuration from file
+    yaml_config = load_yaml_config(args.config_file)
+    ray_config = get_ray_config(yaml_config)
+
     # Get project directory for runtime environment
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+    # Determine Ray address
+    if args.coordinator_address:
+        address = args.coordinator_address
+    else:
+        address = "auto"  # Default to local Ray cluster
+
     # Connect to Ray cluster
     ray.init(
-        address=args.coordinator_address,
+        address=address,
         namespace="bgai",
         runtime_env={"env_vars": {"PYTHONPATH": project_dir}},
     )
@@ -391,6 +417,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # =========================================================================
@@ -399,6 +426,12 @@ def main():
     coord_parser = subparsers.add_parser(
         'coordinator',
         help='Start the coordinator (head node)'
+    )
+    coord_parser.add_argument(
+        '--config-file', '-c',
+        type=str,
+        default=None,
+        help='Path to config file (default: configs/distributed.yaml)'
     )
     coord_parser.add_argument(
         '--ray-address',
@@ -481,10 +514,16 @@ def main():
         help='Start a game generation worker'
     )
     game_parser.add_argument(
+        '--config-file', '-c',
+        type=str,
+        default=None,
+        help='Path to config file (default: configs/distributed.yaml)'
+    )
+    game_parser.add_argument(
         '--coordinator-address',
         type=str,
-        required=True,
-        help='Ray cluster address (e.g., ray://host:10001)'
+        default='auto',
+        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     game_parser.add_argument(
         '--worker-id',
@@ -562,10 +601,16 @@ def main():
         help='Start a training worker'
     )
     train_parser.add_argument(
+        '--config-file', '-c',
+        type=str,
+        default=None,
+        help='Path to config file (default: configs/distributed.yaml)'
+    )
+    train_parser.add_argument(
         '--coordinator-address',
         type=str,
-        required=True,
-        help='Ray cluster address (e.g., ray://host:10001)'
+        default='auto',
+        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     train_parser.add_argument(
         '--worker-id',
@@ -667,10 +712,16 @@ def main():
         help='Start an evaluation worker'
     )
     eval_parser.add_argument(
+        '--config-file', '-c',
+        type=str,
+        default=None,
+        help='Path to config file (default: configs/distributed.yaml)'
+    )
+    eval_parser.add_argument(
         '--coordinator-address',
         type=str,
-        required=True,
-        help='Ray cluster address (e.g., ray://host:10001)'
+        default='auto',
+        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     eval_parser.add_argument(
         '--worker-id',
@@ -754,10 +805,16 @@ def main():
         help='Show cluster status'
     )
     status_parser.add_argument(
+        '--config-file', '-c',
+        type=str,
+        default=None,
+        help='Path to config file (default: configs/distributed.yaml)'
+    )
+    status_parser.add_argument(
         '--coordinator-address',
         type=str,
-        required=True,
-        help='Ray cluster address (e.g., ray://host:10001)'
+        default=None,
+        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     status_parser.set_defaults(func=show_status)
 
