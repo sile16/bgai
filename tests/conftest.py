@@ -110,15 +110,17 @@ def redis_client(redis_available: bool):
 
 @pytest.fixture(scope="module")
 def ray_context():
-    """Initialize Ray for testing (local mode for isolation)."""
+    """Initialize Ray for testing."""
     import ray
 
-    if not ray.is_initialized():
-        ray.init(local_mode=True, ignore_reinit_error=True)
+    if ray.is_initialized():
+        ray.shutdown()
+    # Don't use local_mode - it has crashes during cleanup
+    ray.init(ignore_reinit_error=True)
 
     yield ray
 
-    # Don't shutdown - let other test modules reuse
+    ray.shutdown()
 
 
 # ============================================================================

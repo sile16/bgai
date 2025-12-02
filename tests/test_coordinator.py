@@ -22,11 +22,15 @@ import jax.numpy as jnp
 
 @pytest.fixture(scope="module")
 def ray_init():
-    """Initialize Ray in local mode for testing."""
-    if not ray.is_initialized():
-        ray.init(local_mode=True, ignore_reinit_error=True)
+    """Initialize Ray for testing."""
+    # Always shutdown first to get clean state
+    if ray.is_initialized():
+        ray.shutdown()
+    # Don't use local_mode - it has crashes during cleanup
+    ray.init(ignore_reinit_error=True)
     yield
-    # Don't shutdown - other tests may need Ray
+    # Shutdown to allow clean restart in other test modules
+    ray.shutdown()
 
 
 @pytest.fixture
@@ -50,9 +54,10 @@ def coordinator(ray_init):
 
     yield coord
 
-    # Cleanup
+    # Use ray.kill() instead of shutdown.remote() to avoid crashes during pytest teardown
+    # Ray in local_mode has issues with actor lifecycle during teardown
     try:
-        ray.get(coord.shutdown.remote())
+        ray.kill(coord)
     except Exception:
         pass  # Actor may already be dead
 
@@ -384,7 +389,8 @@ class TestUtilityFunctions:
 
         assert coord is not None
 
-        ray.get(coord.shutdown.remote())
+        # Use ray.kill() to avoid crashes during pytest teardown
+        ray.kill(coord)
 
     def test_get_or_create_coordinator(self, ray_init):
         """Test get_or_create utility."""
@@ -402,4 +408,5 @@ class TestUtilityFunctions:
         ray.get(coord1.get_config.remote())
         ray.get(coord2.get_config.remote())
 
-        ray.get(coord1.shutdown.remote())
+        # Use ray.kill() to avoid crashes during pytest teardown
+        ray.kill(coord1)

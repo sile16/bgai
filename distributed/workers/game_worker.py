@@ -123,7 +123,7 @@ class GameWorker(BaseWorker):
                 return self._env.step(s, a, k)
 
             new_state = jax.lax.cond(
-                state.is_stochastic,
+                state._is_stochastic,
                 stochastic_branch,
                 deterministic_branch,
                 (state, action, key)
@@ -312,7 +312,7 @@ class GameWorker(BaseWorker):
 
         for i in range(self.batch_size):
             # Skip stochastic states (dice rolls)
-            is_stochastic = env_states.is_stochastic[i] if hasattr(env_states, 'is_stochastic') else False
+            is_stochastic = env_states._is_stochastic[i] if hasattr(env_states, '_is_stochastic') else False
 
             if not is_stochastic:
                 # Collect experience for training

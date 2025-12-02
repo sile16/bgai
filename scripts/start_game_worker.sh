@@ -137,13 +137,14 @@ case "$PLATFORM" in
 esac
 
 # =============================================================================
-# Worker ID
+# Worker ID - Use clean hostname without PID for better readability
 # =============================================================================
 if [[ -n "$1" ]]; then
     WORKER_ID="$1"
 else
     HOSTNAME_SHORT=$(hostname -s 2>/dev/null || hostname)
-    WORKER_ID="${PLATFORM_TAG}-${HOSTNAME_SHORT}-$$"
+    # Create a clean worker ID: platform-hostname (no PID for cleaner names)
+    WORKER_ID="${PLATFORM_TAG}-${HOSTNAME_SHORT}"
 fi
 
 # =============================================================================
