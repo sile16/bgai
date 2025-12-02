@@ -228,6 +228,10 @@ class Coordinator:
     ) -> Dict[str, Any]:
         """Update the current model weights (called by training worker).
 
+        Note: This assumes a single training worker. Multiple training workers
+        could race and this method only accepts strictly newer versions to
+        prevent rollback.
+
         Args:
             weights_bytes: Serialized model weights.
             version: New model version number.
@@ -236,6 +240,15 @@ class Coordinator:
             Response with status and version.
         """
         with self._weights_lock:
+            if version <= self.current_model_version:
+                # Reject stale or duplicate updates
+                print(f"Rejected weight update: version {version} <= current {self.current_model_version}")
+                return {
+                    'status': 'rejected',
+                    'reason': 'stale_version',
+                    'current_version': self.current_model_version,
+                }
+
             self.model_weights = weights_bytes
             self.current_model_version = version
 

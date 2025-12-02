@@ -54,6 +54,7 @@ class RedisReplayBuffer:
     EPISODE_LIST = "bgai:buffer:episodes"
     METADATA_KEY = "bgai:buffer:metadata"
     SURPRISE_SORTED_SET = "bgai:buffer:surprise"  # Sorted set for surprise-weighted sampling
+    TOTAL_GAMES_KEY = "bgai:buffer:total_games"  # Monotonic counter for total games added
 
     def __init__(
         self,
@@ -230,10 +231,15 @@ class RedisReplayBuffer:
         score = (surprise_score or 0.0) + np.random.uniform(0, 0.001)
         pipe.zadd(self.SURPRISE_SORTED_SET, {episode_id: score})
 
+        # Increment monotonic game counter (never decreases even after eviction)
+        pipe.incr(self.TOTAL_GAMES_KEY)
+
         pipe.execute()
 
-        # Enforce capacity (both experiences and episodes)
-        self._enforce_capacity()
+        # Enforce episode capacity only - this properly cleans up experiences,
+        # episode metadata, and surprise entries atomically.
+        # Note: We don't use _enforce_capacity() for individual experiences
+        # because it leaves orphaned episode metadata and surprise entries.
         self._enforce_episode_capacity()
 
         return episode_id
@@ -523,21 +529,17 @@ class RedisReplayBuffer:
     # =========================================================================
 
     def _enforce_capacity(self) -> None:
-        """Remove old experiences when capacity is exceeded."""
-        current_size = self.redis.llen(self.EXPERIENCE_LIST)
+        """DEPRECATED: Individual experience eviction causes orphaned metadata.
 
-        if current_size > self.capacity:
-            # Remove oldest experiences
-            num_to_remove = current_size - self.capacity
-
-            pipe = self.redis.pipeline()
-            for _ in range(num_to_remove):
-                # Pop from the end (oldest)
-                exp_id_bytes = self.redis.rpop(self.EXPERIENCE_LIST)
-                if exp_id_bytes:
-                    exp_id = exp_id_bytes.decode() if isinstance(exp_id_bytes, bytes) else exp_id_bytes
-                    pipe.delete(f"{self.EXPERIENCE_KEY}{exp_id}")
-            pipe.execute()
+        This method is kept for backwards compatibility but does nothing.
+        Use _enforce_episode_capacity() instead, which atomically removes
+        complete episodes including all experiences, metadata, and surprise entries.
+        """
+        # No-op: Episode-based eviction is now the only mechanism.
+        # Individual experience eviction was removed because it left
+        # orphaned episode metadata and surprise sorted set entries,
+        # causing sampling to reference non-existent experiences.
+        pass
 
     def _enforce_episode_capacity(self) -> None:
         """Remove old episodes when episode capacity is exceeded (FIFO)."""
@@ -658,6 +660,20 @@ class RedisReplayBuffer:
     def get_size(self) -> int:
         """Get number of experiences in buffer."""
         return self.redis.llen(self.EXPERIENCE_LIST)
+
+    def get_total_games(self) -> int:
+        """Get total number of games ever added (monotonic counter).
+
+        Unlike get_episode_count() which returns current buffer size,
+        this returns the total count of games ever added, which only
+        increases and is suitable for triggering training batches.
+        """
+        count = self.redis.get(self.TOTAL_GAMES_KEY)
+        return int(count) if count else 0
+
+    def get_episode_count(self) -> int:
+        """Get current number of episodes in buffer."""
+        return self.redis.llen(self.EPISODE_LIST)
 
     def get_surprise_stats(self) -> Dict[str, Any]:
         """Get statistics about surprise scores in the buffer.

@@ -372,8 +372,12 @@ class TrainingWorker(BaseWorker):
         return metrics
 
     def _get_current_games_count(self) -> int:
-        """Get current number of completed games in buffer."""
-        return self.buffer.redis.llen(self.buffer.EPISODE_LIST)
+        """Get total number of completed games ever added (monotonic).
+
+        Uses monotonic counter instead of buffer length to avoid stalling
+        when buffer is full and old episodes are being evicted.
+        """
+        return self.buffer.get_total_games()
 
     def _run_training_batch(self, target_steps: int) -> Dict[str, float]:
         """Run a batch of training steps.

@@ -328,9 +328,13 @@ class GameWorker(BaseWorker):
 
                 # Track value prediction for surprise scoring
                 # Get value from evaluator state (MCTS root value)
+                # Normalize to player 0's perspective for consistent surprise scoring
                 eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
                 value_pred = float(self._evaluator.get_value(eval_state_i))
-                state['episode_value_preds'][i].append(value_pred)
+                cur_player = int(metadatas.cur_player_id[i])
+                # If player 1 is playing, negate value to get player 0's perspective
+                value_pred_p0 = value_pred if cur_player == 0 else -value_pred
+                state['episode_value_preds'][i].append(value_pred_p0)
 
             terminated = terminateds[i]
             truncated = truncateds[i]
@@ -381,14 +385,12 @@ class GameWorker(BaseWorker):
         rewards_bytes = serialize_rewards(final_rewards)
 
         # Compute surprise score: |mean_value_pred - actual_outcome|
-        # Value predictions are from current player's perspective
+        # Value predictions are normalized to player 0's perspective during collection
         # Final reward is [player0_reward, player1_reward]
         surprise_score = 0.0
         if value_predictions:
-            # Average value prediction across episode
+            # Average value prediction across episode (already in player 0's perspective)
             mean_value_pred = sum(value_predictions) / len(value_predictions)
-            # For simplicity, use player 0's final reward as the outcome
-            # Value predictions are typically in [-1, 1] range
             actual_outcome = float(final_rewards[0])
             surprise_score = abs(mean_value_pred - actual_outcome)
 
