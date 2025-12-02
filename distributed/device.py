@@ -40,6 +40,14 @@ def detect_device() -> DeviceInfo:
         >>> print(info.is_metal)
         True
     """
+    import os
+
+    # If CUDA_VISIBLE_DEVICES is empty (Ray's way of saying no GPU),
+    # force JAX to use CPU to avoid CUDA initialization errors
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if cuda_visible == '':
+        os.environ['JAX_PLATFORMS'] = 'cpu'
+
     import jax
 
     devices = jax.devices()

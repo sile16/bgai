@@ -287,21 +287,20 @@ def start_eval_worker(args):
         sys.exit(1)
 
     # Parse eval types
-    eval_types = None
-    if args.eval_types:
-        eval_types = [t.strip() for t in args.eval_types.split(',')]
-
     config = {
         'eval_games': args.eval_games,
         'batch_size': args.batch_size,
         'num_simulations': args.mcts_simulations,
         'max_nodes': args.mcts_max_nodes,
         'eval_interval': args.eval_interval,
-        'eval_types': eval_types,
         'redis_host': args.redis_host,
         'redis_port': args.redis_port,
         'redis_password': args.redis_password,
     }
+
+    # Only add eval_types if explicitly specified (else use worker default)
+    if args.eval_types:
+        config['eval_types'] = [t.strip() for t in args.eval_types.split(',')]
 
     print(f"Starting evaluation worker with config:")
     for k, v in config.items():
@@ -318,7 +317,10 @@ def start_eval_worker(args):
             config=config,
         )
     else:
-        worker = EvalWorker.remote(
+        # When not using GPU, set JAX_PLATFORMS=cpu to prevent CUDA init errors
+        worker = EvalWorker.options(
+            runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
+        ).remote(
             coordinator_handle=coordinator,
             worker_id=args.worker_id,
             config=config,
