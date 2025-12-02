@@ -3,11 +3,13 @@
 # Handles Ray connection, worker type detection, and hardware-specific settings
 #
 # Usage:
-#   ./scripts/start_worker.sh                    # Start game worker (default)
-#   ./scripts/start_worker.sh game               # Start game worker
-#   ./scripts/start_worker.sh eval               # Start eval worker
-#   ./scripts/start_worker.sh game eval          # Start both workers
-#   ./scripts/start_worker.sh game --batch-size 32  # Override batch size
+#   ./scripts/start_worker.sh                          # Start game worker (default)
+#   ./scripts/start_worker.sh game                     # Start game worker
+#   ./scripts/start_worker.sh eval                     # Start eval worker
+#   ./scripts/start_worker.sh game eval                # Start both workers
+#   ./scripts/start_worker.sh game --game-batch-size 32    # Override game batch size
+#   ./scripts/start_worker.sh eval --eval-batch-size 16    # Override eval batch size
+#   ./scripts/start_worker.sh game eval -g 32 -e 16        # Both with overrides
 #
 # Environment:
 #   WORKER_ID       - Override auto-generated worker ID
@@ -111,17 +113,31 @@ while [[ $# -gt 0 ]]; do
             WORKER_TYPES+=("$1")
             shift
             ;;
-        --batch-size|--game-batch-size)
+        -g|--game-batch-size)
             CUSTOM_GAME_BATCH="$2"
             shift 2
             ;;
-        --eval-batch-size)
+        -e|--eval-batch-size)
             CUSTOM_EVAL_BATCH="$2"
             shift 2
             ;;
         --worker-id)
             CUSTOM_WORKER_ID="$2"
             shift 2
+            ;;
+        -h|--help)
+            echo "Usage: $0 [game] [eval] [options]"
+            echo ""
+            echo "Worker types:"
+            echo "  game    Start game generation worker (default)"
+            echo "  eval    Start evaluation worker"
+            echo ""
+            echo "Options:"
+            echo "  -g, --game-batch-size N   Override game batch size"
+            echo "  -e, --eval-batch-size N   Override eval batch size"
+            echo "  --worker-id ID            Override worker ID"
+            echo "  -h, --help                Show this help"
+            exit 0
             ;;
         *)
             EXTRA_ARGS="$EXTRA_ARGS $1"
