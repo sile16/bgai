@@ -10,7 +10,7 @@ chex
 flax
 
 # Distributed training
-ray
+ray[client]
 redis
 msgpack-numpy
 
