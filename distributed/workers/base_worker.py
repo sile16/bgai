@@ -118,12 +118,19 @@ class BaseWorker(ABC):
             'hostname': socket.gethostname(),
         }
 
+        print(f"Worker {self.worker_id}: Attempting to register with coordinator...")
+        print(f"  Device info: {device_info_dict}")
+
         try:
-            result = ray.get(self.coordinator.register_worker.remote(
+            print(f"Worker {self.worker_id}: Calling coordinator.register_worker.remote()...")
+            future = self.coordinator.register_worker.remote(
                 self.worker_id,
                 self.worker_type,
                 device_info_dict,
-            ))
+            )
+            print(f"Worker {self.worker_id}: Waiting for registration response (timeout=30s)...")
+            result = ray.get(future, timeout=30)
+            print(f"Worker {self.worker_id}: Got registration response: {result}")
 
             if result['status'] == 'registered':
                 self.registered = True
@@ -133,14 +140,19 @@ class BaseWorker(ABC):
                 if 'config' in result:
                     self.config.update(result['config'])
 
-                print(f"Worker {self.worker_id} registered successfully")
+                print(f"Worker {self.worker_id} registered successfully (model_version={self.current_model_version})")
                 return True
             else:
-                print(f"Registration failed: {result}")
+                print(f"Worker {self.worker_id}: Registration failed: {result}")
                 return False
 
+        except ray.exceptions.GetTimeoutError:
+            print(f"Worker {self.worker_id}: Registration TIMEOUT - coordinator not responding")
+            return False
         except Exception as e:
-            print(f"Registration error: {e}")
+            import traceback
+            print(f"Worker {self.worker_id}: Registration error: {type(e).__name__}: {e}")
+            traceback.print_exc()
             return False
 
     def deregister(self) -> bool:
