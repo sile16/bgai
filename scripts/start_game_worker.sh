@@ -136,29 +136,71 @@ echo "Log file:    $LOG_FILE"
 echo ""
 
 # =============================================================================
-# Start game worker
+# Start game worker with auto-restart
 # =============================================================================
-echo "Starting game worker..."
-python -m distributed.cli.main game-worker \
-    --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
-    --worker-id "$WORKER_ID" \
-    --batch-size "$BATCH_SIZE" \
-    --mcts-simulations "$MCTS_SIMULATIONS" \
-    --mcts-max-nodes "$MCTS_MAX_NODES" \
-    --temperature 1.0 \
-    --redis-host "$REDIS_HOST" \
-    --redis-port "$REDIS_PORT" \
-    --redis-password "$REDIS_PASSWORD" \
-    > "$LOG_FILE" 2>&1 &
+STOP_FILE="$LOG_DIR/game_${WORKER_ID}.stop"
+PID_FILE="$LOG_DIR/game_${WORKER_ID}.pid"
 
+# Remove any old stop file
+rm -f "$STOP_FILE"
+
+echo "Starting game worker with auto-restart..."
+echo "Stop with: touch $STOP_FILE"
+echo ""
+
+# Function to run worker with auto-restart
+run_worker_loop() {
+    RESTART_DELAY=5
+    while true; do
+        # Check for stop file
+        if [[ -f "$STOP_FILE" ]]; then
+            echo "$(date): Stop file detected. Exiting."
+            rm -f "$STOP_FILE" "$PID_FILE"
+            exit 0
+        fi
+
+        echo "$(date): Starting game worker..."
+        python -m distributed.cli.main game-worker \
+            --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
+            --worker-id "$WORKER_ID" \
+            --batch-size "$BATCH_SIZE" \
+            --mcts-simulations "$MCTS_SIMULATIONS" \
+            --mcts-max-nodes "$MCTS_MAX_NODES" \
+            --temperature 1.0 \
+            --redis-host "$REDIS_HOST" \
+            --redis-port "$REDIS_PORT" \
+            --redis-password "$REDIS_PASSWORD"
+
+        EXIT_CODE=$?
+        echo "$(date): Worker exited with code $EXIT_CODE"
+
+        # Check for stop file again before restarting
+        if [[ -f "$STOP_FILE" ]]; then
+            echo "$(date): Stop file detected. Exiting."
+            rm -f "$STOP_FILE" "$PID_FILE"
+            exit 0
+        fi
+
+        echo "$(date): Restarting in $RESTART_DELAY seconds..."
+        sleep $RESTART_DELAY
+        # Exponential backoff up to 60 seconds
+        RESTART_DELAY=$((RESTART_DELAY * 2))
+        if [[ $RESTART_DELAY -gt 60 ]]; then
+            RESTART_DELAY=60
+        fi
+    done
+}
+
+# Run in background
+run_worker_loop >> "$LOG_FILE" 2>&1 &
 WORKER_PID=$!
+echo "$WORKER_PID" > "$PID_FILE"
+
 echo "Game worker started with PID: $WORKER_PID"
 echo ""
 echo "Monitor with:"
 echo "  tail -f $LOG_FILE"
 echo ""
 echo "Stop with:"
-echo "  kill $WORKER_PID"
-
-# Save PID for later
-echo "$WORKER_PID" > "$LOG_DIR/game_${WORKER_ID}.pid"
+echo "  touch $STOP_FILE"
+echo "  # or: kill $WORKER_PID"
