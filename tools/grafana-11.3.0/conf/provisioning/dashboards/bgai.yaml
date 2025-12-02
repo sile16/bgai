@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: 'BGAI'
+    orgId: 1
+    folder: 'BGAI'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /home/sile/github/bgai/tools
