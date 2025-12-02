@@ -52,6 +52,9 @@ join_ray_cluster() {
         return 0
     fi
 
+    # Enable multi-node clusters on Mac/Windows
+    export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+
     echo "Joining Ray cluster at $HEAD_IP:$RAY_PORT..."
     ray start --address="$HEAD_IP:$RAY_PORT" --block &
     RAY_PID=$!
