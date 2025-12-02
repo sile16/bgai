@@ -202,8 +202,18 @@ connect_ray_cluster() {
 
     echo "Joining Ray cluster at $HEAD_IP:$RAY_PORT..."
 
-    # Start Ray and join cluster
-    if ! ray start --address="$HEAD_IP:$RAY_PORT" 2>&1; then
+    # Get system info for node labeling
+    local node_name="${HOSTNAME_SHORT}"
+    local num_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "4")
+    local mem_bytes=$(free -b 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null || echo "8000000000")
+
+    # Start Ray and join cluster with node info
+    if ! ray start \
+        --address="$HEAD_IP:$RAY_PORT" \
+        --node-name="$node_name" \
+        --num-cpus="$num_cpus" \
+        --resources="{\"${PLATFORM}\": 1}" \
+        2>&1; then
         echo "ERROR: Failed to join Ray cluster"
         echo "Make sure the head node is running: ./scripts/start_all_head.sh"
         return 1
