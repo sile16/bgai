@@ -442,13 +442,17 @@ class GameWorker(BaseWorker):
         metrics = get_metrics()
 
         # Register metrics endpoint for dynamic discovery
-        register_metrics_endpoint(
-            self.buffer.redis,
-            worker_id=self.worker_id,
-            worker_type='game',
-            port=metrics_port,
-            ttl_seconds=60,
-        )
+        try:
+            register_metrics_endpoint(
+                self.buffer.redis,
+                worker_id=self.worker_id,
+                worker_type='game',
+                port=metrics_port,
+                ttl_seconds=300,  # 5 min TTL for more reliable discovery
+            )
+            print(f"Worker {self.worker_id}: Registered metrics endpoint on port {metrics_port}")
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Failed to register metrics endpoint: {e}")
 
         # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
@@ -504,13 +508,16 @@ class GameWorker(BaseWorker):
                 ).set(self.current_model_version)
 
                 # Refresh metrics registration heartbeat
-                register_metrics_endpoint(
-                    self.buffer.redis,
-                    worker_id=self.worker_id,
-                    worker_type='game',
-                    port=metrics_port,
-                    ttl_seconds=60,
-                )
+                try:
+                    register_metrics_endpoint(
+                        self.buffer.redis,
+                        worker_id=self.worker_id,
+                        worker_type='game',
+                        port=metrics_port,
+                        ttl_seconds=300,
+                    )
+                except Exception as e:
+                    print(f"Worker {self.worker_id}: Failed to refresh metrics registration: {e}")
 
                 print(
                     f"Worker {self.worker_id}: "
