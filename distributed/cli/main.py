@@ -92,19 +92,27 @@ def start_game_worker(args):
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # Connect to Ray cluster
-    print(f"Connecting to Ray cluster at {args.coordinator_address}...")
-    ray.init(
-        address=args.coordinator_address,
-        namespace="bgai",
-        runtime_env={
-            "env_vars": {
-                "PYTHONPATH": project_dir,
-                # Limit JAX memory to allow multiple workers on same GPU
-                # Based on benchmarks: ~2GB per worker, 25% = 6GB headroom on 24GB GPU
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
-            }
-        },
-    )
+    # 'auto' = connect to local Ray instance (joined via 'ray start --address')
+    # 'ray://host:port' = connect via Ray Client (legacy mode)
+    address = args.coordinator_address
+    if address == "auto":
+        print("Connecting to local Ray cluster (distributed mode)...")
+        ray.init(
+            address="auto",
+            namespace="bgai",
+        )
+    else:
+        print(f"Connecting to Ray cluster at {address}...")
+        ray.init(
+            address=address,
+            namespace="bgai",
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": project_dir,
+                    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
+                }
+            },
+        )
 
     # Get coordinator handle
     coordinator = get_coordinator('coordinator')
@@ -165,19 +173,26 @@ def start_training_worker(args):
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # Connect to Ray cluster
-    print(f"Connecting to Ray cluster at {args.coordinator_address}...")
-    ray.init(
-        address=args.coordinator_address,
-        namespace="bgai",
-        runtime_env={
-            "env_vars": {
-                "PYTHONPATH": project_dir,
-                # Limit JAX memory to allow multiple workers on same GPU
-                # Based on benchmarks: ~2GB per worker, 25% = 6GB headroom on 24GB GPU
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
-            }
-        },
-    )
+    # 'auto' = connect to local Ray instance (joined via 'ray start --address')
+    address = args.coordinator_address
+    if address == "auto":
+        print("Connecting to local Ray cluster (distributed mode)...")
+        ray.init(
+            address="auto",
+            namespace="bgai",
+        )
+    else:
+        print(f"Connecting to Ray cluster at {address}...")
+        ray.init(
+            address=address,
+            namespace="bgai",
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": project_dir,
+                    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
+                }
+            },
+        )
 
     # Get coordinator handle
     coordinator = get_coordinator('coordinator')
@@ -244,18 +259,26 @@ def start_eval_worker(args):
     project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # Connect to Ray cluster
-    print(f"Connecting to Ray cluster at {args.coordinator_address}...")
-    ray.init(
-        address=args.coordinator_address,
-        namespace="bgai",
-        runtime_env={
-            "env_vars": {
-                "PYTHONPATH": project_dir,
-                # Limit JAX memory to allow multiple workers on same GPU
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
-            }
-        },
-    )
+    # 'auto' = connect to local Ray instance (joined via 'ray start --address')
+    address = args.coordinator_address
+    if address == "auto":
+        print("Connecting to local Ray cluster (distributed mode)...")
+        ray.init(
+            address="auto",
+            namespace="bgai",
+        )
+    else:
+        print(f"Connecting to Ray cluster at {address}...")
+        ray.init(
+            address=address,
+            namespace="bgai",
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": project_dir,
+                    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
+                }
+            },
+        )
 
     # Get coordinator handle
     coordinator = get_coordinator('coordinator')

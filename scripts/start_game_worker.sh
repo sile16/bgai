@@ -39,8 +39,35 @@ fi
 REDIS_HOST="$HEAD_IP"
 REDIS_PORT="6379"
 REDIS_PASSWORD="bgai-password"
-RAY_CLIENT_PORT="10001"
+RAY_PORT="6380"
 LOG_DIR="$PROJECT_DIR/logs"
+
+# =============================================================================
+# Join Ray cluster as worker node (for distributed resources)
+# =============================================================================
+join_ray_cluster() {
+    # Check if already connected to a Ray cluster
+    if ray status &>/dev/null; then
+        echo "Already connected to Ray cluster"
+        return 0
+    fi
+
+    echo "Joining Ray cluster at $HEAD_IP:$RAY_PORT..."
+    ray start --address="$HEAD_IP:$RAY_PORT" --block &
+    RAY_PID=$!
+
+    # Wait for connection
+    for i in {1..30}; do
+        if ray status &>/dev/null; then
+            echo "Successfully joined Ray cluster"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "ERROR: Failed to join Ray cluster after 30 seconds"
+    return 1
+}
 
 # =============================================================================
 # Auto-detect platform and set appropriate parameters
@@ -124,15 +151,19 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$LOG_DIR/game_${WORKER_ID}_${TIMESTAMP}.log"
 
 echo "=============================================="
-echo "  BGAI Game Worker"
+echo "  BGAI Game Worker (Distributed Mode)"
 echo "=============================================="
 echo "Platform:    $PLATFORM"
 echo "Worker ID:   $WORKER_ID"
 echo "Batch size:  $BATCH_SIZE"
 echo "MCTS sims:   $MCTS_SIMULATIONS"
 echo "MCTS nodes:  $MCTS_MAX_NODES"
-echo "Head node:   $HEAD_IP:$RAY_CLIENT_PORT"
+echo "Head node:   $HEAD_IP:$RAY_PORT"
 echo "Log file:    $LOG_FILE"
+echo ""
+
+# Join the Ray cluster first
+join_ray_cluster || exit 1
 echo ""
 
 # =============================================================================
@@ -161,7 +192,7 @@ run_worker_loop() {
 
         echo "$(date): Starting game worker..."
         python -m distributed.cli.main game-worker \
-            --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
+            --coordinator-address "auto" \
             --worker-id "$WORKER_ID" \
             --batch-size "$BATCH_SIZE" \
             --mcts-simulations "$MCTS_SIMULATIONS" \

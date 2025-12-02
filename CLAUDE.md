@@ -121,12 +121,50 @@ redis-server --daemonize yes --requirepass bgai-password
 - **Training Workers** (`distributed/workers/training_worker.py`): Train neural network from replay buffer
 - **Redis Buffer** (`distributed/buffer/redis_buffer.py`): Stores experiences with FIFO eviction and surprise-weighted sampling
 
+### Adding Remote Workers (Distributed Mode)
+
+Remote machines join as Ray worker nodes for true distributed computing:
+
+```bash
+# On remote machine (iMac, MacBook, etc):
+git pull  # Get latest code
+./scripts/start_game_worker.sh  # Joins cluster + starts worker
+```
+
+The script automatically:
+1. Joins the Ray cluster with `ray start --address=<head_ip>:6380`
+2. Starts a game worker that uses local CPU/GPU resources
+3. Auto-restarts on disconnect with exponential backoff
+
+Stop with: `touch logs/game_<worker_id>.stop`
+
 ### Metrics & Monitoring
 
 Workers expose Prometheus metrics on ports 9100 (game) and 9200 (training):
 - Dynamic discovery via Redis registration
 - Grafana dashboard at `tools/grafana_bgai_dashboard.json`
 - Key metrics: `bgai_training_loss`, `bgai_games_total`, `bgai_surprise_score_*`
+
+### Updating Grafana Dashboard
+
+The dashboard is auto-provisioned from `tools/grafana_bgai_dashboard.json`.
+
+**To apply dashboard changes:**
+1. Edit `tools/grafana_bgai_dashboard.json`
+2. Delete the old dashboard via API or UI:
+   ```bash
+   curl -X DELETE -u admin:admin "http://localhost:3000/api/dashboards/uid/bgai-training"
+   ```
+3. Restart Grafana to re-provision:
+   ```bash
+   pkill -f grafana-server
+   # Grafana restarts automatically via start_all_head.sh, or manually:
+   /path/to/grafana-server --homepath=... --config=... &
+   ```
+
+**Provisioning config:** `tools/grafana-11.3.0/conf/provisioning/dashboards/bgai.yaml`
+- Dashboard reloads every 30 seconds (updateIntervalSeconds)
+- Changes to existing dashboards require deletion + re-provision
 
 ### Configuration
 
