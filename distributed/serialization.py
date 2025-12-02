@@ -363,6 +363,74 @@ def deserialize_checkpoint_metadata(data: bytes) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Warm Tree Serialization (for MCTS tree sharing)
+# =============================================================================
+
+def serialize_warm_tree(tree_state: Any) -> bytes:
+    """Serialize an MCTS tree state for sharing across workers.
+
+    The warm tree is a pre-computed deep MCTS tree from the initial game
+    position that workers can use as a starting point.
+
+    Args:
+        tree_state: MCTSTree state from the evaluator.
+
+    Returns:
+        Serialized bytes that can be stored in Redis.
+
+    Example:
+        >>> warm_tree = mcts_evaluator.init(template_state)
+        >>> # Run deep MCTS
+        >>> for _ in range(5000):
+        ...     warm_tree = mcts_evaluator.iterate(key, warm_tree, params, step_fn)
+        >>> tree_bytes = serialize_warm_tree(warm_tree)
+    """
+    jax, jnp = _get_jax()
+
+    def to_numpy(x):
+        """Convert JAX arrays to numpy arrays."""
+        if hasattr(x, 'device'):  # JAX array
+            return np.array(x)
+        return x
+
+    numpy_tree = jax.tree_util.tree_map(to_numpy, tree_state)
+
+    buffer = io.BytesIO()
+    pickle.dump(numpy_tree, buffer, protocol=pickle.HIGHEST_PROTOCOL)
+    return buffer.getvalue()
+
+
+def deserialize_warm_tree(data: bytes) -> Any:
+    """Deserialize a warm MCTS tree state.
+
+    Converts numpy arrays back to JAX arrays on the current device.
+
+    Args:
+        data: Serialized tree bytes from serialize_warm_tree()
+
+    Returns:
+        MCTSTree state ready for use with the evaluator.
+
+    Example:
+        >>> tree_bytes = redis.get('bgai:model:warm_tree')
+        >>> warm_tree = deserialize_warm_tree(tree_bytes)
+        >>> # Use warm_tree as initial eval_state
+    """
+    jax, jnp = _get_jax()
+
+    buffer = io.BytesIO(data)
+    numpy_tree = pickle.load(buffer)
+
+    def to_jax(x):
+        """Convert numpy arrays to JAX arrays."""
+        if isinstance(x, np.ndarray):
+            return jnp.array(x)
+        return x
+
+    return jax.tree_util.tree_map(to_jax, numpy_tree)
+
+
+# =============================================================================
 # Utility Functions
 # =============================================================================
 

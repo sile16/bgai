@@ -42,7 +42,6 @@ fi
 REDIS_HOST="$HEAD_IP"
 REDIS_PORT="6379"
 REDIS_PASSWORD="bgai-password"
-RAY_CLIENT_PORT="10001"
 CHECKPOINT_DIR="$PROJECT_DIR/checkpoints"
 LOG_DIR="$PROJECT_DIR/logs"
 
@@ -135,7 +134,7 @@ echo "Platform:      $PLATFORM"
 echo "Worker ID:     $WORKER_ID"
 echo "Batch size:    $BATCH_SIZE"
 echo "Learning rate: $LEARNING_RATE"
-echo "Head node:     $HEAD_IP:$RAY_CLIENT_PORT"
+echo "Redis:         $REDIS_HOST:$REDIS_PORT"
 echo "Checkpoints:   $CHECKPOINT_DIR"
 echo "Log file:      $LOG_FILE"
 echo ""
@@ -145,14 +144,10 @@ echo ""
 # =============================================================================
 echo "Starting training worker..."
 python -m distributed.cli.main training-worker \
-    --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
     --worker-id "$WORKER_ID" \
     --batch-size "$BATCH_SIZE" \
     --learning-rate "$LEARNING_RATE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --min-buffer-size "$MIN_BUFFER_SIZE" \
-    --weight-push-interval "$WEIGHT_PUSH_INTERVAL" \
-    --checkpoint-interval "$CHECKPOINT_INTERVAL" \
     --redis-host "$REDIS_HOST" \
     --redis-port "$REDIS_PORT" \
     --redis-password "$REDIS_PASSWORD" \

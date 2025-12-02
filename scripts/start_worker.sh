@@ -1,6 +1,6 @@
 #!/bin/bash
 # Unified worker script for BGAI distributed training
-# Handles Ray connection, worker type detection, and hardware-specific settings
+# Workers connect to Redis directly (no Ray required)
 #
 # Usage:
 #   ./scripts/start_worker.sh                          # Start game worker (default)
@@ -42,14 +42,14 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 
 # Parse head node IPs from config
-TAILSCALE_IP=$(grep "head_ip:" "$CONFIG_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-LOCAL_IP=$(grep "head_ip_local:" "$CONFIG_FILE" | sed 's/.*: *"\([^"]*\)".*/\1/')
-RAY_PORT=$(grep "gcs_port:" "$CONFIG_FILE" | sed 's/.*: *\([0-9]*\).*/\1/')
+TAILSCALE_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host:" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+LOCAL_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host_local:" | sed 's/.*: *"\([^"]*\)".*/\1/')
+REDIS_PORT=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "port:" | sed 's/.*: *\([0-9]*\).*/\1/')
 
 # Fallback defaults
 TAILSCALE_IP="${TAILSCALE_IP:-100.105.50.111}"
 LOCAL_IP="${LOCAL_IP:-192.168.20.40}"
-RAY_PORT="${RAY_PORT:-6380}"
+REDIS_PORT="${REDIS_PORT:-6379}"
 
 # Try Tailscale IP first, fallback to local IP
 if ping -c 1 -W 1 "$TAILSCALE_IP" &>/dev/null; then
@@ -70,20 +70,12 @@ detect_platform() {
     if [[ "$OS_TYPE" == "Darwin" ]]; then
         PLATFORM="mac"
         DEVICE_TYPE="metal"
-        # Mac: eval runs on CPU to free up Metal for game workers
-        EVAL_NUM_GPUS=0
-        GAME_NUM_GPUS=0
     elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         PLATFORM="cuda"
         DEVICE_TYPE="cuda"
-        # CUDA: can run eval on GPU
-        EVAL_NUM_GPUS=0.25
-        GAME_NUM_GPUS=0.5
     else
         PLATFORM="cpu"
         DEVICE_TYPE="cpu"
-        EVAL_NUM_GPUS=0
-        GAME_NUM_GPUS=0
     fi
 
     # Check for gnubg
@@ -167,7 +159,7 @@ echo "=============================================="
 echo "Platform:     $PLATFORM ($DEVICE_TYPE)"
 echo "Worker types: ${WORKER_TYPES[*]}"
 echo "Worker ID:    $WORKER_ID_BASE"
-echo "Head node:    $HEAD_IP:$RAY_PORT"
+echo "Redis:        $HEAD_IP:$REDIS_PORT"
 echo "Config file:  $CONFIG_FILE"
 if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
     echo "Game batch:   $CUSTOM_GAME_BATCH (override)"
@@ -176,64 +168,6 @@ if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
     echo "Eval batch:   $CUSTOM_EVAL_BATCH (override)"
 fi
 echo "gnubg:        $(if $GNUBG_AVAILABLE; then echo "available"; else echo "not found"; fi)"
-echo ""
-
-# =============================================================================
-# Connect to Ray cluster
-# =============================================================================
-connect_ray_cluster() {
-    echo "Checking Ray connection..."
-
-    # Check if already connected to the correct cluster
-    if ray status &>/dev/null; then
-        CURRENT_HEAD=$(ray status 2>/dev/null | grep -o 'address[^:]*:[0-9.]*' | sed 's/.*://' | head -1 || echo "")
-        if [[ "$CURRENT_HEAD" == "$HEAD_IP" ]] || [[ "$CURRENT_HEAD" == "0.0.0.0" ]]; then
-            echo "Already connected to Ray cluster"
-            return 0
-        else
-            echo "Connected to different cluster, reconnecting..."
-            ray stop --force 2>/dev/null || true
-            sleep 2
-        fi
-    fi
-
-    # Enable multi-node clusters on Mac/Windows
-    export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
-
-    echo "Joining Ray cluster at $HEAD_IP:$RAY_PORT..."
-
-    # Get system info for node labeling
-    local node_name="${HOSTNAME_SHORT}"
-    local num_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "4")
-    local mem_bytes=$(free -b 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null || echo "8000000000")
-
-    # Start Ray and join cluster with node info
-    if ! ray start \
-        --address="$HEAD_IP:$RAY_PORT" \
-        --node-name="$node_name" \
-        --num-cpus="$num_cpus" \
-        --resources="{\"${PLATFORM}\": 1}" \
-        2>&1; then
-        echo "ERROR: Failed to join Ray cluster"
-        echo "Make sure the head node is running: ./scripts/start_all_head.sh"
-        return 1
-    fi
-
-    # Wait for connection to stabilize
-    sleep 3
-
-    # Verify connection
-    if ray status &>/dev/null; then
-        NODE_COUNT=$(ray status 2>/dev/null | grep -c "node_" || echo "0")
-        echo "Successfully joined Ray cluster ($NODE_COUNT nodes)"
-        return 0
-    else
-        echo "ERROR: Ray connection verification failed"
-        return 1
-    fi
-}
-
-connect_ray_cluster || exit 1
 echo ""
 
 # =============================================================================
@@ -273,10 +207,6 @@ start_game_worker() {
 
     if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_GAME_BATCH"
-    fi
-
-    if [[ "$GAME_NUM_GPUS" != "0" ]]; then
-        cmd="$cmd --num-gpus $GAME_NUM_GPUS"
     fi
 
     # Run with auto-restart loop
@@ -328,14 +258,9 @@ start_eval_worker() {
     local cmd="python -m distributed.cli.main eval-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --worker-id $worker_id"
-    cmd="$cmd --eval-types $eval_types"
 
     if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_EVAL_BATCH"
-    fi
-
-    if [[ "$EVAL_NUM_GPUS" != "0" ]]; then
-        cmd="$cmd --num-gpus $EVAL_NUM_GPUS"
     fi
 
     # Run with auto-restart loop
@@ -399,4 +324,4 @@ for worker_type in "${WORKER_TYPES[@]}"; do
 done
 echo ""
 echo "Check cluster status:"
-echo "  ray status"
+echo "  ./scripts/status.sh"

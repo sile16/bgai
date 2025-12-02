@@ -33,18 +33,14 @@ fi
 echo "Loading config from: $CONFIG_FILE"
 
 # Parse values from config (simple grep/sed approach)
-TAILSCALE_IP=$(grep "head_ip:" "$CONFIG_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-LOCAL_IP=$(grep "head_ip_local:" "$CONFIG_FILE" | sed 's/.*: *"\([^"]*\)".*/\1/')
-RAY_PORT=$(grep "gcs_port:" "$CONFIG_FILE" | sed 's/.*: *\([0-9]*\).*/\1/')
-RAY_CLIENT_PORT=$(grep "client_port:" "$CONFIG_FILE" | sed 's/.*: *\([0-9]*\).*/\1/')
+TAILSCALE_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host:" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+LOCAL_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host_local:" | sed 's/.*: *"\([^"]*\)".*/\1/')
 REDIS_PORT=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "port:" | sed 's/.*: *\([0-9]*\).*/\1/')
 REDIS_PASSWORD=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "password:" | sed 's/.*: *"\([^"]*\)".*/\1/')
 
 # Fallback defaults
 TAILSCALE_IP="${TAILSCALE_IP:-100.105.50.111}"
 LOCAL_IP="${LOCAL_IP:-192.168.20.40}"
-RAY_PORT="${RAY_PORT:-6380}"
-RAY_CLIENT_PORT="${RAY_CLIENT_PORT:-10001}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 REDIS_PASSWORD="${REDIS_PASSWORD:-bgai-password}"
 
@@ -82,13 +78,12 @@ echo ""
 # =============================================================================
 # Stop existing processes
 # =============================================================================
-echo "[1/5] Stopping any existing Ray cluster..."
-ray stop --force 2>/dev/null || true
+echo "[1/5] Stopping any existing workers..."
 pkill -f "distributed.cli.main" 2>/dev/null || true
 sleep 2
 
 # =============================================================================
-# Set PYTHONPATH so Ray workers can find the distributed module
+# Set PYTHONPATH
 # =============================================================================
 export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
 echo "PYTHONPATH set to: $PYTHONPATH"
@@ -102,26 +97,9 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25
 echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24GB GPU)"
 
 # =============================================================================
-# Start Ray head node
-# =============================================================================
-echo "[2/5] Starting Ray head node..."
-# Bind to 0.0.0.0 to accept connections from both Tailscale and LAN
-RAY_RUNTIME_ENV_CREATE_WORKING_DIR=1 ray start --head \
-    --port="$RAY_PORT" \
-    --ray-client-server-port="$RAY_CLIENT_PORT" \
-    --dashboard-host=0.0.0.0 \
-    --node-ip-address=0.0.0.0 \
-    --num-cpus=16 \
-    --num-gpus=1
-
-echo "       Ray dashboard: http://$HEAD_IP:8265"
-echo "       Workers connect to: ray://$HEAD_IP:$RAY_CLIENT_PORT"
-sleep 3
-
-# =============================================================================
 # Start Prometheus metrics with custom BGAI config
 # =============================================================================
-echo "       Starting Prometheus metrics..."
+echo "[2/5] Starting Prometheus metrics..."
 PROMETHEUS_BIN="$PROJECT_DIR/tools/prometheus/prometheus"
 PROMETHEUS_CONFIG="$PROJECT_DIR/tools/prometheus_bgai.yml"
 
@@ -136,18 +114,18 @@ if [[ -f "$PROMETHEUS_BIN" ]]; then
         --web.enable-lifecycle \
         > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
     PROMETHEUS_PID=$!
-    echo "       Prometheus PID: $PROMETHEUS_PID (custom BGAI config)"
+    echo "       Prometheus PID: $PROMETHEUS_PID"
 else
-    # Fallback to Ray's built-in Prometheus
-    ray metrics launch-prometheus > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
-    PROMETHEUS_PID=$!
-    echo "       Prometheus PID: $PROMETHEUS_PID (Ray default)"
+    echo "       WARNING: Prometheus not found. Metrics collection disabled."
+    PROMETHEUS_PID=""
 fi
-echo "       Prometheus UI: http://$HEAD_IP:9090"
+if [[ -n "$PROMETHEUS_PID" ]]; then
+    echo "       Prometheus UI: http://$HEAD_IP:9090"
+fi
 sleep 2
 
 # =============================================================================
-# Start Grafana for Ray dashboard metrics visualization
+# Start Grafana for metrics visualization
 # =============================================================================
 GRAFANA_DIR="$PROJECT_DIR/tools/grafana-11.3.0"
 if [[ -d "$GRAFANA_DIR" ]]; then
@@ -191,7 +169,7 @@ sleep 2
 # =============================================================================
 # Start Coordinator (uses config file for all settings)
 # =============================================================================
-echo "[3/5] Starting coordinator..."
+echo "[3/4] Starting coordinator..."
 python -m distributed.cli.main coordinator \
     --config-file "$CONFIG_FILE" \
     --dashboard \
@@ -211,7 +189,7 @@ fi
 # =============================================================================
 # Start Training Worker (uses config file, 0.5 GPU to share with game worker)
 # =============================================================================
-echo "[4/5] Starting training worker..."
+echo "[4/4] Starting training worker..."
 python -m distributed.cli.main training-worker \
     --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
@@ -224,7 +202,7 @@ echo "       Log: $LOG_DIR/training_$TIMESTAMP.log"
 # =============================================================================
 # Start GPU Game Worker (uses config file, 0.5 GPU to share with training worker)
 # =============================================================================
-echo "[5/5] Starting GPU game worker..."
+echo "       Starting GPU game worker..."
 python -m distributed.cli.main game-worker \
     --config-file "$CONFIG_FILE" \
     --worker-id "gpu-head" \
@@ -252,12 +230,13 @@ echo "  Training worker: $TRAIN_PID"
 echo "  Game worker:     $GAME_PID"
 echo ""
 echo "Dashboards:"
-echo "  Ray Dashboard:   http://$HEAD_IP:8265"
 echo "  Grafana:         http://$HEAD_IP:3000"
 echo "  Prometheus:      http://$HEAD_IP:9090"
 echo ""
 echo "Logs:"
+if [[ -n "$PROMETHEUS_PID" ]]; then
 echo "  tail -f $LOG_DIR/prometheus_$TIMESTAMP.log"
+fi
 if [[ -n "$GRAFANA_PID" ]]; then
 echo "  tail -f $LOG_DIR/grafana_$TIMESTAMP.log"
 fi
@@ -274,6 +253,4 @@ echo ""
 echo "Stop all:"
 echo "  ./scripts/stop_all.sh"
 echo ""
-echo "Remote workers connect with:"
-echo "  ray://$HEAD_IP:$RAY_CLIENT_PORT"
-echo "  Redis: $REDIS_HOST:$REDIS_PORT"
+echo "Remote workers connect via Redis: $REDIS_HOST:$REDIS_PORT"

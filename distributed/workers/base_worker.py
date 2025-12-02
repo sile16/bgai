@@ -2,23 +2,31 @@
 
 This module provides the abstract base class for all worker types
 (game, training, evaluation) with common functionality like:
-- Coordinator registration and heartbeat
+- Redis-based registration and heartbeat
 - Device detection and configuration
+- Model weight synchronization
 - Graceful shutdown handling
+
+No Ray dependency - uses Redis for all coordination.
 """
 
 import time
 import threading
+import signal
+import sys
 import socket
-import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
-import ray
-
+from ..coordinator.redis_state import (
+    RedisStateManager,
+    WorkerInfo,
+    create_state_manager,
+    HEARTBEAT_INTERVAL,
+    WORKER_TTL,
+)
 from ..device import detect_device, get_device_config, DeviceInfo
-from ..config import DistributedConfig
 
 
 @dataclass
@@ -31,11 +39,11 @@ class WorkerStats:
     start_time: float = 0.0
     last_heartbeat_time: float = 0.0
 
-    def to_heartbeat_stats(self, reset: bool = True) -> Dict[str, Any]:
-        """Convert to stats dict for heartbeat, optionally resetting counters."""
+    def get_heartbeat_stats(self, reset: bool = True) -> Dict[str, Any]:
+        """Get stats for heartbeat, optionally resetting counters."""
         stats = {
-            'games_since_last': self.games_generated,
-            'training_steps_since_last': self.training_steps,
+            'games_generated': self.games_generated,
+            'training_steps': self.training_steps,
             'status': 'working',
         }
         if reset:
@@ -48,8 +56,9 @@ class BaseWorker(ABC):
     """Abstract base class for distributed workers.
 
     Provides common functionality for all worker types:
-    - Coordinator communication (registration, heartbeat)
+    - Redis-based registration and heartbeat
     - Device detection and configuration
+    - Model weight synchronization
     - Graceful shutdown handling
 
     Subclasses must implement:
@@ -59,24 +68,41 @@ class BaseWorker(ABC):
 
     def __init__(
         self,
-        coordinator_handle: ray.actor.ActorHandle,
-        worker_id: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
     ):
         """Initialize the base worker.
 
         Args:
-            coordinator_handle: Ray actor handle for the coordinator.
+            config: Configuration dict with:
+                - redis_host: Redis server host
+                - redis_port: Redis server port
+                - redis_password: Redis password (optional)
+                - heartbeat_interval: Seconds between heartbeats
+                - metrics_port: Prometheus metrics port
             worker_id: Optional unique worker ID. Auto-generated if not provided.
-            config: Optional configuration dict from coordinator.
         """
-        self.coordinator = coordinator_handle
-        self.worker_id = worker_id or self._generate_worker_id()
         self.config = config or {}
+        self.worker_id = worker_id or self._generate_worker_id()
 
         # Device info
         self.device_info = detect_device()
         self.device_config = get_device_config(self.device_info)
+
+        # Create Redis state manager
+        self.state = create_state_manager(self.config)
+
+        # Verify Redis connection
+        if not self.state.ping():
+            raise ConnectionError(
+                f"Cannot connect to Redis at "
+                f"{self.config.get('redis_host', 'localhost')}:"
+                f"{self.config.get('redis_port', 6379)}"
+            )
+
+        # Configuration
+        self.heartbeat_interval = self.config.get('heartbeat_interval', HEARTBEAT_INTERVAL)
+        self.metrics_port = self.config.get('metrics_port', 9100)
 
         # State
         self.running = False
@@ -88,192 +114,17 @@ class BaseWorker(ABC):
 
         # Heartbeat thread
         self._heartbeat_thread: Optional[threading.Thread] = None
-        self._heartbeat_interval = self.config.get('heartbeat_interval', 10.0)
-
-    def _generate_worker_id(self) -> str:
-        """Generate a unique worker ID."""
-        hostname = socket.gethostname()
-        short_uuid = uuid.uuid4().hex[:8]
-        return f"{self.worker_type}-{hostname}-{short_uuid}"
+        self._heartbeat_stop_event = threading.Event()
 
     @property
     @abstractmethod
     def worker_type(self) -> str:
-        """Return the worker type string ('game', 'training', 'evaluation')."""
+        """Return the worker type string ('game', 'training', 'eval')."""
         pass
-
-    # =========================================================================
-    # Coordinator Communication
-    # =========================================================================
-
-    def register(self) -> bool:
-        """Register with the coordinator.
-
-        Returns:
-            True if registration was successful.
-        """
-        device_info_dict = {
-            'device_type': 'cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu',
-            'device_name': self.device_info.device_kind,
-            'hostname': socket.gethostname(),
-        }
-
-        print(f"Worker {self.worker_id}: Attempting to register with coordinator...")
-        print(f"  Device info: {device_info_dict}")
-
-        try:
-            print(f"Worker {self.worker_id}: Calling coordinator.register_worker.remote()...")
-            future = self.coordinator.register_worker.remote(
-                self.worker_id,
-                self.worker_type,
-                device_info_dict,
-            )
-            print(f"Worker {self.worker_id}: Waiting for registration response (timeout=30s)...")
-            result = ray.get(future, timeout=30)
-            print(f"Worker {self.worker_id}: Got registration response: {result}")
-
-            if result['status'] == 'registered':
-                self.registered = True
-                self.current_model_version = result.get('model_version', 0)
-
-                # Merge coordinator config with our config
-                if 'config' in result:
-                    self.config.update(result['config'])
-
-                print(f"Worker {self.worker_id} registered successfully (model_version={self.current_model_version})")
-                return True
-            else:
-                print(f"Worker {self.worker_id}: Registration failed: {result}")
-                return False
-
-        except ray.exceptions.GetTimeoutError:
-            print(f"Worker {self.worker_id}: Registration TIMEOUT - coordinator not responding")
-            return False
-        except Exception as e:
-            import traceback
-            print(f"Worker {self.worker_id}: Registration error: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            return False
-
-    def deregister(self) -> bool:
-        """Deregister from the coordinator.
-
-        Returns:
-            True if deregistration was successful.
-        """
-        if not self.registered:
-            return True
-
-        try:
-            result = ray.get(self.coordinator.deregister_worker.remote(self.worker_id))
-            self.registered = False
-            print(f"Worker {self.worker_id} deregistered")
-            return result['status'] == 'deregistered'
-        except Exception as e:
-            print(f"Deregistration error: {e}")
-            return False
-
-    def _send_heartbeat(self) -> Dict[str, Any]:
-        """Send heartbeat to coordinator.
-
-        Returns:
-            Coordinator response dict.
-        """
-        stats = self.stats.to_heartbeat_stats(reset=True)
-        self.stats.last_heartbeat_time = time.time()
-
-        try:
-            return ray.get(self.coordinator.heartbeat.remote(self.worker_id, stats))
-        except Exception as e:
-            print(f"Heartbeat error: {e}")
-            return {'status': 'error', 'message': str(e)}
-
-    def _heartbeat_loop(self) -> None:
-        """Background thread for sending heartbeats."""
-        while self.running:
-            try:
-                response = self._send_heartbeat()
-
-                # Check for model updates
-                if response.get('new_model_available'):
-                    new_version = response.get('new_model_version', 0)
-                    if new_version > self.current_model_version:
-                        self._on_model_update_available(new_version)
-
-                # Check if we need to re-register
-                if response.get('should_register'):
-                    self.register()
-
-            except Exception as e:
-                print(f"Heartbeat loop error: {e}")
-
-            # Sleep until next heartbeat
-            time.sleep(self._heartbeat_interval)
-
-    def _start_heartbeat(self) -> None:
-        """Start the heartbeat background thread."""
-        if self._heartbeat_thread is not None:
-            return
-
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
-            name=f"heartbeat-{self.worker_id}",
-        )
-        self._heartbeat_thread.start()
-
-    def _stop_heartbeat(self) -> None:
-        """Stop the heartbeat background thread."""
-        # Thread will stop when self.running becomes False
-        self._heartbeat_thread = None
-
-    def _on_model_update_available(self, new_version: int) -> None:
-        """Called when a new model version is available.
-
-        Subclasses can override to fetch and apply new weights.
-
-        Args:
-            new_version: The new model version number.
-        """
-        pass  # Subclasses implement this
-
-    # =========================================================================
-    # Model Weights
-    # =========================================================================
-
-    def fetch_model_weights(self) -> Optional[bytes]:
-        """Fetch current model weights from coordinator.
-
-        Returns:
-            Serialized model weights or None if not available.
-        """
-        try:
-            weights, version = ray.get(self.coordinator.get_model_weights.remote())
-            if weights is not None:
-                self.current_model_version = version
-                self._acknowledge_model_version(version)
-            return weights
-        except Exception as e:
-            print(f"Error fetching model weights: {e}")
-            return None
-
-    def _acknowledge_model_version(self, version: int) -> None:
-        """Acknowledge receipt of model version to coordinator."""
-        try:
-            ray.get(self.coordinator.acknowledge_model_version.remote(
-                self.worker_id,
-                version,
-            ))
-        except Exception as e:
-            print(f"Error acknowledging model version: {e}")
-
-    # =========================================================================
-    # Main Loop
-    # =========================================================================
 
     @abstractmethod
     def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:
-        """Main worker loop. Must be implemented by subclasses.
+        """Main worker loop to be implemented by subclasses.
 
         Args:
             num_iterations: Number of iterations to run (-1 for infinite).
@@ -282,6 +133,165 @@ class BaseWorker(ABC):
             Dict with results/statistics from the run.
         """
         pass
+
+    # =========================================================================
+    # Worker ID Generation
+    # =========================================================================
+
+    def _generate_worker_id(self) -> str:
+        """Generate a unique worker ID."""
+        import uuid
+        hostname = socket.gethostname().split('.')[0]
+        short_id = uuid.uuid4().hex[:8]
+        return f"{self.worker_type}-{hostname}-{short_id}"
+
+    # =========================================================================
+    # Registration and Heartbeat
+    # =========================================================================
+
+    def register(self) -> bool:
+        """Register with Redis.
+
+        Returns:
+            True if registration was successful.
+        """
+        print(f"Worker {self.worker_id}: Registering...")
+
+        info = WorkerInfo(
+            worker_id=self.worker_id,
+            worker_type=self.worker_type,
+            device_type='cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu',
+            device_name=self.device_info.device_kind,
+            hostname=socket.gethostname(),
+            metrics_port=self.metrics_port,
+            status='idle',
+            model_version=0,
+        )
+
+        try:
+            self.state.register_worker(info, ttl=WORKER_TTL)
+            self.registered = True
+            self.current_model_version = self.state.get_model_version()
+
+            print(f"Worker {self.worker_id}: Registered successfully")
+            print(f"  Device: {info.device_type} ({info.device_name})")
+            print(f"  Model version: {self.current_model_version}")
+            return True
+
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Registration failed: {e}")
+            return False
+
+    def deregister(self) -> bool:
+        """Deregister from Redis.
+
+        Returns:
+            True if deregistration was successful.
+        """
+        if not self.registered:
+            return True
+
+        try:
+            self.state.deregister_worker(self.worker_id)
+            self.registered = False
+            print(f"Worker {self.worker_id}: Deregistered")
+            return True
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Deregistration failed: {e}")
+            return False
+
+    def _heartbeat(self) -> bool:
+        """Send heartbeat to Redis.
+
+        Returns:
+            True if heartbeat was successful.
+        """
+        try:
+            stats = self.stats.get_heartbeat_stats(reset=True)
+            stats['model_version'] = self.current_model_version
+
+            success = self.state.heartbeat_worker(
+                self.worker_id,
+                stats=stats,
+                ttl=WORKER_TTL,
+            )
+
+            if not success:
+                # Worker key expired, re-register
+                print(f"Worker {self.worker_id}: Heartbeat failed, re-registering...")
+                return self.register()
+
+            self.stats.last_heartbeat_time = time.time()
+            return True
+
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Heartbeat error: {e}")
+            return False
+
+    def _start_heartbeat(self) -> None:
+        """Start the heartbeat background thread."""
+        self._heartbeat_stop_event.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """Stop the heartbeat background thread."""
+        self._heartbeat_stop_event.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=5)
+
+    def _heartbeat_loop(self) -> None:
+        """Background heartbeat loop."""
+        while not self._heartbeat_stop_event.is_set():
+            self._heartbeat()
+            # Wait in small increments for responsive shutdown
+            for _ in range(int(self.heartbeat_interval)):
+                if self._heartbeat_stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    # =========================================================================
+    # Model Weight Synchronization
+    # =========================================================================
+
+    def check_for_model_update(self) -> bool:
+        """Check if a newer model is available.
+
+        Returns:
+            True if newer model is available.
+        """
+        latest_version = self.state.get_model_version()
+        return latest_version > self.current_model_version
+
+    def get_model_weights(self) -> Optional[tuple]:
+        """Get model weights if newer version available.
+
+        Returns:
+            Tuple of (weights_bytes, version) if newer available, None otherwise.
+        """
+        result = self.state.get_model_weights_if_newer(self.current_model_version)
+        if result:
+            weights, version = result
+            self.current_model_version = version
+            return result
+        return None
+
+    def get_current_model_weights(self) -> Optional[tuple]:
+        """Get current model weights regardless of version.
+
+        Returns:
+            Tuple of (weights_bytes, version) or None if no weights available.
+        """
+        weights = self.state.get_model_weights()
+        version = self.state.get_model_version()
+        if weights:
+            self.current_model_version = version
+            return (weights, version)
+        return None
+
+    # =========================================================================
+    # Lifecycle
+    # =========================================================================
 
     def run(self, num_iterations: int = -1) -> Dict[str, Any]:
         """Run the worker.
@@ -292,7 +302,11 @@ class BaseWorker(ABC):
         Returns:
             Dict with results/statistics from the run.
         """
-        # Register with coordinator
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+
+        # Register with Redis
         if not self.register():
             return {'status': 'error', 'message': 'Failed to register'}
 
@@ -305,14 +319,28 @@ class BaseWorker(ABC):
             # Run the main loop
             result = self._run_loop(num_iterations)
             return result
+        except KeyboardInterrupt:
+            print(f"\nWorker {self.worker_id}: Interrupted")
+            return {'status': 'interrupted'}
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'status': 'error', 'message': str(e)}
         finally:
             self.stop()
 
     def stop(self) -> None:
         """Stop the worker gracefully."""
+        print(f"Worker {self.worker_id}: Stopping...")
         self.running = False
         self._stop_heartbeat()
         self.deregister()
+
+    def _handle_signal(self, signum: int, frame) -> None:
+        """Handle shutdown signals."""
+        self.stop()
+        sys.exit(0)
 
     # =========================================================================
     # Utility Methods
@@ -330,12 +358,15 @@ class BaseWorker(ABC):
             'device_type': self.device_info.platform,
             'device_name': self.device_info.device_kind,
             'model_version': self.current_model_version,
-            'running': self.running,
-            'registered': self.registered,
-            'uptime_seconds': time.time() - self.stats.start_time,
-            'total_games': self.stats.games_generated,
-            'total_training_steps': self.stats.training_steps,
+            'uptime': time.time() - self.stats.start_time,
+            'games_generated': self.stats.games_generated,
+            'training_steps': self.stats.training_steps,
         }
 
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(id={self.worker_id}, type={self.worker_type})"
+    def is_training_active(self) -> bool:
+        """Check if training is currently active.
+
+        Returns:
+            True if training run is active.
+        """
+        return self.state.is_training_active()

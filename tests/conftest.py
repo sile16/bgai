@@ -1,9 +1,13 @@
-"""Pytest configuration and shared fixtures for distributed training tests."""
+"""Pytest configuration and shared fixtures for distributed training tests.
+
+No Ray dependency - tests use Redis for coordination.
+"""
 
 import pytest
 import jax
 import jax.numpy as jnp
 from typing import Generator, Optional
+from unittest.mock import MagicMock, patch
 
 from distributed.device import detect_device, DeviceInfo
 
@@ -100,27 +104,39 @@ def redis_client(redis_available: bool):
     yield client
 
     # Cleanup test keys after all tests
-    for key in client.keys("test:*"):
+    for key in client.keys("bgai:test:*"):
         client.delete(key)
 
 
-# ============================================================================
-# Ray Fixtures
-# ============================================================================
+@pytest.fixture
+def mock_redis():
+    """Provide a mock Redis client for unit tests."""
+    mock = MagicMock()
+    mock.ping.return_value = True
+    mock.get.return_value = None
+    mock.set.return_value = True
+    mock.setex.return_value = True
+    mock.smembers.return_value = set()
+    mock.sadd.return_value = 1
+    mock.srem.return_value = 1
+    mock.delete.return_value = 1
+    mock.exists.return_value = False
+    mock.keys.return_value = []
+    mock.llen.return_value = 0
+    return mock
 
-@pytest.fixture(scope="module")
-def ray_context():
-    """Initialize Ray for testing."""
-    import ray
 
-    if ray.is_initialized():
-        ray.shutdown()
-    # Don't use local_mode - it has crashes during cleanup
-    ray.init(ignore_reinit_error=True)
+@pytest.fixture
+def mock_state_manager(mock_redis):
+    """Provide a mock RedisStateManager."""
+    from distributed.coordinator.redis_state import RedisStateManager
 
-    yield ray
-
-    ray.shutdown()
+    with patch.object(RedisStateManager, '__init__', lambda self, *args, **kwargs: None):
+        manager = RedisStateManager.__new__(RedisStateManager)
+        manager.redis = mock_redis
+        manager._host = 'localhost'
+        manager._port = 6379
+        yield manager
 
 
 # ============================================================================
@@ -141,11 +157,6 @@ cuda_only = pytest.mark.skipif(
 gpu_only = pytest.mark.skipif(
     not detect_device().is_gpu,
     reason="Test requires GPU (Metal or CUDA)"
-)
-
-requires_redis = pytest.mark.skipif(
-    True,  # Will be overridden by fixture
-    reason="Test requires Redis server"
 )
 
 

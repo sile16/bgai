@@ -1,269 +1,79 @@
-"""Coordinator (Ray Head Node) for distributed training.
+"""Coordinator for distributed training.
 
-The Coordinator is a Ray actor that manages:
-- Worker registration and health monitoring
-- Model weight storage and version tracking
-- Configuration distribution to workers
+The Coordinator is a standalone Python process that manages:
+- Model weight storage and distribution via Redis
+- Worker health monitoring (via Redis TTL)
+- Training run lifecycle
 - Cluster status reporting
+
+No Ray dependency - uses Redis for all coordination.
 """
 
 import time
 import threading
-from dataclasses import dataclass, field
+import signal
+import sys
 from typing import Dict, Optional, Any, List
-from enum import Enum
 
-import ray
-
+from .redis_state import (
+    RedisStateManager,
+    WorkerInfo,
+    WorkerStatus,
+    RunStatus,
+    create_state_manager,
+    HEARTBEAT_INTERVAL,
+)
 from ..serialization import serialize_weights, deserialize_weights
-from ..config import DistributedConfig, get_default_config
 
 
-class WorkerStatus(Enum):
-    """Worker status states."""
-    IDLE = "idle"
-    WORKING = "working"
-    DISCONNECTED = "disconnected"
-
-
-@dataclass
-class WorkerInfo:
-    """Information about a registered worker."""
-    worker_id: str
-    worker_type: str  # 'game', 'training', 'evaluation'
-    device_type: str  # 'cuda', 'metal', 'cpu'
-    device_name: str
-    hostname: str
-    registered_at: float
-    last_heartbeat: float
-    current_model_version: int = 0
-    games_generated: int = 0
-    training_steps: int = 0
-    status: WorkerStatus = WorkerStatus.IDLE
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            'worker_id': self.worker_id,
-            'worker_type': self.worker_type,
-            'device_type': self.device_type,
-            'device_name': self.device_name,
-            'hostname': self.hostname,
-            'registered_at': self.registered_at,
-            'last_heartbeat': self.last_heartbeat,
-            'current_model_version': self.current_model_version,
-            'games_generated': self.games_generated,
-            'training_steps': self.training_steps,
-            'status': self.status.value,
-        }
-
-
-@dataclass
-class ClusterStatus:
-    """Current cluster status."""
-    model_version: int
-    active_workers: List[Dict[str, Any]]
-    disconnected_count: int
-    total_games_generated: int
-    total_training_steps: int
-    buffer_size: int
-    timestamp: float
-
-
-@ray.remote
 class Coordinator:
-    """Central coordinator managing workers, model versions, and task distribution.
+    """Central coordinator managing workers, model versions, and cluster state.
+
+    This is a standalone Python class (not a Ray actor) that uses Redis
+    for all state management.
 
     Example usage:
-        >>> ray.init()
-        >>> coordinator = Coordinator.options(name="coordinator").remote(config)
-        >>> status = ray.get(coordinator.get_cluster_status.remote())
+        >>> coordinator = Coordinator(config)
+        >>> coordinator.start()  # Blocks, runs status loop
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """Initialize the coordinator.
 
         Args:
-            config: Configuration dictionary. If None, uses defaults.
+            config: Configuration dictionary with:
+                - redis_host: Redis server host
+                - redis_port: Redis server port
+                - redis_password: Redis password (optional)
+                - status_interval: Seconds between status prints (default: 10)
         """
         self.config = config or {}
 
-        # Worker registry
-        self.workers: Dict[str, WorkerInfo] = {}
-        self._workers_lock = threading.Lock()
-
-        # Model weights
-        self.current_model_version: int = 0
-        self.model_weights: Optional[bytes] = None
-        self._weights_lock = threading.Lock()
+        # Create Redis state manager
+        self.state = create_state_manager(self.config)
 
         # Configuration
-        self.heartbeat_timeout = self.config.get('heartbeat_timeout', 30.0)
-        self.heartbeat_interval = self.config.get('heartbeat_interval', 10.0)
+        self.status_interval = self.config.get('status_interval', 10.0)
 
-        # Statistics
+        # Runtime state
+        self.running = False
         self.start_time = time.time()
+        self._status_thread: Optional[threading.Thread] = None
+
+        # Verify Redis connection
+        if not self.state.ping():
+            raise ConnectionError(
+                f"Cannot connect to Redis at "
+                f"{self.config.get('redis_host', 'localhost')}:"
+                f"{self.config.get('redis_port', 6379)}"
+            )
 
         print(f"Coordinator initialized at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # =========================================================================
-    # Worker Registration
-    # =========================================================================
-
-    def register_worker(
-        self,
-        worker_id: str,
-        worker_type: str,
-        device_info: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Register a new worker with the coordinator.
-
-        Args:
-            worker_id: Unique identifier for the worker.
-            worker_type: Type of worker ('game', 'training', 'evaluation').
-            device_info: Device information dict with:
-                - device_type: 'cuda', 'metal', 'cpu'
-                - device_name: Human-readable device name
-                - hostname: Worker's hostname
-
-        Returns:
-            Registration response with:
-                - status: 'registered' or 'error'
-                - model_version: Current model version
-                - config: Worker configuration
-        """
-        now = time.time()
-
-        worker_info = WorkerInfo(
-            worker_id=worker_id,
-            worker_type=worker_type,
-            device_type=device_info.get('device_type', 'cpu'),
-            device_name=device_info.get('device_name', 'unknown'),
-            hostname=device_info.get('hostname', 'unknown'),
-            registered_at=now,
-            last_heartbeat=now,
-            current_model_version=0,
-            status=WorkerStatus.IDLE,
-        )
-
-        with self._workers_lock:
-            self.workers[worker_id] = worker_info
-
-        print(f"Worker registered: {worker_id} ({worker_type}, {device_info.get('device_name', 'unknown')})")
-
-        return {
-            'status': 'registered',
-            'model_version': self.current_model_version,
-            'config': self._get_worker_config(worker_type, device_info.get('device_type', 'cpu')),
-        }
-
-    def deregister_worker(self, worker_id: str) -> Dict[str, Any]:
-        """Gracefully remove a worker.
-
-        Args:
-            worker_id: ID of worker to deregister.
-
-        Returns:
-            Response with status.
-        """
-        with self._workers_lock:
-            if worker_id in self.workers:
-                worker = self.workers.pop(worker_id)
-                print(f"Worker deregistered: {worker_id}")
-                return {'status': 'deregistered'}
-
-        return {'status': 'not_found'}
-
-    def heartbeat(
-        self,
-        worker_id: str,
-        stats: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Process worker heartbeat and return any pending updates.
-
-        Args:
-            worker_id: ID of the worker.
-            stats: Worker statistics:
-                - games_since_last: Games generated since last heartbeat
-                - training_steps_since_last: Training steps since last heartbeat
-                - status: Current worker status ('idle', 'working')
-
-        Returns:
-            Response with:
-                - status: 'ok' or 'unknown_worker'
-                - new_model_available: True if newer model is available
-                - new_model_version: New model version number
-        """
-        with self._workers_lock:
-            if worker_id not in self.workers:
-                return {'status': 'unknown_worker', 'should_register': True}
-
-            worker = self.workers[worker_id]
-            worker.last_heartbeat = time.time()
-
-            # Update statistics
-            worker.games_generated += stats.get('games_since_last', 0)
-            worker.training_steps += stats.get('training_steps_since_last', 0)
-
-            status_str = stats.get('status', 'idle')
-            worker.status = WorkerStatus(status_str) if status_str in [s.value for s in WorkerStatus] else WorkerStatus.IDLE
-
-        response = {'status': 'ok'}
-
-        # Check if worker needs model update
-        if worker.current_model_version < self.current_model_version:
-            response['new_model_available'] = True
-            response['new_model_version'] = self.current_model_version
-
-        return response
+        print(f"  Redis: {self.config.get('redis_host', 'localhost')}:{self.config.get('redis_port', 6379)}")
 
     # =========================================================================
     # Model Weight Management
     # =========================================================================
-
-    def update_model_weights(
-        self,
-        weights_bytes: bytes,
-        version: int,
-    ) -> Dict[str, Any]:
-        """Update the current model weights (called by training worker).
-
-        Note: This assumes a single training worker. Multiple training workers
-        could race and this method only accepts strictly newer versions to
-        prevent rollback.
-
-        Args:
-            weights_bytes: Serialized model weights.
-            version: New model version number.
-
-        Returns:
-            Response with status and version.
-        """
-        with self._weights_lock:
-            if version <= self.current_model_version:
-                # Reject stale or duplicate updates
-                print(f"Rejected weight update: version {version} <= current {self.current_model_version}")
-                return {
-                    'status': 'rejected',
-                    'reason': 'stale_version',
-                    'current_version': self.current_model_version,
-                }
-
-            self.model_weights = weights_bytes
-            self.current_model_version = version
-
-        print(f"Model weights updated to version {version}")
-
-        return {'status': 'updated', 'version': version}
-
-    def get_model_weights(self) -> tuple:
-        """Get current model weights and version.
-
-        Returns:
-            Tuple of (weights_bytes, version).
-        """
-        with self._weights_lock:
-            return (self.model_weights, self.current_model_version)
 
     def set_initial_weights(self, weights_bytes: bytes) -> Dict[str, Any]:
         """Set initial model weights (version 1).
@@ -274,116 +84,144 @@ class Coordinator:
         Returns:
             Response with status.
         """
-        return self.update_model_weights(weights_bytes, version=1)
+        success = self.state.set_model_weights(weights_bytes, version=1)
+        if success:
+            print("Initial model weights set (version 1)")
+            return {'status': 'updated', 'version': 1}
+        else:
+            return {'status': 'failed', 'reason': 'version_conflict'}
 
-    def acknowledge_model_version(
+    def update_model_weights(
         self,
-        worker_id: str,
+        weights_bytes: bytes,
         version: int,
     ) -> Dict[str, Any]:
-        """Acknowledge that a worker has received a model version.
+        """Update model weights (called by training worker).
 
         Args:
-            worker_id: ID of the worker.
-            version: Model version the worker now has.
+            weights_bytes: Serialized model weights.
+            version: New model version number.
+
+        Returns:
+            Response with status and version.
+        """
+        success = self.state.set_model_weights(weights_bytes, version)
+
+        if success:
+            print(f"Model weights updated to version {version}")
+            return {'status': 'updated', 'version': version}
+        else:
+            current = self.state.get_model_version()
+            print(f"Rejected weight update: version {version} <= current {current}")
+            return {
+                'status': 'rejected',
+                'reason': 'stale_version',
+                'current_version': current,
+            }
+
+    def get_model_weights(self) -> tuple:
+        """Get current model weights and version.
+
+        Returns:
+            Tuple of (weights_bytes, version).
+        """
+        weights = self.state.get_model_weights()
+        version = self.state.get_model_version()
+        return (weights, version)
+
+    # =========================================================================
+    # Training Run Management
+    # =========================================================================
+
+    def start_training_run(self, run_id: str) -> Dict[str, Any]:
+        """Start a new training run.
+
+        Args:
+            run_id: MLflow run ID.
 
         Returns:
             Response with status.
         """
-        with self._workers_lock:
-            if worker_id in self.workers:
-                self.workers[worker_id].current_model_version = version
-                return {'status': 'acknowledged'}
+        current_status = self.state.get_run_status()
+        if current_status == RunStatus.RUNNING.value:
+            return {
+                'status': 'error',
+                'reason': 'Training already running',
+                'current_run': self.state.get_run_id(),
+            }
 
-        return {'status': 'unknown_worker'}
+        self.state.set_run_id(run_id)
+        self.state.set_run_status(RunStatus.RUNNING)
+        print(f"Training run started: {run_id}")
+
+        return {'status': 'started', 'run_id': run_id}
+
+    def pause_training_run(self) -> Dict[str, Any]:
+        """Pause current training run."""
+        if self.state.get_run_status() != RunStatus.RUNNING.value:
+            return {'status': 'error', 'reason': 'No active training run'}
+
+        self.state.set_run_status(RunStatus.PAUSED)
+        run_id = self.state.get_run_id()
+        print(f"Training run paused: {run_id}")
+
+        return {'status': 'paused', 'run_id': run_id}
+
+    def resume_training_run(self) -> Dict[str, Any]:
+        """Resume paused training run."""
+        if self.state.get_run_status() != RunStatus.PAUSED.value:
+            return {'status': 'error', 'reason': 'No paused training run'}
+
+        self.state.set_run_status(RunStatus.RUNNING)
+        run_id = self.state.get_run_id()
+        print(f"Training run resumed: {run_id}")
+
+        return {'status': 'resumed', 'run_id': run_id}
+
+    def stop_training_run(self) -> Dict[str, Any]:
+        """Stop current training run."""
+        run_id = self.state.get_run_id()
+        self.state.set_run_status(RunStatus.STOPPED)
+        print(f"Training run stopped: {run_id}")
+
+        return {'status': 'stopped', 'run_id': run_id}
 
     # =========================================================================
     # Status and Monitoring
     # =========================================================================
 
     def get_cluster_status(self) -> Dict[str, Any]:
-        """Get current cluster status for monitoring.
+        """Get current cluster status.
 
         Returns:
             Dict with cluster status information.
         """
-        now = time.time()
-        active_workers = []
-        disconnected_count = 0
+        status = self.state.get_cluster_status()
+        status['uptime_seconds'] = time.time() - self.start_time
+        return status
 
-        with self._workers_lock:
-            for worker_id, info in self.workers.items():
-                if now - info.last_heartbeat > self.heartbeat_timeout:
-                    info.status = WorkerStatus.DISCONNECTED
-                    disconnected_count += 1
-                else:
-                    active_workers.append({
-                        'id': info.worker_id,
-                        'type': info.worker_type,
-                        'device': info.device_name,
-                        'status': info.status.value,
-                        'games': info.games_generated,
-                        'train_steps': info.training_steps,
-                        'model_version': info.current_model_version,
-                        'last_heartbeat_ago': now - info.last_heartbeat,
-                    })
+    def get_worker_counts(self) -> Dict[str, int]:
+        """Get count of workers by type."""
+        return self.state.get_worker_counts()
 
-            total_games = sum(w.games_generated for w in self.workers.values())
-            total_steps = sum(w.training_steps for w in self.workers.values())
+    def print_status(self) -> None:
+        """Print current cluster status to stdout."""
+        status = self.get_cluster_status()
+        counts = status['workers']
 
-        return {
-            'model_version': self.current_model_version,
-            'active_workers': active_workers,
-            'disconnected_count': disconnected_count,
-            'total_games_generated': total_games,
-            'total_training_steps': total_steps,
-            'uptime_seconds': now - self.start_time,
-            'timestamp': now,
-        }
-
-    def get_worker_count(self) -> Dict[str, int]:
-        """Get count of workers by type.
-
-        Returns:
-            Dict with worker counts by type.
-        """
-        now = time.time()
-        counts = {'game': 0, 'training': 0, 'evaluation': 0, 'disconnected': 0}
-
-        with self._workers_lock:
-            for worker in self.workers.values():
-                if now - worker.last_heartbeat > self.heartbeat_timeout:
-                    counts['disconnected'] += 1
-                else:
-                    counts[worker.worker_type] = counts.get(worker.worker_type, 0) + 1
-
-        return counts
-
-    def get_workers_by_type(self, worker_type: str) -> List[Dict[str, Any]]:
-        """Get list of workers of a specific type.
-
-        Args:
-            worker_type: Type of workers to list.
-
-        Returns:
-            List of worker info dicts.
-        """
-        now = time.time()
-        workers = []
-
-        with self._workers_lock:
-            for worker in self.workers.values():
-                if worker.worker_type == worker_type:
-                    if now - worker.last_heartbeat <= self.heartbeat_timeout:
-                        workers.append(worker.to_dict())
-
-        return workers
+        print(
+            f"Status: model_v{status['model_version']}, "
+            f"games: {counts['game']}, "
+            f"training: {counts['training']}, "
+            f"total_games: {status['total_games_generated']}, "
+            f"train_steps: {status['total_training_steps']}"
+        )
 
     # =========================================================================
     # Configuration
     # =========================================================================
 
-    def _get_worker_config(
+    def get_worker_config(
         self,
         worker_type: str,
         device_type: str,
@@ -391,8 +229,8 @@ class Coordinator:
         """Get configuration for a specific worker type.
 
         Args:
-            worker_type: Type of worker.
-            device_type: Worker's device type.
+            worker_type: Type of worker ('game', 'training', 'eval').
+            device_type: Worker's device type ('cuda', 'metal', 'cpu').
 
         Returns:
             Worker configuration dict.
@@ -400,9 +238,11 @@ class Coordinator:
         base_config = {
             'redis_host': self.config.get('redis_host', 'localhost'),
             'redis_port': self.config.get('redis_port', 6379),
-            'heartbeat_interval': self.heartbeat_interval,
+            'redis_password': self.config.get('redis_password'),
+            'heartbeat_interval': HEARTBEAT_INTERVAL,
         }
 
+        # Add type-specific config
         if worker_type == 'game':
             base_config.update({
                 'num_simulations': self.config.get('mcts_simulations', 100),
@@ -415,9 +255,8 @@ class Coordinator:
                 'train_batch_size': self.config.get('train_batch_size', 128),
                 'learning_rate': self.config.get('learning_rate', 3e-4),
                 'checkpoint_interval': self.config.get('checkpoint_interval', 1000),
-                'weight_push_interval': self.config.get('weight_push_interval', 10),
             })
-        elif worker_type == 'evaluation':
+        elif worker_type == 'eval':
             base_config.update({
                 'num_simulations': self.config.get('eval_simulations', 200),
                 'num_episodes': self.config.get('eval_episodes', 64),
@@ -426,121 +265,101 @@ class Coordinator:
         return base_config
 
     def get_config(self) -> Dict[str, Any]:
-        """Get full coordinator configuration.
-
-        Returns:
-            Configuration dict.
-        """
+        """Get full coordinator configuration."""
         return self.config.copy()
 
-    def update_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
-        """Update coordinator configuration.
+    # =========================================================================
+    # Lifecycle
+    # =========================================================================
+
+    def start(self, blocking: bool = True) -> None:
+        """Start the coordinator.
 
         Args:
-            updates: Configuration updates.
-
-        Returns:
-            Response with status.
+            blocking: If True, blocks and runs status loop. If False, returns immediately.
         """
-        self.config.update(updates)
-        return {'status': 'updated', 'config': self.config}
+        self.running = True
+        self.start_time = time.time()
 
-    # =========================================================================
-    # Cleanup
-    # =========================================================================
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
 
-    def cleanup_disconnected_workers(self) -> int:
-        """Remove workers that have been disconnected for too long.
+        print("Coordinator started")
 
-        Returns:
-            Number of workers removed.
-        """
-        now = time.time()
-        removed = 0
-        to_remove = []
+        if blocking:
+            self._run_status_loop()
+        else:
+            self._status_thread = threading.Thread(target=self._run_status_loop)
+            self._status_thread.daemon = True
+            self._status_thread.start()
 
-        with self._workers_lock:
-            for worker_id, worker in self.workers.items():
-                # Remove if disconnected for more than 5 minutes
-                if now - worker.last_heartbeat > 300:
-                    to_remove.append(worker_id)
+    def stop(self) -> None:
+        """Stop the coordinator gracefully."""
+        print("\nCoordinator stopping...")
+        self.running = False
 
-            for worker_id in to_remove:
-                del self.workers[worker_id]
-                removed += 1
+        if self._status_thread and self._status_thread.is_alive():
+            self._status_thread.join(timeout=5)
 
-        if removed > 0:
-            print(f"Cleaned up {removed} disconnected workers")
+        # Cleanup stale workers
+        cleaned = self.state.cleanup_stale_workers()
+        if cleaned > 0:
+            print(f"Cleaned up {cleaned} stale workers")
 
-        return removed
+        print("Coordinator stopped")
 
-    def shutdown(self) -> Dict[str, Any]:
-        """Graceful shutdown of coordinator.
+    def _run_status_loop(self) -> None:
+        """Main loop that prints status and cleans up stale workers."""
+        while self.running:
+            try:
+                self.print_status()
 
-        Returns:
-            Response with status.
-        """
-        print("Coordinator shutting down...")
+                # Cleanup stale workers periodically
+                self.state.cleanup_stale_workers()
 
-        with self._workers_lock:
-            worker_count = len(self.workers)
-            self.workers.clear()
+                # Update Prometheus targets
+                self.state.update_metrics_targets()
 
-        return {
-            'status': 'shutdown',
-            'workers_cleared': worker_count,
-        }
+                # Sleep in small increments to allow quick shutdown
+                for _ in range(int(self.status_interval)):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+
+            except Exception as e:
+                print(f"Error in status loop: {e}")
+                time.sleep(1)
+
+    def _handle_signal(self, signum: int, frame) -> None:
+        """Handle shutdown signals."""
+        self.stop()
+        sys.exit(0)
 
 
 # =============================================================================
-# Utility Functions
+# Standalone Functions (for compatibility)
 # =============================================================================
 
-def get_coordinator(name: str = "coordinator") -> Optional[ray.actor.ActorHandle]:
-    """Get existing coordinator actor by name.
-
-    Args:
-        name: Name of the coordinator actor.
-
-    Returns:
-        Coordinator actor handle or None if not found.
-    """
-    try:
-        return ray.get_actor(name)
-    except ValueError:
-        return None
-
-
-def create_coordinator(
-    config: Optional[Dict[str, Any]] = None,
-    name: str = "coordinator",
-) -> ray.actor.ActorHandle:
-    """Create a new coordinator actor.
+def create_coordinator(config: Optional[Dict[str, Any]] = None) -> Coordinator:
+    """Create a new coordinator instance.
 
     Args:
         config: Coordinator configuration.
-        name: Name for the coordinator actor.
 
     Returns:
-        Coordinator actor handle.
+        Coordinator instance.
     """
-    return Coordinator.options(name=name).remote(config)
+    return Coordinator(config)
 
 
-def get_or_create_coordinator(
-    config: Optional[Dict[str, Any]] = None,
-    name: str = "coordinator",
-) -> ray.actor.ActorHandle:
-    """Get existing coordinator or create a new one.
+def run_coordinator(config: Optional[Dict[str, Any]] = None) -> None:
+    """Create and run a coordinator (blocking).
+
+    This is the main entry point for running the coordinator as a standalone process.
 
     Args:
-        config: Coordinator configuration (used only if creating new).
-        name: Name for the coordinator actor.
-
-    Returns:
-        Coordinator actor handle.
+        config: Coordinator configuration.
     """
-    coordinator = get_coordinator(name)
-    if coordinator is None:
-        coordinator = create_coordinator(config, name)
-    return coordinator
+    coordinator = create_coordinator(config)
+    coordinator.start(blocking=True)

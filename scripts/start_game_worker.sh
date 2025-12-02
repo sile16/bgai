@@ -35,14 +35,14 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 
 # Parse head node IPs from config (simple grep/sed approach)
-TAILSCALE_IP=$(grep "head_ip:" "$CONFIG_FILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-LOCAL_IP=$(grep "head_ip_local:" "$CONFIG_FILE" | sed 's/.*: *"\([^"]*\)".*/\1/')
-RAY_PORT=$(grep "gcs_port:" "$CONFIG_FILE" | sed 's/.*: *\([0-9]*\).*/\1/')
+TAILSCALE_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host:" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+LOCAL_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host_local:" | sed 's/.*: *"\([^"]*\)".*/\1/')
+REDIS_PORT=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "port:" | sed 's/.*: *\([0-9]*\).*/\1/')
 
 # Fallback defaults
 TAILSCALE_IP="${TAILSCALE_IP:-100.105.50.111}"
 LOCAL_IP="${LOCAL_IP:-192.168.20.40}"
-RAY_PORT="${RAY_PORT:-6380}"
+REDIS_PORT="${REDIS_PORT:-6379}"
 
 # Try Tailscale IP first, fallback to local IP
 if ping -c 1 -W 1 "$TAILSCALE_IP" &>/dev/null; then
@@ -92,36 +92,6 @@ STOP_FILE="$LOG_DIR/game_${WORKER_ID}.stop"
 PID_FILE="$LOG_DIR/game_${WORKER_ID}.pid"
 
 # =============================================================================
-# Join Ray cluster
-# =============================================================================
-join_ray_cluster() {
-    # Check if already connected to a Ray cluster
-    if ray status &>/dev/null; then
-        echo "Already connected to Ray cluster"
-        return 0
-    fi
-
-    # Enable multi-node clusters on Mac/Windows
-    export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
-
-    echo "Joining Ray cluster at $HEAD_IP:$RAY_PORT..."
-    ray start --address="$HEAD_IP:$RAY_PORT" --block &
-    RAY_PID=$!
-
-    # Wait for connection
-    for i in {1..30}; do
-        if ray status &>/dev/null; then
-            echo "Successfully joined Ray cluster"
-            return 0
-        fi
-        sleep 1
-    done
-
-    echo "ERROR: Failed to join Ray cluster after 30 seconds"
-    return 1
-}
-
-# =============================================================================
 # Display configuration
 # =============================================================================
 echo "=============================================="
@@ -129,13 +99,9 @@ echo "  BGAI Game Worker"
 echo "=============================================="
 echo "Worker ID:   $WORKER_ID"
 echo "Config file: $CONFIG_FILE"
-echo "Head node:   $HEAD_IP:$RAY_PORT"
+echo "Redis:       $HEAD_IP:$REDIS_PORT"
 echo "Log file:    $LOG_FILE"
 echo "Extra args:  $EXTRA_ARGS"
-echo ""
-
-# Join the Ray cluster first
-join_ray_cluster || exit 1
 echo ""
 
 # =============================================================================

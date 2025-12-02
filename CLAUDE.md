@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is a backgammon AI project based on Alpha Zero training methodology. The codebase implements:
 
 - **Core AI Components**: Located in `bgai/` with backgammon-specific environment handling and evaluators
-- **Distributed Training**: Ray-based multi-node training with Redis coordination in `distributed/`
+- **Distributed Training**: Redis-based multi-node training with MLflow experiment tracking in `distributed/`
 - **Benchmarking Suite**: Comprehensive performance testing tools in `benchmarks/` for MCTS and StochasticMCTS algorithms
 - **Training Notebooks**: Jupyter notebooks in `notebooks/` for experimental training runs
 
@@ -17,7 +17,8 @@ The project follows a modular design:
 
 - **Environment Integration**: Uses PGX backgammon environment with custom step functions that handle both deterministic and stochastic game states
 - **MCTS Evaluators**: Two main variants - standard MCTS and StochasticMCTS that adapts to the probabilistic nature of dice rolls
-- **Distributed System**: Ray actors for coordination, game workers, and training workers with Redis-backed replay buffer
+- **Distributed System**: Redis-only coordination with standalone Python workers (no Ray dependency)
+- **Experiment Tracking**: MLflow for training run management, metrics logging, and checkpoint storage
 - **Benchmarking Framework**: Extensible base classes for performance testing with memory tracking, batch optimization, and profile management
 
 ## Dependencies
@@ -123,20 +124,43 @@ redis-server --daemonize yes --requirepass bgai-password
 
 ### Adding Remote Workers (Distributed Mode)
 
-Remote machines join as Ray worker nodes for true distributed computing:
+Remote machines run standalone Python workers that connect via Redis:
 
 ```bash
 # On remote machine (iMac, MacBook, etc):
 git pull  # Get latest code
-./scripts/start_game_worker.sh  # Joins cluster + starts worker
+./scripts/start_game_worker.sh  # Starts worker, connects via Redis
 ```
 
 The script automatically:
-1. Joins the Ray cluster with `ray start --address=<head_ip>:6380`
-2. Starts a game worker that uses local CPU/GPU resources
-3. Auto-restarts on disconnect with exponential backoff
+1. Connects to Redis on the head node (auto-detected from config)
+2. Registers the worker with heartbeat TTL for health monitoring
+3. Starts generating games using local CPU/GPU resources
+4. Auto-restarts on disconnect with exponential backoff
 
 Stop with: `touch logs/game_<worker_id>.stop`
+
+### Training Run Management
+
+Manage training runs via CLI:
+
+```bash
+# List training runs
+python -m distributed.cli.main runs list
+
+# Start new training run
+python -m distributed.cli.main runs start --run-id my-experiment
+
+# Pause/resume training
+python -m distributed.cli.main runs pause
+python -m distributed.cli.main runs resume
+
+# Stop training run
+python -m distributed.cli.main runs stop
+
+# Reset for new run
+python -m distributed.cli.main runs reset
+```
 
 ### Metrics & Monitoring
 

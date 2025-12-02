@@ -9,6 +9,8 @@ Eval types:
 - random: Play against random policy
 - self_play: Play current model against itself (baseline)
 - checkpoint_N: Play against a specific checkpoint version
+
+No Ray dependency - uses Redis for all coordination.
 """
 
 import time
@@ -20,7 +22,6 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import chex
-import ray
 
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
@@ -59,18 +60,28 @@ class EvalResult:
     timestamp: float
 
 
-@ray.remote
 class EvalWorker(BaseWorker):
-    """Ray actor that evaluates models against baselines.
+    """Evaluation worker that evaluates models against baselines.
 
     Eval workers wait for new model versions and then run evaluation
     games against various opponents. Each worker picks up individual
     eval types from a queue, allowing parallel evaluation.
 
+    No Ray dependency - uses Redis for all coordination.
+
     Example:
-        >>> coordinator = create_coordinator(config)
-        >>> worker = EvalWorker.remote(coordinator, config={'eval_games': 100})
-        >>> ray.get(worker.run.remote())
+        >>> worker = EvalWorker(config={'eval_games': 100})
+        >>> worker.run()
+
+    TODO: Future optimization - distributed eval aggregation:
+        Currently one worker runs all games for a (version, eval_type) pair.
+        Better approach: set a target total (e.g., 100 games), workers check out
+        batches dynamically based on their local hardware batch size.
+        - Worker 1 (batch=16): checks out 16, finishes, checks out 16 more...
+        - Worker 2 (batch=50): checks out 50, finishes fast, grabs remaining 34
+        - Use Redis INCRBY for atomic game counter
+        - Aggregate partial results when target reached
+        This maximizes hardware utilization across heterogeneous nodes.
     """
 
     # Redis keys for eval coordination
@@ -80,15 +91,12 @@ class EvalWorker(BaseWorker):
 
     def __init__(
         self,
-        coordinator_handle: ray.actor.ActorHandle,
-        worker_id: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
     ):
         """Initialize the eval worker.
 
         Args:
-            coordinator_handle: Ray actor handle for the coordinator.
-            worker_id: Optional unique worker ID. Auto-generated if not provided.
             config: Configuration dict with keys:
                 - eval_games: Games per evaluation (default: 100)
                 - batch_size: Number of parallel games (default: 16)
@@ -96,8 +104,9 @@ class EvalWorker(BaseWorker):
                 - max_nodes: Maximum MCTS tree nodes (default: 800)
                 - eval_types: List of eval types to run (default: all)
                 - redis_host/port/password: Redis connection info
+            worker_id: Optional unique worker ID. Auto-generated if not provided.
         """
-        super().__init__(coordinator_handle, worker_id, config)
+        super().__init__(config, worker_id)
 
         # Log backend info
         print(f"EvalWorker: JAX backend = {jax.default_backend()}")
@@ -150,7 +159,7 @@ class EvalWorker(BaseWorker):
 
     @property
     def worker_type(self) -> str:
-        return 'evaluation'
+        return 'eval'
 
     def _setup_environment(self) -> None:
         """Set up the backgammon environment."""
@@ -326,13 +335,15 @@ class EvalWorker(BaseWorker):
         self._random_evaluator = RandomEvaluator(self._env)
 
     def _initialize_params(self) -> None:
-        """Initialize neural network parameters from coordinator."""
-        weights_bytes = self.fetch_model_weights()
+        """Initialize neural network parameters from Redis."""
+        result = self.get_current_model_weights()
 
-        if weights_bytes is not None:
+        if result is not None:
+            weights_bytes, version = result
             params_dict = deserialize_weights(weights_bytes)
             self._nn_params = params_dict
-            print(f"Worker {self.worker_id}: Loaded model version {self.current_model_version}")
+            self.current_model_version = version
+            print(f"Worker {self.worker_id}: Loaded model version {version}")
         else:
             # Initialize random weights
             key = jax.random.PRNGKey(42)
@@ -342,12 +353,19 @@ class EvalWorker(BaseWorker):
             self._nn_params = {'params': variables['params']}
             print(f"Worker {self.worker_id}: Initialized random weights")
 
-    def _on_model_update_available(self, new_version: int) -> None:
-        """Handle new model version notification."""
-        weights_bytes = self.fetch_model_weights()
-        if weights_bytes is not None:
+    def _check_and_update_model(self) -> bool:
+        """Check for model updates and load if available.
+
+        Returns:
+            True if model was updated.
+        """
+        result = self.get_model_weights()
+        if result is not None:
+            weights_bytes, version = result
             self._nn_params = deserialize_weights(weights_bytes)
-            print(f"Worker {self.worker_id}: Updated to model version {new_version}")
+            print(f"Worker {self.worker_id}: Updated to model version {version}")
+            return True
+        return False
 
     def _queue_eval_tasks(self, model_version: int) -> None:
         """Queue evaluation tasks for a new model version.
@@ -451,9 +469,11 @@ class EvalWorker(BaseWorker):
 
         # Ensure we have the right model version
         if self.current_model_version != model_version:
-            weights_bytes = self.fetch_model_weights()
-            if weights_bytes is not None:
+            result = self.get_current_model_weights()
+            if result is not None:
+                weights_bytes, version = result
                 self._nn_params = deserialize_weights(weights_bytes)
+                self.current_model_version = version
 
         # Get opponent evaluator
         if eval_type == EvalType.GNUBG.value:
@@ -716,19 +736,19 @@ class EvalWorker(BaseWorker):
         register_metrics_endpoint(
             self.buffer.redis,
             worker_id=self.worker_id,
-            worker_type='evaluation',
+            worker_type='eval',
             port=metrics_port,
             ttl_seconds=60,
         )
 
         # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
-            'type': 'evaluation',
+            'type': 'eval',
             'eval_games': str(self.eval_games),
             'eval_types': ','.join(self.enabled_eval_types),
         })
         metrics.worker_status.labels(
-            worker_id=self.worker_id, worker_type='evaluation'
+            worker_id=self.worker_id, worker_type='eval'
         ).set(1)
 
         print(f"Worker {self.worker_id}: Starting evaluation loop...")
@@ -755,13 +775,14 @@ class EvalWorker(BaseWorker):
 
             if task is None:
                 # No tasks available, wait and check for model updates
+                self._check_and_update_model()
                 time.sleep(5.0)
 
                 # Refresh metrics registration
                 register_metrics_endpoint(
                     self.buffer.redis,
                     worker_id=self.worker_id,
-                    worker_type='evaluation',
+                    worker_type='eval',
                     port=metrics_port,
                     ttl_seconds=60,
                 )
@@ -790,7 +811,7 @@ class EvalWorker(BaseWorker):
 
         # Mark worker as stopped
         metrics.worker_status.labels(
-            worker_id=self.worker_id, worker_type='evaluation'
+            worker_id=self.worker_id, worker_type='eval'
         ).set(0)
 
         # Cleanup
@@ -835,11 +856,11 @@ class EvalWorker(BaseWorker):
 
         # General worker metrics
         metrics.games_total.labels(
-            worker_id=self.worker_id, worker_type='evaluation'
+            worker_id=self.worker_id, worker_type='eval'
         ).inc(result.games_played)
 
         metrics.model_version.labels(
-            worker_id=self.worker_id, worker_type='evaluation'
+            worker_id=self.worker_id, worker_type='eval'
         ).set(result.model_version)
 
     def get_eval_stats(self) -> Dict[str, Any]:

@@ -1,9 +1,9 @@
 # Distributed AlphaZero Training Configuration
 # =============================================
 #
-# ARCHITECTURE:
-# - Head node: Ray cluster, Redis, Grafana, Prometheus, Training worker
-# - Remote workers: Macs, TPUs join for game collection and evaluation
+# ARCHITECTURE (Redis-based, no Ray):
+# - Head node: Redis, Coordinator, Training worker, Grafana, Prometheus, MLflow
+# - Remote workers: Standalone Python processes connecting via Redis
 #
 # CONFIG HIERARCHY:
 # 1. Global settings (MCTS simulations, max_nodes) - same for all workers
@@ -30,6 +30,10 @@ training:
   surprise_weight: 0.5    # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_interval: 1000
   max_checkpoints: 5
+  # Warm tree: pre-computed deep MCTS tree from initial position
+  # Set to 0 to disable. Game workers use this as starting point.
+  warm_tree_simulations: 0     # MCTS sims for warm tree (0 = disabled)
+  warm_tree_max_nodes: 10000   # Max nodes in warm tree
 
 game:
   max_episode_steps: 500  # Max moves per game
@@ -47,12 +51,14 @@ redis:
   buffer_capacity: 100000   # Max experiences
   episode_capacity: 5000    # Max episodes
 
-ray:
-  head_ip: "100.105.50.111"  # Tailscale IP
-  head_ip_local: "192.168.20.40"  # LAN fallback
-  gcs_port: 6380            # Ray GCS server
-  client_port: 10001        # Ray client
-  dashboard_port: 8265
+head:
+  host: "100.105.50.111"       # Head node IP (Tailscale)
+  host_local: "192.168.20.40"  # LAN fallback
+
+mlflow:
+  tracking_uri: "http://100.105.50.111:5000"
+  experiment_name: "bgai-training"
+  artifact_location: "./mlruns"
 
 coordinator:
   heartbeat_timeout: 30.0   # Seconds before worker considered dead

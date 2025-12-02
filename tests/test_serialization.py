@@ -16,6 +16,8 @@ from distributed.serialization import (
     experiences_to_numpy_batch,
     serialize_checkpoint_metadata,
     deserialize_checkpoint_metadata,
+    serialize_warm_tree,
+    deserialize_warm_tree,
     get_serialized_size,
     estimate_experience_size,
 )
@@ -378,3 +380,110 @@ class TestEdgeCases:
 
         assert restored['custom_field'] == 'some_value'
         assert restored['another_field'] == 123
+
+
+class TestWarmTreeSerialization:
+    """Tests for warm tree serialization."""
+
+    def test_serialize_simple_tree_structure(self):
+        """Test serialization of a simple tree-like structure."""
+        # Create a mock tree structure similar to MCTSTree
+        tree = {
+            'data': {
+                'n': jnp.zeros((100,)),
+                'q': jnp.zeros((100,)),
+                'p': jnp.zeros((100, 156)),
+                'terminated': jnp.zeros((100,), dtype=jnp.bool_),
+            },
+            'edge_map': jnp.zeros((100, 156), dtype=jnp.int32),
+            'parents': jnp.zeros((100,), dtype=jnp.int32),
+            'next_free_idx': jnp.array(1),
+        }
+
+        data = serialize_warm_tree(tree)
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+
+    def test_deserialize_simple_tree_structure(self):
+        """Test deserialization of a tree structure."""
+        tree = {
+            'data': {
+                'n': jnp.ones((50,)) * 10,
+                'q': jnp.ones((50,)) * 0.5,
+            },
+            'edge_map': jnp.ones((50, 156), dtype=jnp.int32),
+            'next_free_idx': jnp.array(25),
+        }
+
+        data = serialize_warm_tree(tree)
+        restored = deserialize_warm_tree(data)
+
+        assert 'data' in restored
+        assert 'edge_map' in restored
+        assert jnp.allclose(restored['data']['n'], tree['data']['n'])
+        assert jnp.allclose(restored['data']['q'], tree['data']['q'])
+        assert jnp.allclose(restored['next_free_idx'], jnp.array(25))
+
+    def test_warm_tree_roundtrip_preserves_dtype(self):
+        """Test that roundtrip preserves array dtypes."""
+        tree = {
+            'float_data': jnp.ones((10,), dtype=jnp.float32),
+            'int_data': jnp.ones((10,), dtype=jnp.int32),
+            'bool_data': jnp.ones((10,), dtype=jnp.bool_),
+        }
+
+        data = serialize_warm_tree(tree)
+        restored = deserialize_warm_tree(data)
+
+        assert restored['float_data'].dtype == jnp.float32
+        assert restored['int_data'].dtype == jnp.int32
+        assert restored['bool_data'].dtype == jnp.bool_
+
+    def test_warm_tree_with_nested_structure(self):
+        """Test tree with nested embedding structure."""
+        tree = {
+            'data': {
+                'embedding': {
+                    'observation': jnp.zeros((100, 34)),
+                    'current_player': jnp.zeros((100,), dtype=jnp.int32),
+                    '_is_stochastic': jnp.zeros((100,), dtype=jnp.bool_),
+                },
+                'n': jnp.zeros((100,)),
+                'q': jnp.zeros((100,)),
+            },
+        }
+
+        data = serialize_warm_tree(tree)
+        restored = deserialize_warm_tree(data)
+
+        assert 'embedding' in restored['data']
+        assert restored['data']['embedding']['observation'].shape == (100, 34)
+        assert restored['data']['embedding']['current_player'].dtype == jnp.int32
+
+    def test_warm_tree_size_reasonable(self):
+        """Test that serialized tree size is reasonable."""
+        # Create a moderately sized tree
+        max_nodes = 1000
+        num_actions = 156
+        obs_dim = 34
+
+        tree = {
+            'data': {
+                'n': jnp.zeros((max_nodes,)),
+                'q': jnp.zeros((max_nodes,)),
+                'p': jnp.zeros((max_nodes, num_actions)),
+                'terminated': jnp.zeros((max_nodes,), dtype=jnp.bool_),
+                'embedding': {
+                    'observation': jnp.zeros((max_nodes, obs_dim)),
+                    'current_player': jnp.zeros((max_nodes,), dtype=jnp.int32),
+                },
+            },
+            'edge_map': jnp.zeros((max_nodes, num_actions), dtype=jnp.int32),
+            'parents': jnp.zeros((max_nodes,), dtype=jnp.int32),
+        }
+
+        data = serialize_warm_tree(tree)
+
+        # Should be on the order of a few MB for 1000 nodes
+        size_mb = len(data) / (1024 * 1024)
+        assert size_mb < 50  # Reasonable upper bound

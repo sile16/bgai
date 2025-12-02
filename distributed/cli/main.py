@@ -1,29 +1,37 @@
 #!/usr/bin/env python
 """CLI for distributed backgammon AI training.
 
+No Ray dependency - workers run as standalone Python processes
+coordinated via Redis.
+
 Usage:
-    # Start coordinator (head node) - uses config file
+    # Start coordinator (head node)
     python -m distributed.cli.main coordinator
 
-    # Start game worker - auto-detects device, uses config
+    # Start game worker
     python -m distributed.cli.main game-worker
-
-    # Start with local batch size override
-    python -m distributed.cli.main game-worker --batch-size 32
 
     # Start training worker
     python -m distributed.cli.main training-worker
 
+    # Start evaluation worker
+    python -m distributed.cli.main eval-worker
+
     # Check cluster status
     python -m distributed.cli.main status
+
+    # Training run management
+    python -m distributed.cli.main runs list
+    python -m distributed.cli.main runs start
+    python -m distributed.cli.main runs pause
+    python -m distributed.cli.main runs resume
+    python -m distributed.cli.main runs stop
 """
 
 import argparse
 import sys
 import time
 from typing import Optional
-
-import ray
 
 from .config_loader import (
     load_yaml_config,
@@ -32,33 +40,17 @@ from .config_loader import (
     get_game_worker_config,
     get_training_worker_config,
     get_eval_worker_config,
-    get_ray_config,
     print_config_summary,
 )
 
 
 def start_coordinator(args):
     """Start the coordinator (head node)."""
-    import os
-    from ..coordinator.head_node import create_coordinator
+    from ..coordinator.head_node import Coordinator
 
     # Load configuration from file
     yaml_config = load_yaml_config(args.config_file)
     file_config = get_coordinator_config(yaml_config)
-
-    # Get project directory for runtime environment
-    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    # Initialize Ray (head node)
-    print("Initializing Ray head node...")
-    print(f"Project directory: {project_dir}")
-    ray.init(
-        address=args.ray_address if args.ray_address else None,
-        dashboard_host='0.0.0.0' if args.dashboard else None,
-        include_dashboard=args.dashboard,
-        namespace="bgai",  # Use consistent namespace for all workers
-        runtime_env={"env_vars": {"PYTHONPATH": project_dir}},
-    )
 
     # Merge: file config <- CLI overrides (CLI takes precedence if specified)
     config = file_config.copy()
@@ -72,40 +64,29 @@ def start_coordinator(args):
         config['mcts_simulations'] = args.mcts_simulations
     if args.mcts_max_nodes != 400:
         config['mcts_max_nodes'] = args.mcts_max_nodes
+    if args.status_interval != 10:
+        config['status_interval'] = args.status_interval
 
     print(f"Creating coordinator with config:")
     for k, v in config.items():
         if k != 'device_configs':  # Don't print the large device_configs dict
             print(f"  {k}: {v}")
 
-    coordinator = create_coordinator(config, name='coordinator')
-    print(f"Coordinator started. Dashboard available at http://127.0.0.1:8265")
+    # Create and start coordinator
+    coordinator = Coordinator(config)
 
-    # Keep running
     print("\nCoordinator running. Press Ctrl+C to stop.")
     try:
-        while True:
-            time.sleep(10)
-            # Print status periodically
-            status = ray.get(coordinator.get_cluster_status.remote())
-            counts = ray.get(coordinator.get_worker_count.remote())
-            print(
-                f"Status: model_v{status['model_version']}, "
-                f"games: {counts['game']}, training: {counts['training']}, "
-                f"total_games: {status['total_games_generated']}, "
-                f"train_steps: {status['total_training_steps']}"
-            )
+        # This blocks and runs the status loop
+        coordinator.start(blocking=True)
     except KeyboardInterrupt:
         print("\nShutting down coordinator...")
-        ray.get(coordinator.shutdown.remote())
-        ray.shutdown()
+        coordinator.stop()
 
 
 def start_game_worker(args):
     """Start a game generation worker."""
-    import os
     from ..workers.game_worker import GameWorker
-    from ..coordinator.head_node import get_coordinator
 
     # Load configuration from file
     yaml_config = load_yaml_config(args.config_file)
@@ -115,78 +96,49 @@ def start_game_worker(args):
     batch_override = args.batch_size if args.batch_size != 16 else None
     config = get_game_worker_config(yaml_config, device_type, batch_override)
 
+    # CLI overrides
+    if args.redis_host != 'localhost':
+        config['redis_host'] = args.redis_host
+    if args.redis_port != 6379:
+        config['redis_port'] = args.redis_port
+    if args.redis_password is not None:
+        config['redis_password'] = args.redis_password
+    if args.mcts_simulations != 100:
+        config['num_simulations'] = args.mcts_simulations
+    if args.mcts_max_nodes != 400:
+        config['max_nodes'] = args.mcts_max_nodes
+    if args.temperature != 1.0:
+        config['temperature'] = args.temperature
+    if args.max_episode_steps != 500:
+        config['max_episode_steps'] = args.max_episode_steps
+    if args.metrics_port != 9100:
+        config['metrics_port'] = args.metrics_port
+
     # Print config summary
     print_config_summary(yaml_config, device_type)
-
-    # Get project directory for runtime environment
-    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    # Connect to Ray cluster
-    # 'auto' = connect to local Ray instance (joined via 'ray start --address')
-    # 'ray://host:port' = connect via Ray Client (legacy mode)
-    address = args.coordinator_address
-    if address == "auto":
-        print("Connecting to local Ray cluster (distributed mode)...")
-        ray.init(
-            address="auto",
-            namespace="bgai",
-        )
-    else:
-        print(f"Connecting to Ray cluster at {address}...")
-        ray.init(
-            address=address,
-            namespace="bgai",
-            runtime_env={
-                "env_vars": {
-                    "PYTHONPATH": project_dir,
-                    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
-                }
-            },
-        )
-
-    # Get coordinator handle
-    coordinator = get_coordinator('coordinator')
-    if coordinator is None:
-        print("ERROR: Could not find coordinator. Make sure it's running.")
-        sys.exit(1)
 
     print(f"Starting game worker with config:")
     for k, v in config.items():
         print(f"  {k}: {v}")
 
-    # Create worker with optional GPU resources
-    num_gpus = args.num_gpus if hasattr(args, 'num_gpus') else 0
-    if num_gpus > 0:
-        print(f"Requesting {num_gpus} GPU(s)")
-        worker = GameWorker.options(num_gpus=num_gpus).remote(
-            coordinator_handle=coordinator,
-            worker_id=args.worker_id,
-            config=config,
-        )
-    else:
-        worker = GameWorker.remote(
-            coordinator_handle=coordinator,
-            worker_id=args.worker_id,
-            config=config,
-        )
+    # Create and run worker
+    worker = GameWorker(
+        config=config,
+        worker_id=args.worker_id,
+    )
 
-    # Run worker
     print("\nGame worker running. Press Ctrl+C to stop.")
     try:
-        result = ray.get(worker.run.remote(num_iterations=args.num_iterations))
+        result = worker.run(num_iterations=args.num_iterations)
         print(f"Worker finished: {result}")
     except KeyboardInterrupt:
         print("\nStopping worker...")
-        ray.get(worker.stop.remote())
-
-    ray.shutdown()
+        worker.stop()
 
 
 def start_training_worker(args):
     """Start a training worker."""
-    import os
     from ..workers.training_worker import TrainingWorker
-    from ..coordinator.head_node import get_coordinator
 
     # Load configuration from file
     yaml_config = load_yaml_config(args.config_file)
@@ -196,77 +148,61 @@ def start_training_worker(args):
     batch_override = args.batch_size if args.batch_size != 128 else None
     config = get_training_worker_config(yaml_config, device_type, batch_override)
 
+    # CLI overrides
+    if args.redis_host != 'localhost':
+        config['redis_host'] = args.redis_host
+    if args.redis_port != 6379:
+        config['redis_port'] = args.redis_port
+    if args.redis_password is not None:
+        config['redis_password'] = args.redis_password
+    if args.learning_rate != 3e-4:
+        config['learning_rate'] = args.learning_rate
+    if args.l2_reg != 1e-4:
+        config['l2_reg_lambda'] = args.l2_reg
+    if args.games_per_batch != 10:
+        config['games_per_training_batch'] = args.games_per_batch
+    if args.steps_per_game != 10:
+        config['steps_per_game'] = args.steps_per_game
+    if args.surprise_weight != 0.5:
+        config['surprise_weight'] = args.surprise_weight
+    if args.checkpoint_interval != 1000:
+        config['checkpoint_interval'] = args.checkpoint_interval
+    if args.min_buffer_size != 1000:
+        config['min_buffer_size'] = args.min_buffer_size
+    if args.checkpoint_dir:
+        config['checkpoint_dir'] = args.checkpoint_dir
+    if args.metrics_port != 9200:
+        config['metrics_port'] = args.metrics_port
+    if args.mlflow_uri:
+        config['mlflow_tracking_uri'] = args.mlflow_uri
+    if args.mlflow_experiment:
+        config['mlflow_experiment_name'] = args.mlflow_experiment
+
     # Print config summary
     print_config_summary(yaml_config, device_type)
-
-    # Get project directory for runtime environment
-    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    # Connect to Ray cluster
-    # 'auto' = connect to local Ray instance (joined via 'ray start --address')
-    address = args.coordinator_address
-    if address == "auto":
-        print("Connecting to local Ray cluster (distributed mode)...")
-        ray.init(
-            address="auto",
-            namespace="bgai",
-        )
-    else:
-        print(f"Connecting to Ray cluster at {address}...")
-        ray.init(
-            address=address,
-            namespace="bgai",
-            runtime_env={
-                "env_vars": {
-                    "PYTHONPATH": project_dir,
-                    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
-                }
-            },
-        )
-
-    # Get coordinator handle
-    coordinator = get_coordinator('coordinator')
-    if coordinator is None:
-        print("ERROR: Could not find coordinator. Make sure it's running.")
-        sys.exit(1)
 
     print(f"Starting training worker with config:")
     for k, v in config.items():
         print(f"  {k}: {v}")
 
-    # Create worker with optional GPU resources
-    num_gpus = args.num_gpus if hasattr(args, 'num_gpus') else 0
-    if num_gpus > 0:
-        print(f"Requesting {num_gpus} GPU(s)")
-        worker = TrainingWorker.options(num_gpus=num_gpus).remote(
-            coordinator_handle=coordinator,
-            worker_id=args.worker_id,
-            config=config,
-        )
-    else:
-        worker = TrainingWorker.remote(
-            coordinator_handle=coordinator,
-            worker_id=args.worker_id,
-            config=config,
-        )
+    # Create and run worker
+    worker = TrainingWorker(
+        config=config,
+        worker_id=args.worker_id,
+    )
 
-    # Run worker
     print("\nTraining worker running. Press Ctrl+C to stop.")
     try:
-        result = ray.get(worker.run.remote(num_iterations=args.num_iterations))
+        result = worker.run(num_iterations=args.num_iterations)
         print(f"Worker finished: {result}")
     except KeyboardInterrupt:
         print("\nStopping worker...")
-        ray.get(worker.stop.remote())
-
-    ray.shutdown()
+        worker.stop()
 
 
 def start_eval_worker(args):
     """Start an evaluation worker."""
-    import os
     from ..workers.eval_worker import EvalWorker
-    from ..coordinator.head_node import get_coordinator
 
     # Load configuration from file
     yaml_config = load_yaml_config(args.config_file)
@@ -276,144 +212,171 @@ def start_eval_worker(args):
     batch_override = args.batch_size if args.batch_size != 16 else None
     config = get_eval_worker_config(yaml_config, device_type, batch_override)
 
-    # Add eval-specific settings
+    # CLI overrides
+    if args.redis_host != 'localhost':
+        config['redis_host'] = args.redis_host
+    if args.redis_port != 6379:
+        config['redis_port'] = args.redis_port
+    if args.redis_password is not None:
+        config['redis_password'] = args.redis_password
+    if args.mcts_simulations != 200:
+        config['num_simulations'] = args.mcts_simulations
+    if args.mcts_max_nodes != 800:
+        config['max_nodes'] = args.mcts_max_nodes
+    if args.metrics_port != 9300:
+        config['metrics_port'] = args.metrics_port
+
+    # Eval-specific settings
     config['eval_games'] = args.eval_games
     config['eval_interval'] = args.eval_interval
 
-    # Only add eval_types if explicitly specified (else use worker default)
     if args.eval_types:
         config['eval_types'] = [t.strip() for t in args.eval_types.split(',')]
 
     # Print config summary
     print_config_summary(yaml_config, device_type)
 
-    # Get project directory for runtime environment
-    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    # Connect to Ray cluster
-    # 'auto' = connect to local Ray instance (joined via 'ray start --address')
-    address = args.coordinator_address
-    if address == "auto":
-        print("Connecting to local Ray cluster (distributed mode)...")
-        ray.init(
-            address="auto",
-            namespace="bgai",
-        )
-    else:
-        print(f"Connecting to Ray cluster at {address}...")
-        ray.init(
-            address=address,
-            namespace="bgai",
-            runtime_env={
-                "env_vars": {
-                    "PYTHONPATH": project_dir,
-                    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.25",
-                }
-            },
-        )
-
-    # Get coordinator handle
-    coordinator = get_coordinator('coordinator')
-    if coordinator is None:
-        print("ERROR: Could not find coordinator. Make sure it's running.")
-        sys.exit(1)
-
     print(f"Starting evaluation worker with config:")
     for k, v in config.items():
         if v is not None:
             print(f"  {k}: {v}")
 
-    # Create worker with optional GPU resources
-    num_gpus = args.num_gpus if hasattr(args, 'num_gpus') else 0
-    if num_gpus > 0:
-        print(f"Requesting {num_gpus} GPU(s)")
-        worker = EvalWorker.options(num_gpus=num_gpus).remote(
-            coordinator_handle=coordinator,
-            worker_id=args.worker_id,
-            config=config,
-        )
-    else:
-        # When not using GPU, set JAX_PLATFORMS=cpu to prevent CUDA init errors
-        worker = EvalWorker.options(
-            runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}}
-        ).remote(
-            coordinator_handle=coordinator,
-            worker_id=args.worker_id,
-            config=config,
-        )
+    # Create and run worker
+    worker = EvalWorker(
+        config=config,
+        worker_id=args.worker_id,
+    )
 
-    # Run worker
     print("\nEvaluation worker running. Press Ctrl+C to stop.")
     try:
-        result = ray.get(worker.run.remote(num_iterations=args.num_iterations))
+        result = worker.run(num_iterations=args.num_iterations)
         print(f"Worker finished: {result}")
     except KeyboardInterrupt:
         print("\nStopping worker...")
-        ray.get(worker.stop.remote())
-
-    ray.shutdown()
+        worker.stop()
 
 
 def show_status(args):
-    """Show cluster status."""
-    import os
-    from ..coordinator.head_node import get_coordinator
+    """Show cluster status from Redis."""
+    from ..coordinator.redis_state import create_state_manager
 
     # Load configuration from file
     yaml_config = load_yaml_config(args.config_file)
-    ray_config = get_ray_config(yaml_config)
 
-    # Get project directory for runtime environment
-    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    config = {
+        'redis_host': args.redis_host if args.redis_host != 'localhost' else yaml_config.get('redis', {}).get('host', 'localhost'),
+        'redis_port': args.redis_port if args.redis_port != 6379 else yaml_config.get('redis', {}).get('port', 6379),
+        'redis_password': args.redis_password or yaml_config.get('redis', {}).get('password'),
+    }
 
-    # Determine Ray address
-    if args.coordinator_address:
-        address = args.coordinator_address
-    else:
-        address = "auto"  # Default to local Ray cluster
-
-    # Connect to Ray cluster
-    ray.init(
-        address=address,
-        namespace="bgai",
-        runtime_env={"env_vars": {"PYTHONPATH": project_dir}},
-    )
-
-    coordinator = get_coordinator('coordinator')
-    if coordinator is None:
-        print("ERROR: Could not find coordinator. Make sure it's running.")
+    try:
+        state = create_state_manager(config)
+        if not state.ping():
+            print(f"ERROR: Cannot connect to Redis at {config['redis_host']}:{config['redis_port']}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Cannot connect to Redis: {e}")
         sys.exit(1)
 
-    status = ray.get(coordinator.get_cluster_status.remote())
-    counts = ray.get(coordinator.get_worker_count.remote())
+    status = state.get_cluster_status()
+    workers = status['workers']
 
     print("\n=== Cluster Status ===")
     print(f"Model version: {status['model_version']}")
-    print(f"Uptime: {status['uptime_seconds']:.1f}s")
-    print(f"Total games: {status['total_games_generated']}")
+    print(f"Run ID: {status['run_id'] or 'None'}")
+    print(f"Run status: {status['run_status']}")
+    print(f"Total games generated: {status['total_games_generated']}")
     print(f"Total training steps: {status['total_training_steps']}")
 
     print(f"\n=== Workers ===")
-    print(f"Game workers: {counts['game']}")
-    print(f"Training workers: {counts['training']}")
-    print(f"Evaluation workers: {counts['evaluation']}")
-    print(f"Disconnected: {counts['disconnected']}")
+    print(f"Game workers: {workers['game']}")
+    print(f"Training workers: {workers['training']}")
+    print(f"Evaluation workers: {workers['eval']}")
+    print(f"Total: {workers['total']}")
 
-    print(f"\n=== Active Workers ===")
-    for w in status['active_workers']:
-        print(
-            f"  {w['id']}: type={w['type']}, device={w['device']}, "
-            f"status={w['status']}, games={w['games']}, "
-            f"model_v{w['model_version']}"
-        )
+    if status['active_workers']:
+        print(f"\n=== Active Workers ===")
+        for w in status['active_workers']:
+            print(
+                f"  {w['worker_id']}: type={w['worker_type']}, "
+                f"device={w['device_type']}, status={w['status']}, "
+                f"games={w['games_generated']}, model_v{w['model_version']}"
+            )
+    else:
+        print(f"\n(No active workers)")
 
-    ray.shutdown()
+
+def manage_runs(args):
+    """Manage training runs."""
+    from ..coordinator.redis_state import create_state_manager, RunStatus
+
+    # Load configuration
+    yaml_config = load_yaml_config(args.config_file)
+
+    config = {
+        'redis_host': args.redis_host if args.redis_host != 'localhost' else yaml_config.get('redis', {}).get('host', 'localhost'),
+        'redis_port': args.redis_port if args.redis_port != 6379 else yaml_config.get('redis', {}).get('port', 6379),
+        'redis_password': args.redis_password or yaml_config.get('redis', {}).get('password'),
+    }
+
+    try:
+        state = create_state_manager(config)
+        if not state.ping():
+            print(f"ERROR: Cannot connect to Redis")
+            sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Cannot connect to Redis: {e}")
+        sys.exit(1)
+
+    if args.run_command == 'list':
+        run_id = state.get_run_id()
+        run_status = state.get_run_status()
+        print(f"Current run ID: {run_id or 'None'}")
+        print(f"Status: {run_status}")
+
+    elif args.run_command == 'start':
+        import uuid
+        run_id = args.run_id or f"run_{uuid.uuid4().hex[:8]}"
+        current_status = state.get_run_status()
+        if current_status == RunStatus.RUNNING.value:
+            print(f"ERROR: Training already running (run_id: {state.get_run_id()})")
+            sys.exit(1)
+        state.set_run_id(run_id)
+        state.set_run_status(RunStatus.RUNNING)
+        print(f"Started training run: {run_id}")
+
+    elif args.run_command == 'pause':
+        if state.get_run_status() != RunStatus.RUNNING.value:
+            print("ERROR: No active training run to pause")
+            sys.exit(1)
+        state.set_run_status(RunStatus.PAUSED)
+        print(f"Paused training run: {state.get_run_id()}")
+
+    elif args.run_command == 'resume':
+        if state.get_run_status() != RunStatus.PAUSED.value:
+            print("ERROR: No paused training run to resume")
+            sys.exit(1)
+        state.set_run_status(RunStatus.RUNNING)
+        print(f"Resumed training run: {state.get_run_id()}")
+
+    elif args.run_command == 'stop':
+        run_id = state.get_run_id()
+        state.set_run_status(RunStatus.STOPPED)
+        print(f"Stopped training run: {run_id}")
+
+    elif args.run_command == 'reset':
+        if args.confirm:
+            state.reset_cluster_state()
+            print("Cluster state reset (all workers deregistered, model version reset)")
+        else:
+            print("WARNING: This will reset all cluster state!")
+            print("Use --confirm to proceed")
 
 
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description='Distributed backgammon AI training',
+        description='Distributed backgammon AI training (Redis-based, no Ray)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -434,17 +397,6 @@ def main():
         help='Path to config file (default: configs/distributed.yaml)'
     )
     coord_parser.add_argument(
-        '--ray-address',
-        type=str,
-        default=None,
-        help='Ray cluster address (default: start new cluster)'
-    )
-    coord_parser.add_argument(
-        '--dashboard',
-        action='store_true',
-        help='Enable Ray dashboard'
-    )
-    coord_parser.add_argument(
         '--redis-host',
         type=str,
         default='localhost',
@@ -463,16 +415,10 @@ def main():
         help='Redis password (default: None)'
     )
     coord_parser.add_argument(
-        '--heartbeat-timeout',
-        type=float,
-        default=30.0,
-        help='Worker heartbeat timeout in seconds (default: 30)'
-    )
-    coord_parser.add_argument(
-        '--heartbeat-interval',
+        '--status-interval',
         type=float,
         default=10.0,
-        help='Worker heartbeat interval in seconds (default: 10)'
+        help='Status print interval in seconds (default: 10)'
     )
     coord_parser.add_argument(
         '--mcts-simulations',
@@ -485,24 +431,6 @@ def main():
         type=int,
         default=400,
         help='Maximum MCTS tree nodes (default: 400)'
-    )
-    coord_parser.add_argument(
-        '--train-batch-size',
-        type=int,
-        default=128,
-        help='Training batch size (default: 128)'
-    )
-    coord_parser.add_argument(
-        '--game-batch-size',
-        type=int,
-        default=16,
-        help='Game worker batch size (default: 16)'
-    )
-    coord_parser.add_argument(
-        '--learning-rate',
-        type=float,
-        default=3e-4,
-        help='Learning rate (default: 3e-4)'
     )
     coord_parser.set_defaults(func=start_coordinator)
 
@@ -518,12 +446,6 @@ def main():
         type=str,
         default=None,
         help='Path to config file (default: configs/distributed.yaml)'
-    )
-    game_parser.add_argument(
-        '--coordinator-address',
-        type=str,
-        default='auto',
-        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     game_parser.add_argument(
         '--worker-id',
@@ -580,16 +502,16 @@ def main():
         help='Redis password (default: None)'
     )
     game_parser.add_argument(
+        '--metrics-port',
+        type=int,
+        default=9100,
+        help='Prometheus metrics port (default: 9100)'
+    )
+    game_parser.add_argument(
         '--num-iterations',
         type=int,
         default=-1,
         help='Number of iterations (-1 for infinite, default: -1)'
-    )
-    game_parser.add_argument(
-        '--num-gpus',
-        type=float,
-        default=0,
-        help='Number of GPUs to request (0 for CPU only, default: 0)'
     )
     game_parser.set_defaults(func=start_game_worker)
 
@@ -605,12 +527,6 @@ def main():
         type=str,
         default=None,
         help='Path to config file (default: configs/distributed.yaml)'
-    )
-    train_parser.add_argument(
-        '--coordinator-address',
-        type=str,
-        default='auto',
-        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     train_parser.add_argument(
         '--worker-id',
@@ -652,7 +568,7 @@ def main():
         '--surprise-weight',
         type=float,
         default=0.5,
-        help='Weight for surprise-based sampling (0=uniform, 1=fully surprise-weighted, default: 0.5)'
+        help='Weight for surprise-based sampling (0=uniform, 1=fully weighted, default: 0.5)'
     )
     train_parser.add_argument(
         '--checkpoint-interval',
@@ -669,8 +585,8 @@ def main():
     train_parser.add_argument(
         '--checkpoint-dir',
         type=str,
-        default='/tmp/distributed_ckpts',
-        help='Checkpoint directory (default: /tmp/distributed_ckpts)'
+        default='checkpoints',
+        help='Checkpoint directory (default: checkpoints)'
     )
     train_parser.add_argument(
         '--redis-host',
@@ -691,16 +607,28 @@ def main():
         help='Redis password (default: None)'
     )
     train_parser.add_argument(
+        '--metrics-port',
+        type=int,
+        default=9200,
+        help='Prometheus metrics port (default: 9200)'
+    )
+    train_parser.add_argument(
+        '--mlflow-uri',
+        type=str,
+        default=None,
+        help='MLflow tracking URI (default: None, MLflow disabled)'
+    )
+    train_parser.add_argument(
+        '--mlflow-experiment',
+        type=str,
+        default='bgai-training',
+        help='MLflow experiment name (default: bgai-training)'
+    )
+    train_parser.add_argument(
         '--num-iterations',
         type=int,
         default=-1,
         help='Number of training steps (-1 for infinite, default: -1)'
-    )
-    train_parser.add_argument(
-        '--num-gpus',
-        type=float,
-        default=0,
-        help='Number of GPUs to request (0 for CPU only, default: 0)'
     )
     train_parser.set_defaults(func=start_training_worker)
 
@@ -716,12 +644,6 @@ def main():
         type=str,
         default=None,
         help='Path to config file (default: configs/distributed.yaml)'
-    )
-    eval_parser.add_argument(
-        '--coordinator-address',
-        type=str,
-        default='auto',
-        help='Ray cluster address (default: auto = local Ray cluster)'
     )
     eval_parser.add_argument(
         '--worker-id',
@@ -784,16 +706,16 @@ def main():
         help='Redis password (default: None)'
     )
     eval_parser.add_argument(
+        '--metrics-port',
+        type=int,
+        default=9300,
+        help='Prometheus metrics port (default: 9300)'
+    )
+    eval_parser.add_argument(
         '--num-iterations',
         type=int,
         default=-1,
         help='Number of evaluation runs (-1 for infinite, default: -1)'
-    )
-    eval_parser.add_argument(
-        '--num-gpus',
-        type=float,
-        default=0,
-        help='Number of GPUs to request (0 for CPU only, default: 0)'
     )
     eval_parser.set_defaults(func=start_eval_worker)
 
@@ -811,12 +733,73 @@ def main():
         help='Path to config file (default: configs/distributed.yaml)'
     )
     status_parser.add_argument(
-        '--coordinator-address',
+        '--redis-host',
+        type=str,
+        default='localhost',
+        help='Redis host (default: localhost)'
+    )
+    status_parser.add_argument(
+        '--redis-port',
+        type=int,
+        default=6379,
+        help='Redis port (default: 6379)'
+    )
+    status_parser.add_argument(
+        '--redis-password',
         type=str,
         default=None,
-        help='Ray cluster address (default: auto = local Ray cluster)'
+        help='Redis password (default: None)'
     )
     status_parser.set_defaults(func=show_status)
+
+    # =========================================================================
+    # Runs management command
+    # =========================================================================
+    runs_parser = subparsers.add_parser(
+        'runs',
+        help='Manage training runs'
+    )
+    runs_parser.add_argument(
+        'run_command',
+        choices=['list', 'start', 'pause', 'resume', 'stop', 'reset'],
+        help='Run management command'
+    )
+    runs_parser.add_argument(
+        '--config-file', '-c',
+        type=str,
+        default=None,
+        help='Path to config file (default: configs/distributed.yaml)'
+    )
+    runs_parser.add_argument(
+        '--run-id',
+        type=str,
+        default=None,
+        help='Run ID for start command (auto-generated if not provided)'
+    )
+    runs_parser.add_argument(
+        '--redis-host',
+        type=str,
+        default='localhost',
+        help='Redis host (default: localhost)'
+    )
+    runs_parser.add_argument(
+        '--redis-port',
+        type=int,
+        default=6379,
+        help='Redis port (default: 6379)'
+    )
+    runs_parser.add_argument(
+        '--redis-password',
+        type=str,
+        default=None,
+        help='Redis password (default: None)'
+    )
+    runs_parser.add_argument(
+        '--confirm',
+        action='store_true',
+        help='Confirm destructive operations like reset'
+    )
+    runs_parser.set_defaults(func=manage_runs)
 
     # Parse and execute
     args = parser.parse_args()

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Download and setup Grafana for Ray metrics
+# Download and setup Grafana for BGAI metrics
 # This only needs to be run once to install Grafana
 
 set -e
@@ -28,12 +28,10 @@ mkdir -p "$GRAFANA_DIR/data"
 mkdir -p "$GRAFANA_DIR/conf/provisioning/datasources"
 mkdir -p "$GRAFANA_DIR/conf/provisioning/dashboards"
 
-# Ray generates dashboards at runtime in the session directory
-# These are processed templates with proper PromQL queries
-RAY_DASHBOARDS_DIR="/tmp/ray/session_latest/metrics/grafana/dashboards"
+# BGAI dashboard location
+BGAI_DASHBOARDS_DIR="$PROJECT_DIR/tools"
 
-echo "Using Ray generated dashboards from: $RAY_DASHBOARDS_DIR"
-echo "Note: Ray must be running for dashboards to be available"
+echo "Using BGAI dashboards from: $BGAI_DASHBOARDS_DIR"
 
 # Create Prometheus datasource config
 cat > "$GRAFANA_DIR/conf/provisioning/datasources/prometheus.yaml" << EOF
@@ -48,19 +46,19 @@ datasources:
 EOF
 
 # Create dashboard provisioning config
-# Points to Ray's runtime-generated dashboards (processed templates)
-cat > "$GRAFANA_DIR/conf/provisioning/dashboards/ray.yaml" << EOF
+cat > "$GRAFANA_DIR/conf/provisioning/dashboards/bgai.yaml" << EOF
 apiVersion: 1
 providers:
-  - name: 'Ray'
+  - name: 'BGAI'
     orgId: 1
-    folder: 'Ray'
+    folder: 'BGAI'
     type: file
     disableDeletion: false
     editable: true
     updateIntervalSeconds: 30
     options:
-      path: $RAY_DASHBOARDS_DIR
+      path: $BGAI_DASHBOARDS_DIR
+      foldersFromFilesStructure: false
 EOF
 
 # Create custom ini file for anonymous access

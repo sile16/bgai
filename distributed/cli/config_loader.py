@@ -34,8 +34,7 @@ def is_host_reachable(host: str, port: int = 6379, timeout: float = 1.0) -> bool
 def detect_redis_host(config: Dict[str, Any]) -> str:
     """Auto-detect the reachable Redis host.
 
-    Tries Tailscale IP first (ray.head_ip), falls back to local IP (ray.head_ip_local),
-    then finally to redis.host config.
+    Tries head node IP first, falls back to local IP, then to redis.host config.
 
     Args:
         config: Full configuration dictionary.
@@ -43,22 +42,17 @@ def detect_redis_host(config: Dict[str, Any]) -> str:
     Returns:
         Reachable Redis host IP/hostname.
     """
-    ray = config.get('ray', {})
+    head = config.get('head', {})
     redis = config.get('redis', {})
     redis_port = redis.get('port', 6379)
 
     # Get candidate IPs
-    tailscale_ip = ray.get('head_ip')
-    local_ip = ray.get('head_ip_local')
+    head_ip = head.get('host')
     config_host = redis.get('host', 'localhost')
 
-    # Try Tailscale IP first (VPN)
-    if tailscale_ip and is_host_reachable(tailscale_ip, redis_port):
-        return tailscale_ip
-
-    # Try local LAN IP
-    if local_ip and is_host_reachable(local_ip, redis_port):
-        return local_ip
+    # Try head node IP first
+    if head_ip and is_host_reachable(head_ip, redis_port):
+        return head_ip
 
     # Fall back to config host
     return config_host
@@ -320,25 +314,6 @@ def get_eval_worker_config(
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
-    }
-
-
-def get_ray_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract Ray cluster configuration.
-
-    Args:
-        config: Full configuration dictionary.
-
-    Returns:
-        Ray config dict with head_ip, ports, etc.
-    """
-    ray = config.get('ray', {})
-    return {
-        'head_ip': ray.get('head_ip', '100.105.50.111'),
-        'head_ip_local': ray.get('head_ip_local', '192.168.20.40'),
-        'gcs_port': ray.get('gcs_port', 6380),
-        'client_port': ray.get('client_port', 10001),
-        'dashboard_port': ray.get('dashboard_port', 8265),
     }
 
 

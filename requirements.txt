@@ -11,9 +11,10 @@ chex
 flax
 
 # Distributed training
-ray[default,client]
 redis
 msgpack-numpy
+mlflow
+psutil
 
 # Utilities
 numpy

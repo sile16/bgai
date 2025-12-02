@@ -2,59 +2,53 @@
 
 This worker runs batches of self-play games using StochasticMCTS,
 generating training experiences and sending them to the Redis replay buffer.
+
+No Ray dependency - uses Redis for all coordination.
 """
 
-import os
 import time
 from functools import partial
-from typing import Dict, Any, Optional, Callable, Tuple
+from typing import Dict, Any, Optional
 
 import jax
 import jax.numpy as jnp
-import chex
-import ray
 
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.common import step_env_and_evaluator
 from core.types import StepMetadata
-from core.memory.replay_memory import BaseExperience
 
-from .base_worker import BaseWorker, WorkerStats
+from .base_worker import BaseWorker
 from ..serialization import (
     serialize_experience,
     serialize_rewards,
     deserialize_weights,
+    deserialize_warm_tree,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
 from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
 
 
-@ray.remote
 class GameWorker(BaseWorker):
-    """Ray actor that generates self-play games using StochasticMCTS.
+    """Worker that generates self-play games using StochasticMCTS.
 
     Each worker runs a batch of parallel environments, collecting experiences
     and sending them to the centralized Redis replay buffer.
 
     Example:
-        >>> coordinator = create_coordinator(config)
-        >>> worker = GameWorker.remote(coordinator, config={'batch_size': 32})
-        >>> ray.get(worker.run.remote(num_iterations=1000))
+        >>> worker = GameWorker(config={'batch_size': 32})
+        >>> worker.run()
     """
 
     def __init__(
         self,
-        coordinator_handle: ray.actor.ActorHandle,
-        worker_id: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
     ):
         """Initialize the game worker.
 
         Args:
-            coordinator_handle: Ray actor handle for the coordinator.
-            worker_id: Optional unique worker ID. Auto-generated if not provided.
             config: Configuration dict with keys:
                 - batch_size: Number of parallel environments (default: 16)
                 - num_simulations: MCTS simulations per move (default: 100)
@@ -63,8 +57,11 @@ class GameWorker(BaseWorker):
                 - temperature: MCTS temperature (default: 1.0)
                 - redis_host: Redis server host (default: 'localhost')
                 - redis_port: Redis server port (default: 6379)
+                - redis_password: Redis password (optional)
+            worker_id: Optional unique worker ID. Auto-generated if not provided.
         """
-        super().__init__(coordinator_handle, worker_id, config)
+        # Initialize base worker (handles Redis connection, registration)
+        super().__init__(config, worker_id)
 
         # Log backend info
         print(f"GameWorker: JAX backend = {jax.default_backend()}")
@@ -76,10 +73,10 @@ class GameWorker(BaseWorker):
         self.max_episode_steps = self.config.get('max_episode_steps', 500)
         self.temperature = self.config.get('temperature', 1.0)
 
-        # Initialize Redis buffer
+        # Initialize Redis buffer (uses same connection info)
         redis_host = self.config.get('redis_host', 'localhost')
         redis_port = self.config.get('redis_port', 6379)
-        redis_password = self.config.get('redis_password', None)
+        redis_password = self.config.get('redis_password')
         self.buffer = RedisReplayBuffer(
             host=redis_host,
             port=redis_port,
@@ -101,6 +98,10 @@ class GameWorker(BaseWorker):
         # Collection state
         self._collection_state = None
         self._rng_key = jax.random.PRNGKey(int(time.time() * 1000) % (2**31))
+
+        # Warm tree state
+        self._warm_tree = None
+        self._warm_tree_version = 0
 
     @property
     def worker_type(self) -> str:
@@ -210,15 +211,18 @@ class GameWorker(BaseWorker):
         )
 
     def _initialize_params(self) -> None:
-        """Initialize neural network parameters from scratch or from coordinator."""
-        # Try to get weights from coordinator
-        weights_bytes = self.fetch_model_weights()
+        """Initialize neural network parameters from scratch or from Redis."""
+        # Try to get weights from Redis
+        result = self.get_current_model_weights()
 
-        if weights_bytes is not None:
-            # Use coordinator weights
+        if result is not None:
+            weights_bytes, version = result
             params_dict = deserialize_weights(weights_bytes)
             self._nn_params = params_dict
-            print(f"Worker {self.worker_id}: Loaded model version {self.current_model_version}")
+            print(f"Worker {self.worker_id}: Loaded model version {version}")
+
+            # Also try to get warm tree
+            self._check_and_update_warm_tree()
         else:
             # Initialize random weights
             key = jax.random.PRNGKey(42)
@@ -236,32 +240,70 @@ class GameWorker(BaseWorker):
         # Initialize environments
         env_states, metadatas = jax.vmap(self._env_init_fn)(init_keys)
 
-        # Initialize evaluator states
+        # Initialize evaluator states - use warm tree if available
         template_state, _ = self._env_init_fn(jax.random.PRNGKey(0))
-        eval_states = self._evaluator.init_batched(
-            self.batch_size,
-            template_embedding=template_state
-        )
+
+        if self._warm_tree is not None:
+            # Replicate warm tree across batch dimension
+            eval_states = self._replicate_warm_tree(self._warm_tree)
+            print(f"Worker {self.worker_id}: Using warm tree for game initialization")
+        else:
+            # Create empty trees
+            eval_states = self._evaluator.init_batched(
+                self.batch_size,
+                template_embedding=template_state
+            )
 
         return {
             'env_states': env_states,
             'metadatas': metadatas,
             'eval_states': eval_states,
             'episode_experiences': [[] for _ in range(self.batch_size)],
-            'episode_value_preds': [[] for _ in range(self.batch_size)],  # Track value predictions
+            'episode_value_preds': [[] for _ in range(self.batch_size)],
             'episode_ids': [None] * self.batch_size,
         }
 
-    def _on_model_update_available(self, new_version: int) -> None:
-        """Handle new model version notification."""
-        weights_bytes = self.fetch_model_weights()
-        if weights_bytes is not None:
+    def _replicate_warm_tree(self, warm_tree):
+        """Replicate a single warm tree across the batch dimension.
+
+        Args:
+            warm_tree: A single MCTSTree to replicate.
+
+        Returns:
+            Batched MCTSTree with the warm tree replicated batch_size times.
+        """
+        # Stack the warm tree batch_size times along a new batch dimension
+        def stack_leaves(x):
+            return jnp.stack([x] * self.batch_size, axis=0)
+
+        return jax.tree_util.tree_map(stack_leaves, warm_tree)
+
+    def _check_and_update_model(self) -> None:
+        """Check for and apply model updates from Redis."""
+        result = self.get_model_weights()
+        if result is not None:
+            weights_bytes, version = result
             self._nn_params = deserialize_weights(weights_bytes)
-            print(f"Worker {self.worker_id}: Updated to model version {new_version}")
+            print(f"Worker {self.worker_id}: Updated to model version {version}")
+
+            # Also check for warm tree update
+            self._check_and_update_warm_tree()
+
+    def _check_and_update_warm_tree(self) -> None:
+        """Check for and fetch warm tree update from Redis."""
+        result = self.state.get_warm_tree_if_newer(self._warm_tree_version)
+        if result is not None:
+            tree_bytes, version = result
+            try:
+                self._warm_tree = deserialize_warm_tree(tree_bytes)
+                self._warm_tree_version = version
+                print(f"Worker {self.worker_id}: Loaded warm tree version {version}")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Error loading warm tree: {e}")
+                self._warm_tree = None
 
     def _setup_batched_step(self) -> None:
         """Create and cache the JIT-compiled batched step function."""
-        # Create step function partial
         step_fn = partial(
             step_env_and_evaluator,
             evaluator=self._evaluator,
@@ -270,7 +312,6 @@ class GameWorker(BaseWorker):
             max_steps=self.max_episode_steps
         )
 
-        # Vectorize the step function
         def batched_step(env_state, metadata, eval_state, params, key):
             return step_fn(
                 key=key,
@@ -280,7 +321,6 @@ class GameWorker(BaseWorker):
                 params=params
             )
 
-        # JIT compile the vmapped function (compiled once, reused every step)
         self._jitted_batched_step = jax.jit(jax.vmap(batched_step, in_axes=(0, 0, 0, None, 0)))
 
     def _collect_step(self) -> int:
@@ -311,11 +351,9 @@ class GameWorker(BaseWorker):
         completed_episodes = 0
 
         for i in range(self.batch_size):
-            # Skip stochastic states (dice rolls)
             is_stochastic = env_states._is_stochastic[i] if hasattr(env_states, '_is_stochastic') else False
 
             if not is_stochastic:
-                # Collect experience for training
                 exp = {
                     'observation_nn': self._state_to_nn_input_fn(
                         jax.tree.map(lambda x: x[i], env_states)
@@ -326,13 +364,9 @@ class GameWorker(BaseWorker):
                 }
                 state['episode_experiences'][i].append(exp)
 
-                # Track value prediction for surprise scoring
-                # Get value from evaluator state (MCTS root value)
-                # Normalize to player 0's perspective for consistent surprise scoring
                 eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
                 value_pred = float(self._evaluator.get_value(eval_state_i))
                 cur_player = int(metadatas.cur_player_id[i])
-                # If player 1 is playing, negate value to get player 0's perspective
                 value_pred_p0 = value_pred if cur_player == 0 else -value_pred
                 state['episode_value_preds'][i].append(value_pred_p0)
 
@@ -340,7 +374,6 @@ class GameWorker(BaseWorker):
             truncated = truncateds[i]
 
             if terminated or truncated:
-                # Episode complete - send to Redis
                 if terminated and len(state['episode_experiences'][i]) > 0:
                     self._send_episode_to_buffer(
                         state['episode_experiences'][i],
@@ -350,12 +383,10 @@ class GameWorker(BaseWorker):
                     completed_episodes += 1
                     self.stats.games_generated += 1
 
-                # Reset episode state
                 state['episode_experiences'][i] = []
                 state['episode_value_preds'][i] = []
                 state['episode_ids'][i] = None
 
-        # Update collection state
         self._collection_state['env_states'] = new_env_states
         self._collection_state['metadatas'] = new_metadatas
         self._collection_state['eval_states'] = eval_outputs.eval_state
@@ -368,37 +399,23 @@ class GameWorker(BaseWorker):
         final_rewards: jnp.ndarray,
         value_predictions: list,
     ) -> None:
-        """Send a completed episode to the Redis buffer.
-
-        Args:
-            experiences: List of experience dicts from the episode.
-            final_rewards: Final rewards for each player.
-            value_predictions: List of value predictions from each step.
-        """
-        # Serialize experiences
+        """Send a completed episode to the Redis buffer."""
         serialized_exps = []
         for exp in experiences:
             exp_bytes = serialize_experience(exp)
             serialized_exps.append(exp_bytes)
 
-        # Serialize rewards
         rewards_bytes = serialize_rewards(final_rewards)
 
-        # Compute surprise score: |mean_value_pred - actual_outcome|
-        # Value predictions are normalized to player 0's perspective during collection
-        # Final reward is [player0_reward, player1_reward]
         surprise_score = 0.0
         if value_predictions:
-            # Average value prediction across episode (already in player 0's perspective)
             mean_value_pred = sum(value_predictions) / len(value_predictions)
             actual_outcome = float(final_rewards[0])
             surprise_score = abs(mean_value_pred - actual_outcome)
 
-        # Record surprise score metric
         metrics = get_metrics()
         metrics.surprise_score.labels(worker_id=self.worker_id).observe(surprise_score)
 
-        # Add to Redis buffer
         try:
             self.buffer.add_episode(
                 experiences=serialized_exps,
@@ -434,7 +451,7 @@ class GameWorker(BaseWorker):
         print(f"Worker {self.worker_id}: Initializing {self.batch_size} parallel environments...")
         self._collection_state = self._init_collection_state()
 
-        # Setup and JIT compile the batched step function (compile once)
+        # Setup and JIT compile the batched step function
         print(f"Worker {self.worker_id}: JIT compiling batched step function...")
         self._setup_batched_step()
 
@@ -450,7 +467,7 @@ class GameWorker(BaseWorker):
                 worker_id=self.worker_id,
                 worker_type='game',
                 port=metrics_port,
-                ttl_seconds=300,  # 5 min TTL for more reliable discovery
+                ttl_seconds=300,
             )
             print(f"Worker {self.worker_id}: Registered metrics endpoint on port {metrics_port}")
         except Exception as e:
@@ -472,11 +489,16 @@ class GameWorker(BaseWorker):
         total_games = 0
         total_steps = 0
         start_time = time.time()
-        last_metrics_time = start_time
+        last_model_check = start_time
 
         while self.running:
             if num_iterations >= 0 and iteration >= num_iterations:
                 break
+
+            # Check for model updates periodically (every 10 seconds)
+            if time.time() - last_model_check > 10:
+                self._check_and_update_model()
+                last_model_check = time.time()
 
             # Collect one step across all environments
             completed = self._collect_step()
@@ -492,13 +514,12 @@ class GameWorker(BaseWorker):
 
             metrics.steps_total.labels(worker_id=self.worker_id).inc(self.batch_size)
 
-            # Log progress and update rate metrics periodically
+            # Log progress periodically
             if iteration % 100 == 0:
                 elapsed = time.time() - start_time
                 steps_per_sec = total_steps / max(elapsed, 0.001)
                 games_per_min = (total_games / max(elapsed, 0.001)) * 60
 
-                # Update rate gauges
                 metrics.collection_steps_per_second.labels(
                     worker_id=self.worker_id
                 ).set(steps_per_sec)
@@ -509,7 +530,7 @@ class GameWorker(BaseWorker):
                     worker_id=self.worker_id, worker_type='game'
                 ).set(self.current_model_version)
 
-                # Refresh metrics registration heartbeat
+                # Refresh metrics registration
                 try:
                     register_metrics_endpoint(
                         self.buffer.redis,
@@ -518,13 +539,14 @@ class GameWorker(BaseWorker):
                         port=metrics_port,
                         ttl_seconds=300,
                     )
-                except Exception as e:
-                    print(f"Worker {self.worker_id}: Failed to refresh metrics registration: {e}")
+                except Exception:
+                    pass
 
                 print(
                     f"Worker {self.worker_id}: "
                     f"iter={iteration}, games={total_games}, "
-                    f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}"
+                    f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}, "
+                    f"model_v{self.current_model_version}"
                 )
 
         # Mark worker as stopped
@@ -544,11 +566,7 @@ class GameWorker(BaseWorker):
         }
 
     def get_collection_stats(self) -> Dict[str, Any]:
-        """Get current collection statistics.
-
-        Returns:
-            Dict with collection stats.
-        """
+        """Get current collection statistics."""
         base_stats = self.get_stats()
         base_stats.update({
             'batch_size': self.batch_size,
@@ -558,3 +576,17 @@ class GameWorker(BaseWorker):
             'buffer_size': self.buffer.get_size() if self.buffer else 0,
         })
         return base_stats
+
+
+def run_game_worker(config: Optional[Dict[str, Any]] = None, worker_id: Optional[str] = None) -> Dict[str, Any]:
+    """Run a game worker (convenience function).
+
+    Args:
+        config: Worker configuration.
+        worker_id: Optional worker ID.
+
+    Returns:
+        Result dict from worker.run().
+    """
+    worker = GameWorker(config=config, worker_id=worker_id)
+    return worker.run()

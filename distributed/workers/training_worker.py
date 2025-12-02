@@ -2,16 +2,19 @@
 
 This worker fetches batches of experiences from the Redis replay buffer
 and performs gradient updates on the neural network, pushing updated
-weights back to the coordinator.
+weights back to Redis for other workers to fetch.
 
 Training is gated on collection milestones:
 - Collection runs continuously, filling the buffer
 - Training triggers when N new games have been collected
 - Training runs until it has processed all available data
 - Weights are pushed after each training batch completes
+
+No Ray dependency - uses Redis for all coordination.
 """
 
 import time
+import os
 from functools import partial
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -20,7 +23,6 @@ import jax
 import jax.numpy as jnp
 import chex
 import optax
-import ray
 from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
@@ -31,6 +33,7 @@ from ..serialization import (
     serialize_weights,
     deserialize_weights,
     batch_experiences_to_jax,
+    serialize_warm_tree,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
 from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
@@ -55,30 +58,27 @@ class TrainingStats:
         return self.cumulative_loss / max(self.loss_count, 1)
 
 
-@ray.remote
 class TrainingWorker(BaseWorker):
-    """Ray actor that performs neural network training.
+    """Training worker that performs neural network training.
 
     Samples batches from the Redis replay buffer and performs gradient
-    updates, pushing new weights to the coordinator periodically.
+    updates, pushing new weights to Redis periodically.
+
+    No Ray dependency - uses Redis for all coordination.
 
     Example:
-        >>> coordinator = create_coordinator(config)
-        >>> worker = TrainingWorker.remote(coordinator, config={...})
-        >>> ray.get(worker.run.remote(num_iterations=10000))
+        >>> worker = TrainingWorker(config={...})
+        >>> worker.run(num_iterations=10000)
     """
 
     def __init__(
         self,
-        coordinator_handle: ray.actor.ActorHandle,
-        worker_id: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
     ):
         """Initialize the training worker.
 
         Args:
-            coordinator_handle: Ray actor handle for the coordinator.
-            worker_id: Optional unique worker ID. Auto-generated if not provided.
             config: Configuration dict with keys:
                 - train_batch_size: Batch size for training (default: 128)
                 - learning_rate: Optimizer learning rate (default: 3e-4)
@@ -89,9 +89,12 @@ class TrainingWorker(BaseWorker):
                 - min_buffer_size: Minimum buffer size before training (default: 1000)
                 - redis_host: Redis server host (default: 'localhost')
                 - redis_port: Redis server port (default: 6379)
-                - checkpoint_dir: Directory for saving checkpoints (default: '/tmp/distributed_ckpts')
+                - checkpoint_dir: Directory for saving checkpoints (default: 'checkpoints')
+                - mlflow_tracking_uri: MLflow tracking server URI (optional)
+                - mlflow_experiment_name: MLflow experiment name (optional)
+            worker_id: Optional unique worker ID. Auto-generated if not provided.
         """
-        super().__init__(coordinator_handle, worker_id, config)
+        super().__init__(config, worker_id)
 
         # Training configuration
         self.train_batch_size = self.config.get('train_batch_size', 128)
@@ -99,7 +102,7 @@ class TrainingWorker(BaseWorker):
         self.l2_reg_lambda = self.config.get('l2_reg_lambda', 1e-4)
         self.checkpoint_interval = self.config.get('checkpoint_interval', 1000)
         self.min_buffer_size = self.config.get('min_buffer_size', 1000)
-        self.checkpoint_dir = self.config.get('checkpoint_dir', '/tmp/distributed_ckpts')
+        self.checkpoint_dir = self.config.get('checkpoint_dir', 'checkpoints')
 
         # Collection-gated training configuration
         # Training triggers after this many new games collected
@@ -111,6 +114,15 @@ class TrainingWorker(BaseWorker):
         # 0 = uniform sampling, 1 = fully surprise-weighted
         self.surprise_weight = self.config.get('surprise_weight', 0.5)
 
+        # Warm tree configuration
+        # Number of MCTS simulations for warm tree (0 to disable)
+        self.warm_tree_simulations = self.config.get('warm_tree_simulations', 0)
+        self.warm_tree_max_nodes = self.config.get('warm_tree_max_nodes', 10000)
+
+        # Warm tree components (lazy initialization)
+        self._warm_tree_env = None
+        self._warm_tree_evaluator = None
+
         # Initialize Redis buffer
         redis_host = self.config.get('redis_host', 'localhost')
         redis_port = self.config.get('redis_port', 6379)
@@ -121,6 +133,11 @@ class TrainingWorker(BaseWorker):
             password=redis_password,
             worker_id=self.worker_id,
         )
+
+        # MLflow configuration
+        self.mlflow_tracking_uri = self.config.get('mlflow_tracking_uri')
+        self.mlflow_experiment_name = self.config.get('mlflow_experiment_name', 'bgai-training')
+        self._mlflow_run = None
 
         # Neural network (lazy initialization)
         self._nn_model = None
@@ -140,6 +157,63 @@ class TrainingWorker(BaseWorker):
     @property
     def worker_type(self) -> str:
         return 'training'
+
+    def _setup_mlflow(self) -> None:
+        """Set up MLflow tracking if configured."""
+        if not self.mlflow_tracking_uri:
+            print(f"Worker {self.worker_id}: MLflow not configured, skipping")
+            return
+
+        try:
+            import mlflow
+
+            mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+            mlflow.set_experiment(self.mlflow_experiment_name)
+
+            # Check if we should resume an existing run
+            run_id = self.state.get_run_id()
+            if run_id:
+                # Resume existing run
+                self._mlflow_run = mlflow.start_run(run_id=run_id)
+                print(f"Worker {self.worker_id}: Resumed MLflow run {run_id}")
+            else:
+                # Start new run
+                self._mlflow_run = mlflow.start_run()
+                run_id = self._mlflow_run.info.run_id
+                self.state.set_run_id(run_id)
+                print(f"Worker {self.worker_id}: Started MLflow run {run_id}")
+
+                # Log configuration parameters
+                mlflow.log_params({
+                    'train_batch_size': self.train_batch_size,
+                    'learning_rate': self.learning_rate,
+                    'l2_reg_lambda': self.l2_reg_lambda,
+                    'games_per_training_batch': self.games_per_training_batch,
+                    'steps_per_game': self.steps_per_game,
+                    'surprise_weight': self.surprise_weight,
+                    'min_buffer_size': self.min_buffer_size,
+                    'checkpoint_interval': self.checkpoint_interval,
+                })
+
+        except Exception as e:
+            print(f"Worker {self.worker_id}: MLflow setup error: {e}")
+            self._mlflow_run = None
+
+    def _log_mlflow_metrics(self, metrics: Dict[str, float], step: int) -> None:
+        """Log metrics to MLflow if configured.
+
+        Args:
+            metrics: Dict of metric name to value.
+            step: Training step number.
+        """
+        if self._mlflow_run is None:
+            return
+
+        try:
+            import mlflow
+            mlflow.log_metrics(metrics, step=step)
+        except Exception as e:
+            print(f"Worker {self.worker_id}: MLflow logging error: {e}")
 
     def _setup_environment(self) -> None:
         """Set up the backgammon environment for shape inference."""
@@ -189,20 +263,22 @@ class TrainingWorker(BaseWorker):
         )
 
     def _initialize_train_state(self) -> None:
-        """Initialize training state from scratch or from coordinator."""
-        # Try to get weights from coordinator
-        weights_bytes = self.fetch_model_weights()
+        """Initialize training state from scratch or from Redis."""
+        # Try to get weights from Redis
+        result = self.get_current_model_weights()
 
         # Create sample input for initialization
         key = jax.random.PRNGKey(42)
         sample_state = self._env.init(key)
         sample_obs = sample_state.observation
 
-        if weights_bytes is not None:
-            # Use coordinator weights
+        if result is not None:
+            # Use weights from Redis
+            weights_bytes, version = result
             params_dict = deserialize_weights(weights_bytes)
             params = params_dict['params']
-            print(f"Worker {self.worker_id}: Loaded model version {self.current_model_version}")
+            self.current_model_version = version
+            print(f"Worker {self.worker_id}: Loaded model version {version}")
         else:
             # Initialize random weights
             variables = self._nn_model.init(key, sample_obs[None, ...], train=False)
@@ -219,8 +295,8 @@ class TrainingWorker(BaseWorker):
             tx=optimizer,
         )
 
-    def _push_weights_to_coordinator(self) -> bool:
-        """Push current weights to the coordinator.
+    def _push_weights_to_redis(self) -> bool:
+        """Push current weights to Redis.
 
         Returns:
             True if weights were pushed successfully.
@@ -233,26 +309,164 @@ class TrainingWorker(BaseWorker):
             # Increment version
             new_version = self.current_model_version + 1
 
-            # Push to coordinator
-            result = ray.get(self.coordinator.update_model_weights.remote(
-                weights_bytes,
-                version=new_version,
-            ))
+            # Push to Redis
+            success = self.state.set_model_weights(weights_bytes, new_version)
 
-            if result.get('status') == 'updated':
+            if success:
                 self.current_model_version = new_version
                 print(f"Worker {self.worker_id}: Pushed weights version {new_version}")
+
+                # Build and push warm tree if configured
+                if self.warm_tree_simulations > 0:
+                    self._build_and_push_warm_tree()
+
                 return True
 
+            # Version conflict - another worker updated
+            current = self.state.get_model_version()
+            print(f"Worker {self.worker_id}: Weight push rejected, current version is {current}")
             return False
 
         except Exception as e:
             print(f"Worker {self.worker_id}: Error pushing weights: {e}")
             return False
 
+    def _setup_warm_tree_environment(self) -> None:
+        """Set up environment for warm tree building (lazy initialization)."""
+        if self._warm_tree_env is not None:
+            return
+
+        import pgx.backgammon as bg
+        from core.types import StepMetadata
+
+        self._warm_tree_env = bg.Backgammon(short_game=True)
+
+        def step_fn(state, action, key):
+            def stochastic_branch(operand):
+                s, a, _ = operand
+                return self._warm_tree_env.stochastic_step(s, a)
+
+            def deterministic_branch(operand):
+                s, a, k = operand
+                return self._warm_tree_env.step(s, a, k)
+
+            new_state = jax.lax.cond(
+                state._is_stochastic,
+                stochastic_branch,
+                deterministic_branch,
+                (state, action, key)
+            )
+
+            metadata = StepMetadata(
+                rewards=new_state.rewards,
+                action_mask=new_state.legal_action_mask,
+                terminated=new_state.terminated,
+                cur_player_id=new_state.current_player,
+                step=new_state._step_count
+            )
+
+            return new_state, metadata
+
+        self._warm_tree_step_fn = step_fn
+
+        def init_fn(key):
+            state = self._warm_tree_env.init(key)
+            return state, StepMetadata(
+                rewards=state.rewards,
+                action_mask=state.legal_action_mask,
+                terminated=state.terminated,
+                cur_player_id=state.current_player,
+                step=state._step_count
+            )
+
+        self._warm_tree_init_fn = init_fn
+        self._warm_tree_state_to_nn = lambda state: state.observation
+
+    def _setup_warm_tree_evaluator(self) -> None:
+        """Set up MCTS evaluator for warm tree building."""
+        if self._warm_tree_evaluator is not None:
+            return
+
+        self._setup_warm_tree_environment()
+
+        from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
+        from core.evaluators.mcts.action_selection import PUCTSelector
+        from core.evaluators.evaluation_fns import make_nn_eval_fn
+
+        eval_fn = make_nn_eval_fn(self._nn_model, self._warm_tree_state_to_nn)
+
+        self._warm_tree_evaluator = StochasticMCTS(
+            eval_fn=eval_fn,
+            stochastic_action_probs=self._warm_tree_env.stochastic_action_probs,
+            num_iterations=self.warm_tree_simulations,
+            max_nodes=self.warm_tree_max_nodes,
+            branching_factor=self._warm_tree_env.num_actions,
+            action_selector=PUCTSelector(),
+            temperature=1.0,
+            persist_tree=True,
+        )
+
+    def _build_and_push_warm_tree(self) -> bool:
+        """Build warm tree from initial position and push to Redis.
+
+        Returns:
+            True if warm tree was built and pushed successfully.
+        """
+        if self.warm_tree_simulations <= 0:
+            return False
+
+        try:
+            start_time = time.time()
+            print(f"Worker {self.worker_id}: Building warm tree ({self.warm_tree_simulations} sims)...")
+
+            # Setup evaluator if needed
+            self._setup_warm_tree_evaluator()
+
+            # Initialize from starting position
+            key = jax.random.PRNGKey(42)  # Fixed seed for reproducibility
+            init_state, init_metadata = self._warm_tree_init_fn(key)
+
+            # Initialize tree
+            eval_state = self._warm_tree_evaluator.init(template_embedding=init_state)
+
+            # Get current params
+            params = self._train_state.params
+
+            # Run MCTS iterations to build the tree
+            # The evaluator's evaluate() method runs num_iterations internally
+            key, eval_key = jax.random.split(key)
+            output = self._warm_tree_evaluator.evaluate(
+                key=eval_key,
+                eval_state=eval_state,
+                env_state=init_state,
+                root_metadata=init_metadata,
+                params=params,
+                env_step_fn=self._warm_tree_step_fn,
+            )
+
+            # Serialize and push the warm tree
+            warm_tree = output.eval_state
+            tree_bytes = serialize_warm_tree(warm_tree)
+
+            self.state.set_warm_tree(tree_bytes, self.current_model_version)
+
+            duration = time.time() - start_time
+            tree_size_mb = len(tree_bytes) / (1024 * 1024)
+            print(
+                f"Worker {self.worker_id}: Warm tree built and pushed "
+                f"(v{self.current_model_version}, {tree_size_mb:.2f} MB, {duration:.1f}s)"
+            )
+
+            return True
+
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Error building warm tree: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def _save_checkpoint(self) -> None:
         """Save a checkpoint of the current training state."""
-        import os
         import pickle
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -273,6 +487,14 @@ class TrainingWorker(BaseWorker):
             pickle.dump(checkpoint, f)
 
         print(f"Worker {self.worker_id}: Saved checkpoint to {ckpt_path}")
+
+        # Log checkpoint to MLflow if configured
+        if self._mlflow_run is not None:
+            try:
+                import mlflow
+                mlflow.log_artifact(ckpt_path)
+            except Exception as e:
+                print(f"Worker {self.worker_id}: MLflow artifact logging error: {e}")
 
         # Clean up old checkpoints (keep last 3)
         ckpt_files = sorted([
@@ -452,6 +674,9 @@ class TrainingWorker(BaseWorker):
         self._setup_neural_network()
         self._initialize_train_state()
 
+        # Set up MLflow tracking
+        self._setup_mlflow()
+
         # Start Prometheus metrics server
         metrics_port = self.config.get('metrics_port', 9200)
         start_metrics_server(metrics_port)
@@ -492,6 +717,12 @@ class TrainingWorker(BaseWorker):
         self._training_stats.experiences_at_last_train = self.buffer.get_size()
 
         while self.running:
+            # Check if training is active
+            if not self.is_training_active():
+                print(f"Worker {self.worker_id}: Training paused, waiting...")
+                time.sleep(5.0)
+                continue
+
             if num_iterations >= 0 and self._total_steps >= num_iterations:
                 break
 
@@ -543,8 +774,8 @@ class TrainingWorker(BaseWorker):
             # Run training batch
             batch_metrics = self._run_training_batch(target_steps)
 
-            # Push updated weights
-            self._push_weights_to_coordinator()
+            # Push updated weights to Redis
+            self._push_weights_to_redis()
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games
@@ -553,6 +784,21 @@ class TrainingWorker(BaseWorker):
             # Log batch results
             elapsed = time.time() - start_time
             overall_steps_per_sec = self._total_steps / max(elapsed, 0.001)
+
+            # Log to MLflow
+            mlflow_metrics = {
+                'loss': batch_metrics.get('loss', 0),
+                'policy_loss': batch_metrics.get('policy_loss', 0),
+                'value_loss': batch_metrics.get('value_loss', 0),
+                'batch_steps': batch_metrics.get('batch_steps', 0),
+                'batch_duration': batch_metrics.get('batch_duration', 0),
+                'steps_per_sec': batch_metrics.get('steps_per_sec', 0),
+                'overall_steps_per_sec': overall_steps_per_sec,
+                'buffer_size': buffer_size,
+                'total_games': current_games,
+                'model_version': self.current_model_version,
+            }
+            self._log_mlflow_metrics(mlflow_metrics, step=self._total_steps)
 
             # Update Prometheus metrics
             metrics.training_steps_total.labels(
@@ -620,8 +866,16 @@ class TrainingWorker(BaseWorker):
 
         # Final checkpoint
         if self._total_steps > 0:
-            self._push_weights_to_coordinator()
+            self._push_weights_to_redis()
             self._save_checkpoint()
+
+        # End MLflow run
+        if self._mlflow_run is not None:
+            try:
+                import mlflow
+                mlflow.end_run()
+            except Exception as e:
+                print(f"Worker {self.worker_id}: MLflow end run error: {e}")
 
         # Mark worker as stopped
         metrics.worker_status.labels(

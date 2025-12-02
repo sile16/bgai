@@ -42,7 +42,6 @@ fi
 REDIS_HOST="$HEAD_IP"
 REDIS_PORT="6379"
 REDIS_PASSWORD="bgai-password"
-RAY_CLIENT_PORT="10001"
 LOG_DIR="$PROJECT_DIR/logs"
 
 # Evaluation settings
@@ -141,47 +140,28 @@ echo "MCTS sims:     $MCTS_SIMULATIONS"
 echo "Eval games:    $EVAL_GAMES"
 echo "Eval interval: ${EVAL_INTERVAL}s"
 echo "Eval types:    $EVAL_TYPES"
-echo "Head node:     $HEAD_IP:$RAY_CLIENT_PORT"
+echo "Redis:         $REDIS_HOST:$REDIS_PORT"
 echo "Log file:      $LOG_FILE"
 echo ""
 
 # =============================================================================
 # Start eval worker
-# Note: eval-worker command needs to be implemented in CLI
-# For now, this is a placeholder that shows the intended interface
 # =============================================================================
 echo "Starting evaluation worker..."
+python -m distributed.cli.main eval-worker \
+    --worker-id "$WORKER_ID" \
+    --batch-size "$BATCH_SIZE" \
+    --mcts-simulations "$MCTS_SIMULATIONS" \
+    --mcts-max-nodes "$MCTS_MAX_NODES" \
+    --eval-games "$EVAL_GAMES" \
+    --redis-host "$REDIS_HOST" \
+    --redis-port "$REDIS_PORT" \
+    --redis-password "$REDIS_PASSWORD" \
+    > "$LOG_FILE" 2>&1 &
 
-# Check if eval-worker command exists
-if python -m distributed.cli.main --help 2>&1 | grep -q "eval-worker"; then
-    python -m distributed.cli.main eval-worker \
-        --coordinator-address "ray://$HEAD_IP:$RAY_CLIENT_PORT" \
-        --worker-id "$WORKER_ID" \
-        --batch-size "$BATCH_SIZE" \
-        --mcts-simulations "$MCTS_SIMULATIONS" \
-        --mcts-max-nodes "$MCTS_MAX_NODES" \
-        --eval-games "$EVAL_GAMES" \
-        --eval-interval "$EVAL_INTERVAL" \
-        --eval-types "$EVAL_TYPES" \
-        --redis-host "$REDIS_HOST" \
-        --redis-port "$REDIS_PORT" \
-        --redis-password "$REDIS_PASSWORD" \
-        > "$LOG_FILE" 2>&1 &
-
-    WORKER_PID=$!
-    echo "Evaluation worker started with PID: $WORKER_PID"
-    echo "$WORKER_PID" > "$LOG_DIR/eval_${WORKER_ID}.pid"
-else
-    echo "WARNING: eval-worker command not yet implemented in CLI."
-    echo ""
-    echo "The evaluation worker will:"
-    echo "  1. Periodically fetch current model weights"
-    echo "  2. Play $EVAL_GAMES games against baseline (GNUBG/random)"
-    echo "  3. Report win rate to coordinator"
-    echo ""
-    echo "To implement, add 'eval-worker' command to distributed/cli/main.py"
-    exit 1
-fi
+WORKER_PID=$!
+echo "Evaluation worker started with PID: $WORKER_PID"
+echo "$WORKER_PID" > "$LOG_DIR/eval_${WORKER_ID}.pid"
 
 echo ""
 echo "Monitor with:"
