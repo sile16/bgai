@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 from typing import Optional
@@ -42,6 +43,21 @@ from .config_loader import (
     get_eval_worker_config,
     print_config_summary,
 )
+
+
+def configure_gpu_fraction(num_gpus: float) -> None:
+    """Configure JAX to use a fraction of GPU memory.
+
+    IMPORTANT: Must be called BEFORE any JAX imports.
+
+    Args:
+        num_gpus: Fraction of GPU to use (0.0-1.0).
+                  Use 0.5 to share GPU between two processes.
+    """
+    if num_gpus < 1.0:
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(num_gpus)
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+        print(f"GPU memory fraction set to {num_gpus}")
 
 
 def start_coordinator(args):
@@ -86,6 +102,9 @@ def start_coordinator(args):
 
 def start_game_worker(args):
     """Start a game generation worker."""
+    # Configure GPU fraction BEFORE importing JAX-dependent modules
+    configure_gpu_fraction(args.num_gpus)
+
     from ..workers.game_worker import GameWorker
 
     # Load configuration from file
@@ -138,6 +157,9 @@ def start_game_worker(args):
 
 def start_training_worker(args):
     """Start a training worker."""
+    # Configure GPU fraction BEFORE importing JAX-dependent modules
+    configure_gpu_fraction(args.num_gpus)
+
     from ..workers.training_worker import TrainingWorker
 
     # Load configuration from file
@@ -202,6 +224,9 @@ def start_training_worker(args):
 
 def start_eval_worker(args):
     """Start an evaluation worker."""
+    # Configure GPU fraction BEFORE importing JAX-dependent modules
+    configure_gpu_fraction(args.num_gpus)
+
     from ..workers.eval_worker import EvalWorker
 
     # Load configuration from file
@@ -733,6 +758,12 @@ def main():
         type=int,
         default=-1,
         help='Number of evaluation runs (-1 for infinite, default: -1)'
+    )
+    eval_parser.add_argument(
+        '--num-gpus',
+        type=float,
+        default=1.0,
+        help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
     )
     eval_parser.set_defaults(func=start_eval_worker)
 
