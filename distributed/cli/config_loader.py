@@ -276,6 +276,9 @@ def get_training_worker_config(
         'games_per_training_batch': training.get('games_per_batch', 10),
         'steps_per_game': training.get('steps_per_game', 10),
         'surprise_weight': training.get('surprise_weight', 0.5),
+        # Warm tree configuration (pre-computed MCTS tree from initial position)
+        'warm_tree_simulations': training.get('warm_tree_simulations', 0),
+        'warm_tree_max_nodes': training.get('warm_tree_max_nodes', 10000),
     }
 
 

@@ -178,7 +178,7 @@ class EvalWorker(BaseWorker):
                 return self._env.step(s, a, k)
 
             new_state = jax.lax.cond(
-                state.is_stochastic,
+                state._is_stochastic,
                 stochastic_branch,
                 deterministic_branch,
                 (state, action, key)

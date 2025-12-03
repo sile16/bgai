@@ -432,6 +432,11 @@ def main():
         default=400,
         help='Maximum MCTS tree nodes (default: 400)'
     )
+    coord_parser.add_argument(
+        '--dashboard',
+        action='store_true',
+        help='Enable dashboard mode (reserved for future use)'
+    )
     coord_parser.set_defaults(func=start_coordinator)
 
     # =========================================================================
@@ -512,6 +517,12 @@ def main():
         type=int,
         default=-1,
         help='Number of iterations (-1 for infinite, default: -1)'
+    )
+    game_parser.add_argument(
+        '--num-gpus',
+        type=float,
+        default=1.0,
+        help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
     )
     game_parser.set_defaults(func=start_game_worker)
 
@@ -629,6 +640,12 @@ def main():
         type=int,
         default=-1,
         help='Number of training steps (-1 for infinite, default: -1)'
+    )
+    train_parser.add_argument(
+        '--num-gpus',
+        type=float,
+        default=1.0,
+        help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
     )
     train_parser.set_defaults(func=start_training_worker)
 
