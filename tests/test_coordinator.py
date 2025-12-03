@@ -253,6 +253,9 @@ class TestRedisStateManager:
 
     def test_is_training_active(self, state_manager, mock_redis):
         """Test checking if training is active."""
+        mock_redis.get.return_value = None
+        assert state_manager.is_training_active() is True
+
         mock_redis.get.return_value = b'running'
         assert state_manager.is_training_active() is True
 

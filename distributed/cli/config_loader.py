@@ -34,7 +34,7 @@ def is_host_reachable(host: str, port: int = 6379, timeout: float = 1.0) -> bool
 def detect_redis_host(config: Dict[str, Any]) -> str:
     """Auto-detect the reachable Redis host.
 
-    Tries head node IP first, falls back to local IP, then to redis.host config.
+    Tries head node IP first, then head_local fallback, then to redis.host config.
 
     Args:
         config: Full configuration dictionary.
@@ -48,11 +48,16 @@ def detect_redis_host(config: Dict[str, Any]) -> str:
 
     # Get candidate IPs
     head_ip = head.get('host')
+    head_local_ip = head.get('host_local')
     config_host = redis.get('host', 'localhost')
 
     # Try head node IP first
     if head_ip and is_host_reachable(head_ip, redis_port):
         return head_ip
+
+    # Try local/LAN IP next
+    if head_local_ip and is_host_reachable(head_local_ip, redis_port):
+        return head_local_ip
 
     # Fall back to config host
     return config_host

@@ -293,7 +293,11 @@ class RedisStateManager:
 
     def is_training_active(self) -> bool:
         """Check if training is currently active."""
-        return self.get_run_status() == RunStatus.RUNNING.value
+        status = self.redis.get(KEY_RUN_STATUS)
+        if status is None:
+            # Default to active when unset so fresh clusters train
+            return True
+        return status.decode() == RunStatus.RUNNING.value
 
     # =========================================================================
     # Worker Registry

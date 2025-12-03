@@ -7,6 +7,7 @@ Handles symmetry optimization for memory efficiency.
 import numpy as np
 import jax.numpy as jnp
 import jax
+from functools import partial
 from typing import Optional, Tuple
 from pathlib import Path
 
@@ -90,7 +91,7 @@ class BearoffTable:
             idx = j * self.n - j * (j + 1) // 2 + i
             return 1.0 - float(self.table[idx])
 
-    @jax.jit
+    @partial(jax.jit, static_argnums=0)
     def lookup_jax(self, x_pos: jnp.ndarray, o_pos: jnp.ndarray) -> jnp.ndarray:
         """JAX-compatible lookup (JIT-compiled).
 
