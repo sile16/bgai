@@ -1,12 +1,15 @@
-"""Numba-accelerated bearoff table generator.
+"""Numba-accelerated bearoff table generator with proper move enumeration.
 
-Uses JIT-compiled loops for fast value iteration with minimal memory overhead.
-Only needs 2 full-size arrays (table + new_table = 24 GB for 15 checkers).
+Uses JIT-compiled loops for fast value iteration.
+Now with CORRECT minimax over all legal moves (not greedy heuristics).
+
+Memory: 2 full-size arrays (table + new_table = 24 GB for 15 checkers)
+        + padded transition array (~3 GB for 15 checkers)
 """
 
 import numpy as np
 from numba import jit, prange
-from typing import Tuple, List
+from typing import Tuple, List, Set
 import time
 from tqdm import tqdm
 import gc
@@ -18,9 +21,26 @@ from .indexing import (
 )
 
 
-# All 36 dice outcomes
-N_DICE = 36
-DICE_PROB = np.float32(1.0 / 36.0)
+# 21 unique dice outcomes (not 36) - we use probabilities to weight
+DICE_OUTCOMES = []
+DICE_PROBS = []
+
+for d1 in range(1, 7):
+    for d2 in range(d1, 7):
+        DICE_OUTCOMES.append((d1, d2))
+        if d1 == d2:
+            DICE_PROBS.append(1/36)  # Doubles
+        else:
+            DICE_PROBS.append(2/36)  # Non-doubles (2 orderings)
+
+DICE_OUTCOMES = list(DICE_OUTCOMES)
+DICE_PROBS = np.array(DICE_PROBS, dtype=np.float32)
+N_DICE = len(DICE_OUTCOMES)  # 21
+
+# Maximum moves per dice roll (empirically determined)
+# Doubles can have many outcomes due to 4 moves, non-doubles typically fewer
+# For 15 checkers with doubles, can exceed 100 outcomes
+MAX_MOVES_PER_DICE = 128  # Padded to power of 2 for efficiency
 
 
 def generate_all_positions(max_checkers: int = MAX_CHECKERS) -> List[Tuple[int, ...]]:
@@ -40,56 +60,93 @@ def generate_all_positions(max_checkers: int = MAX_CHECKERS) -> List[Tuple[int, 
     return positions
 
 
-def apply_single_die(pos: np.ndarray, die: int) -> np.ndarray:
-    """Apply single die move optimally in bearoff."""
-    pos = pos.copy()
-    total = pos.sum()
+def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, ...]]:
+    """
+    Generates all legal positions resulting from playing a single die.
+    Assumes all checkers are in the home board (a bearoff position).
+    """
+    moves = []
+    pos_list = list(pos)
 
-    if total == 0:
-        return pos
+    # Rule 1: Move a checker from a point to a lower point.
+    for p in range(die, NUM_POINTS):
+        if pos_list[p] > 0:
+            new_pos = pos_list[:]
+            new_pos[p] -= 1
+            new_pos[p - die] += 1
+            moves.append(tuple(new_pos))
 
-    if pos[die - 1] > 0:
-        pos[die - 1] -= 1
-        return pos
+    # Rule 2: Bear off a checker from the point corresponding to the die.
+    if pos_list[die - 1] > 0:
+        new_pos = pos_list[:]
+        new_pos[die - 1] -= 1
+        moves.append(tuple(new_pos))
 
-    highest = -1
-    for i in range(5, -1, -1):
-        if pos[i] > 0:
-            highest = i
-            break
+    # Rule 3: If no move under Rule 1 or 2 is possible, you can bear off from a
+    # higher point if the die roll is greater than your highest point.
+    if not moves:
+        highest_occupied = -1
+        for i in range(NUM_POINTS - 1, -1, -1):
+            if pos_list[i] > 0:
+                highest_occupied = i
+                break
 
-    if highest < 0:
-        return pos
+        if highest_occupied != -1 and die > highest_occupied + 1:
+            new_pos = pos_list[:]
+            new_pos[highest_occupied] -= 1
+            moves.append(tuple(new_pos))
 
-    if die > highest + 1:
-        pos[highest] -= 1
-        return pos
-
-    for src in range(5, -1, -1):
-        dst = src - die
-        if pos[src] > 0 and dst >= 0:
-            pos[src] -= 1
-            pos[dst] += 1
-            return pos
-
-    return pos
+    return list(set(moves))
 
 
-def apply_dice(pos: np.ndarray, d1: int, d2: int) -> np.ndarray:
-    """Apply a dice roll (d1, d2) optimally."""
-    if d1 == d2:
+def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> List[Tuple[int, ...]]:
+    """
+    Generates all legal final positions for a dice roll (d1, d2).
+    Handles non-doubles and doubles, and the rule that you must play as
+    much of the roll as possible.
+    """
+    d1, d2 = dice
+    if d1 == d2:  # Doubles
+        # Apply the die up to 4 times
+        positions: Set[Tuple[int, ...]] = {pos}
         for _ in range(4):
-            pos = apply_single_die(pos, d1)
-    else:
-        pos1 = apply_single_die(pos.copy(), d1)
-        pos1 = apply_single_die(pos1, d2)
+            next_positions: Set[Tuple[int, ...]] = set()
+            for p in positions:
+                moves = get_legal_moves_for_die(p, d1)
+                if moves:
+                    next_positions.update(moves)
+                else:
+                    next_positions.add(p)  # Can't move further
+            positions = next_positions
+        return list(positions)
 
-        pos2 = apply_single_die(pos.copy(), d2)
-        pos2 = apply_single_die(pos2, d1)
+    # Non-doubles
+    two_move_plays: Set[Tuple[int, ...]] = set()
+    one_move_plays: Set[Tuple[int, ...]] = set()
 
-        pos = pos1 if pos1.sum() <= pos2.sum() else pos2
+    # Path 1: d1 then d2
+    for p1 in get_legal_moves_for_die(pos, d1):
+        moves_d2 = get_legal_moves_for_die(p1, d2)
+        if moves_d2:
+            two_move_plays.update(moves_d2)
+        else:
+            one_move_plays.add(p1)
 
-    return pos
+    # Path 2: d2 then d1
+    for p2 in get_legal_moves_for_die(pos, d2):
+        moves_d1 = get_legal_moves_for_die(p2, d1)
+        if moves_d1:
+            two_move_plays.update(moves_d1)
+        else:
+            one_move_plays.add(p2)
+
+    if two_move_plays:
+        return list(two_move_plays)
+
+    if one_move_plays:
+        return list(one_move_plays)
+
+    return [pos]  # No moves possible
 
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -97,28 +154,20 @@ def value_iteration_step_numba(
     table: np.ndarray,
     new_table: np.ndarray,
     trans: np.ndarray,
+    trans_counts: np.ndarray,
+    dice_probs: np.ndarray,
     x_done: np.ndarray,
-    o_done: np.ndarray,
     n: int,
     n_dice: int,
+    max_moves: int,
 ) -> None:
-    """Single value iteration step using numba.
+    """Single value iteration step using numba with proper minimax.
 
-    Computes new_table from table in-place.
-    Note: max_diff must be computed separately after this function returns,
-    as prange doesn't support proper reduction across threads.
+    Formula (correct minimax):
+    V(X, O) = 1 - E_dice[ min_{X'} V(O, X') ]
 
-    Formula:
-    V(x, o) = sum_{d1} P(d1) * [
-        if trans[x,d1] done: 1.0
-        else: sum_{d2} P(d2) * [
-            if trans[o,d2] done: 0.0
-            else: V(trans[x,d1], trans[o,d2])
-        ]
-    ]
+    where min is over ALL legal moves X' for that dice roll.
     """
-    prob = np.float32(1.0 / 36.0)
-
     # Process in parallel over x positions
     for x_idx in prange(n):
         if x_done[x_idx]:
@@ -126,43 +175,50 @@ def value_iteration_step_numba(
                 new_table[x_idx, o_idx] = 1.0
             continue
 
-        x_trans = trans[x_idx]  # Shape: (n_dice,)
-
         for o_idx in range(n):
-            if o_done[o_idx]:
+            if x_done[o_idx]:  # O is done = X loses
                 new_table[x_idx, o_idx] = 0.0
                 continue
 
-            o_trans = trans[o_idx]  # Shape: (n_dice,)
+            # V(X, O) = 1 - E_dice[ min_{X'} V(O, X') ]
+            expected_min_opp_value = np.float32(0.0)
 
-            val = np.float32(0.0)
-            for d1_idx in range(n_dice):
-                x_prime = x_trans[d1_idx]
+            for dice_idx in range(n_dice):
+                prob = dice_probs[dice_idx]
+                n_moves = trans_counts[x_idx, dice_idx]
 
-                if x_done[x_prime]:
-                    val += prob * 1.0
-                else:
-                    inner = np.float32(0.0)
-                    for d2_idx in range(n_dice):
-                        o_prime = o_trans[d2_idx]
-                        if o_done[o_prime]:
-                            pass  # inner += prob * 0.0
-                        else:
-                            inner += prob * table[x_prime, o_prime]
-                    val += prob * inner
+                # Find minimum opponent value over all legal moves
+                min_opp_value = np.float32(1.0)
+                for move_idx in range(n_moves):
+                    x_new_idx = trans[x_idx, dice_idx, move_idx]
 
-            new_table[x_idx, o_idx] = val
+                    if x_done[x_new_idx]:
+                        # X borne off -> X wins -> O's value = 0
+                        opp_value = np.float32(0.0)
+                    else:
+                        # V(O, X') from table
+                        opp_value = table[o_idx, x_new_idx]
+
+                    if opp_value < min_opp_value:
+                        min_opp_value = opp_value
+
+                expected_min_opp_value += prob * min_opp_value
+
+            new_table[x_idx, o_idx] = 1.0 - expected_min_opp_value
 
 
 def generate_bearoff_table_numba(
     max_checkers: int = MAX_CHECKERS,
-    max_iterations: int = 100,
-    tolerance: float = 1e-8,
+    max_iterations: int = 200,
+    tolerance: float = 1e-9,
     output_path: str = None,
 ) -> Tuple[np.ndarray, List[Tuple[int, ...]]]:
-    """Generate bearoff table using numba acceleration.
+    """Generate bearoff table using numba acceleration with proper minimax.
 
-    Memory usage: ~24 GB for 15 checkers (2 x 12 GB arrays).
+    Uses CORRECT move enumeration - enumerates ALL legal moves and takes
+    minimum opponent value (optimal play).
+
+    Memory usage: ~27 GB for 15 checkers (2 x 12 GB tables + transitions)
 
     Args:
         max_checkers: Maximum checkers per side
@@ -173,36 +229,44 @@ def generate_bearoff_table_numba(
     Returns:
         Tuple of (table, positions)
     """
-    print(f"Generating bearoff table for {max_checkers} checkers (numba)...")
+    print(f"Generating bearoff table for {max_checkers} checkers (numba + minimax)...")
 
     positions = generate_all_positions(max_checkers)
     n = len(positions)
     pos_to_idx = {pos: i for i, pos in enumerate(positions)}
 
     table_size_gb = n * n * 4 / 1e9
+    trans_size_gb = n * N_DICE * MAX_MOVES_PER_DICE * 4 / 1e9
     print(f"  Positions: {n:,}")
     print(f"  Table entries: {n*n:,} ({table_size_gb:.2f} GB)")
-    print(f"  Memory usage: ~{2 * table_size_gb:.2f} GB")
+    print(f"  Transition array: {trans_size_gb:.2f} GB")
+    print(f"  Total memory: ~{2 * table_size_gb + trans_size_gb:.2f} GB")
 
     # Compute which positions are done (borne off)
     totals = np.array([sum(p) for p in positions], dtype=np.int32)
     x_done = totals == 0
-    o_done = totals == 0
 
-    # Build dice outcomes
-    dice_outcomes = []
-    for d1 in range(1, 7):
-        for d2 in range(1, 7):
-            dice_outcomes.append((d1, d2))
+    # Precompute ALL transitions (all legal moves per dice roll)
+    print("  Precomputing transitions (all legal moves)...")
+    trans = np.zeros((n, N_DICE, MAX_MOVES_PER_DICE), dtype=np.int32)
+    trans_counts = np.zeros((n, N_DICE), dtype=np.int32)
 
-    # Precompute transitions
-    print("  Precomputing transitions...")
-    trans = np.zeros((n, N_DICE), dtype=np.int32)
+    max_moves_seen = 0
     for i, pos in enumerate(tqdm(positions)):
-        pos_arr = np.array(pos, dtype=np.int32)
-        for j, (d1, d2) in enumerate(dice_outcomes):
-            new_pos = apply_dice(pos_arr, d1, d2)
-            trans[i, j] = pos_to_idx[tuple(new_pos)]
+        for j, dice in enumerate(DICE_OUTCOMES):
+            new_positions = apply_dice(pos, dice)
+            n_moves = len(new_positions)
+
+            if n_moves > MAX_MOVES_PER_DICE:
+                raise ValueError(f"Too many moves ({n_moves}) for position {pos}, dice {dice}")
+
+            max_moves_seen = max(max_moves_seen, n_moves)
+            trans_counts[i, j] = n_moves
+
+            for k, new_pos in enumerate(new_positions):
+                trans[i, j, k] = pos_to_idx[new_pos]
+
+    print(f"  Max moves per dice roll: {max_moves_seen}")
 
     # Allocate tables
     print("  Allocating tables...")
@@ -216,14 +280,11 @@ def generate_bearoff_table_numba(
             table[x_idx, :] = 1.0
         else:
             for o_idx in range(n):
-                if o_done[o_idx]:
+                if x_done[o_idx]:
                     table[x_idx, o_idx] = 0.0
 
-    # Warm up numba JIT
-    print("  JIT compiling (first iteration)...")
-
     # Value iteration
-    print("  Running value iteration...")
+    print("  Running value iteration (minimax)...")
     start = time.time()
 
     for iteration in range(max_iterations):
@@ -231,10 +292,11 @@ def generate_bearoff_table_numba(
 
         # Compute new table values (in parallel)
         value_iteration_step_numba(
-            table, new_table, trans, x_done, o_done, n, N_DICE
+            table, new_table, trans, trans_counts, DICE_PROBS,
+            x_done, n, N_DICE, MAX_MOVES_PER_DICE
         )
 
-        # Compute max_diff outside parallel loop (prange doesn't support reduction)
+        # Compute max_diff outside parallel loop
         max_diff = np.max(np.abs(new_table - table))
 
         # Swap tables
@@ -280,17 +342,18 @@ def verify_table(table: np.ndarray, positions: List[Tuple[int, ...]], n_samples:
         if n > 1:
             print(f"  V(any, 0) should be 0.0 (if not 0): {table[1, idx]:.6f}")
 
-    # Symmetric positions should have value ~0.5
-    symmetric_tests = [
-        ((1, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0)),
-        ((0, 1, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0)),
-        ((0, 0, 0, 0, 0, 1), (0, 0, 0, 0, 0, 1)),
+    # Test positions - note: V=1.0 for (1,0,0,0,0,0) is CORRECT
+    # because X with 1 checker on 1-point will bear off with ANY dice roll
+    test_positions = [
+        ((1, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0), "~1.0 (X bears off first)"),
+        ((0, 1, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0), "first mover advantage"),
+        ((0, 0, 0, 0, 0, 1), (0, 0, 0, 0, 0, 1), "~0.81 (need 6 to bear off)"),
     ]
 
-    for x_pos, o_pos in symmetric_tests:
+    for x_pos, o_pos, note in test_positions:
         if x_pos in pos_to_idx and o_pos in pos_to_idx:
             val = table[pos_to_idx[x_pos], pos_to_idx[o_pos]]
-            print(f"  V({x_pos}, {o_pos}) = {val:.6f} (symmetric, should be ~0.5)")
+            print(f"  V({x_pos}, {o_pos}) = {val:.6f} ({note})")
 
     # Range check
     min_val = table.min()
@@ -313,7 +376,7 @@ if __name__ == "__main__":
     if max_checkers <= 5:
         from .generator_v2 import generate_bearoff_table as gen_v2
         print("\nComparing with reference implementation...")
-        ref_table, _ = gen_v2(max_checkers=max_checkers, max_iterations=100)
+        ref_table, _ = gen_v2(max_checkers=max_checkers, max_iterations=200)
         max_diff = np.max(np.abs(table - ref_table))
         print(f"  Max difference: {max_diff:.2e}")
-        print("  PASS!" if max_diff < 1e-5 else "  FAIL!")
+        print("  PASS!" if max_diff < 1e-6 else "  FAIL!")

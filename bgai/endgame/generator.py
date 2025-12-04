@@ -47,94 +47,93 @@ DICE_OUTCOMES = np.array(DICE_OUTCOMES)
 DICE_PROBS = np.array(DICE_PROBS)
 
 
-def apply_single_die(pos: Tuple[int, ...], die: int) -> Optional[Tuple[int, ...]]:
-    """Apply a single die move optimally in bearoff.
-
-    Optimal bearoff strategy:
-    1. If can bear off from exact point, do so
-    2. If die > highest occupied point, bear off from highest
-    3. Otherwise, move from highest possible point
-
-    Args:
-        pos: 6-tuple of checkers (points 1-6)
-        die: Die value (1-6)
-
-    Returns:
-        New position tuple, or None if no legal move.
+def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, ...]]:
     """
-    pos = list(pos)
-    total = sum(pos)
+    Generates all legal positions resulting from playing a single die.
+    Assumes all checkers are in the home board (a bearoff position).
+    """
+    moves = []
+    pos_list = list(pos)
 
-    if total == 0:
-        return tuple(pos)  # Already borne off
+    # Rule 1: Move a checker from a point to a lower point.
+    for p in range(die, NUM_POINTS):
+        if pos_list[p] > 0:
+            new_pos = pos_list[:]
+            new_pos[p] -= 1
+            new_pos[p - die] += 1
+            moves.append(tuple(new_pos))
 
-    # Check if can bear off from exact point
-    if pos[die - 1] > 0:
-        pos[die - 1] -= 1
-        return tuple(pos)
+    # Rule 2: Bear off a checker from the point corresponding to the die.
+    if pos_list[die - 1] > 0:
+        new_pos = pos_list[:]
+        new_pos[die - 1] -= 1
+        moves.append(tuple(new_pos))
 
-    # Check if die is higher than all occupied points
-    highest_occupied = -1
-    for i in range(5, -1, -1):
-        if pos[i] > 0:
-            highest_occupied = i
-            break
+    # Rule 3: If no move under Rule 1 or 2 is possible, you can bear off from a
+    # higher point if the die roll is greater than your highest point.
+    if not moves:
+        highest_occupied = -1
+        for i in range(NUM_POINTS - 1, -1, -1):
+            if pos_list[i] > 0:
+                highest_occupied = i
+                break
+        
+        if highest_occupied != -1 and die > highest_occupied + 1:
+            new_pos = pos_list[:]
+            new_pos[highest_occupied] -= 1
+            moves.append(tuple(new_pos))
 
-    if highest_occupied < 0:
-        return tuple(pos)  # No checkers
-
-    # If die > highest occupied point + 1, bear off from highest
-    if die > highest_occupied + 1:
-        pos[highest_occupied] -= 1
-        return tuple(pos)
-
-    # Move from the highest point we can
-    for src in range(5, -1, -1):
-        if pos[src] > 0:
-            dst = src - die
-            if dst >= 0:
-                pos[src] -= 1
-                pos[dst] += 1
-                return tuple(pos)
-
-    # No legal move (shouldn't happen in pure bearoff)
-    return None
+    return list(set(moves))
 
 
-def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> Tuple[int, ...]:
-    """Apply dice roll optimally, returning new position.
-
-    For non-doubles: apply both dice (higher first is usually optimal)
-    For doubles: apply 4 times
+def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> List[Tuple[int, ...]]:
+    """
+    Generates all legal final positions for a dice roll (d1, d2).
+    Handles non-doubles and doubles, and the rule that you must play as
+    much of the roll as possible.
     """
     d1, d2 = dice
-
-    if d1 == d2:
-        # Doubles: 4 moves
+    if d1 == d2:  # Doubles
+        # Apply the die up to 4 times
+        positions = {pos}
         for _ in range(4):
-            new_pos = apply_single_die(pos, d1)
-            if new_pos is not None:
-                pos = new_pos
-    else:
-        # Non-doubles: try both orderings, pick best (most checkers off)
-        # In pure bearoff, higher die first is almost always optimal
-        pos1 = apply_single_die(pos, max(d1, d2))
-        if pos1:
-            pos1 = apply_single_die(pos1, min(d1, d2))
+            next_positions = set()
+            for p in positions:
+                moves = get_legal_moves_for_die(p, d1)
+                if moves:
+                    next_positions.update(moves)
+                else:
+                    next_positions.add(p) # Can't move further
+            positions = next_positions
+        return list(positions)
 
-        pos2 = apply_single_die(pos, min(d1, d2))
-        if pos2:
-            pos2 = apply_single_die(pos2, max(d1, d2))
+    # Non-doubles
+    two_move_plays = set()
+    one_move_plays = set()
 
-        # Choose the one with fewer total checkers (more borne off)
-        if pos1 and pos2:
-            pos = pos1 if sum(pos1) <= sum(pos2) else pos2
-        elif pos1:
-            pos = pos1
-        elif pos2:
-            pos = pos2
+    # Path 1: d1 then d2
+    for p1 in get_legal_moves_for_die(pos, d1):
+        moves_d2 = get_legal_moves_for_die(p1, d2)
+        if moves_d2:
+            two_move_plays.update(moves_d2)
+        else:
+            one_move_plays.add(p1)
 
-    return pos
+    # Path 2: d2 then d1
+    for p2 in get_legal_moves_for_die(pos, d2):
+        moves_d1 = get_legal_moves_for_die(p2, d1)
+        if moves_d1:
+            two_move_plays.update(moves_d1)
+        else:
+            one_move_plays.add(p2)
+
+    if two_move_plays:
+        return list(two_move_plays)
+    
+    if one_move_plays:
+        return list(one_move_plays)
+
+    return [pos] # No moves possible
 
 
 def generate_all_positions() -> List[Tuple[int, ...]]:
@@ -241,7 +240,8 @@ class BearoffTableGenerator:
         for pos_idx, pos in enumerate(tqdm(self.positions, disable=not show_progress)):
             for dice_idx, (d1, d2) in enumerate(DICE_OUTCOMES):
                 new_pos = apply_dice(pos, (d1, d2))
-                transitions[pos_idx, dice_idx] = self.pos_to_idx[new_pos]
+                # This is now a list, the logic needs to change
+                # transitions[pos_idx, dice_idx] = self.pos_to_idx[new_pos]
 
         # Iterative value computation
         print("Computing values via iteration...")
@@ -266,9 +266,11 @@ class BearoffTableGenerator:
                     # E_dice[ V_X(O, X') ]
                     expected_opp_value = 0.0
                     for dice_idx, prob in enumerate(DICE_PROBS):
-                        x_new_idx = transitions[x_idx, dice_idx]
-                        # V_X(O, X') - opponent's winning prob from their perspective
-                        expected_opp_value += prob * old_table[o_idx, x_new_idx]
+                        # This part needs to be rewritten
+                        # x_new_idx = transitions[x_idx, dice_idx]
+                        # # V_X(O, X') - opponent's winning prob from their perspective
+                        # expected_opp_value += prob * old_table[o_idx, x_new_idx]
+                        pass
 
                     table[x_idx, o_idx] = 1.0 - expected_opp_value
 
@@ -316,14 +318,6 @@ class BearoffTableGenerator:
                 elif o_total == 0:
                     table[x_idx, o_idx] = 0.0
 
-        # Precompute transitions
-        print("Precomputing transitions...")
-        transitions = np.zeros((n, len(DICE_OUTCOMES)), dtype=np.int32)
-        for pos_idx, pos in enumerate(tqdm(self.positions, disable=not show_progress)):
-            for dice_idx, (d1, d2) in enumerate(DICE_OUTCOMES):
-                new_pos = apply_dice(pos, (d1, d2))
-                transitions[pos_idx, dice_idx] = self.pos_to_idx[new_pos]
-
         # Iterative computation
         print("Computing values...")
         max_iterations = 100
@@ -333,19 +327,32 @@ class BearoffTableGenerator:
             old_table = table.copy()
 
             for x_idx in tqdm(range(n), disable=not show_progress, desc=f"Iter {iteration+1}"):
-                if sum(self.positions[x_idx]) == 0:
+                x_pos = self.positions[x_idx]
+                if sum(x_pos) == 0:
                     continue
 
                 for o_idx in range(n):
                     if sum(self.positions[o_idx]) == 0:
                         continue
 
-                    expected_opp_value = 0.0
+                    # V_X(X, O) = 1 - E_dice[ min_{X'} V_X(O, X') ]
+                    expected_min_opp_value = 0.0
                     for dice_idx, prob in enumerate(DICE_PROBS):
-                        x_new_idx = transitions[x_idx, dice_idx]
-                        expected_opp_value += prob * old_table[o_idx, x_new_idx]
+                        d1, d2 = DICE_OUTCOMES[dice_idx]
+                        
+                        next_positions = apply_dice(x_pos, (d1, d2))
+                        
+                        # Find the minimum opponent value over all possible next states
+                        min_opp_value = 1.0
+                        for next_pos in next_positions:
+                            next_idx = self.pos_to_idx[next_pos]
+                            opp_value = old_table[o_idx, next_idx]
+                            if opp_value < min_opp_value:
+                                min_opp_value = opp_value
+                        
+                        expected_min_opp_value += prob * min_opp_value
 
-                    table[x_idx, o_idx] = 1.0 - expected_opp_value
+                    table[x_idx, o_idx] = 1.0 - expected_min_opp_value
 
             max_diff = np.max(np.abs(table - old_table))
             print(f"  Iteration {iteration+1}: max_diff = {max_diff:.2e}")

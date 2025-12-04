@@ -1,17 +1,18 @@
-"""Corrected two-sided bearoff table generator.
+"""Corrected two-sided bearoff table generator with proper move enumeration.
 
 V(X, O) = P(X wins | X to move)
 
-After X moves (dice d1) to X', then O moves (dice d2) to O':
-V(X, O) = E_d1,d2[ V(X', O') ]  if neither bears off
-        = E_d1[ 1 ]             if X bears off (X wins)
-        = E_d1[ E_d2[ 0 ] ]     if X doesn't bear off but O does
+Uses the CORRECT minimax formula:
+V(X, O) = 1 - E_dice[ min_{X'} V(O, X') ]
 
-Key insight: Check for game-ending conditions at each step.
+where min is over ALL legal moves (not a greedy heuristic).
+
+Key insight: Must enumerate ALL legal moves and take the minimum
+(optimal play from X's perspective minimizes opponent's value).
 """
 
 import numpy as np
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Set
 import time
 from tqdm import tqdm
 
@@ -19,75 +20,114 @@ from tqdm import tqdm
 MAX_CHECKERS = 15
 NUM_POINTS = 6
 
-# All 36 dice outcomes (we enumerate all, not just unique pairs)
-# This makes the expected value computation simpler
-ALL_DICE = [(d1, d2) for d1 in range(1, 7) for d2 in range(1, 7)]
-DICE_PROB = 1 / 36  # Each outcome equally likely
+# All 21 unique dice outcomes with their probabilities
+# Doubles (1/36 each), non-doubles (2/36 each)
+DICE_OUTCOMES = []
+DICE_PROBS = []
 
-
-def apply_single_die(pos: np.ndarray, die: int) -> np.ndarray:
-    """Apply single die optimally in bearoff."""
-    pos = pos.copy()
-    total = pos.sum()
-
-    if total == 0:
-        return pos
-
-    # Indices: 0=1-point, 5=6-point
-    # Die 1 bears off from index 0, die 6 bears off from index 5
-
-    # Can bear off from exact point?
-    if pos[die - 1] > 0:
-        pos[die - 1] -= 1
-        return pos
-
-    # Find highest occupied point
-    highest = -1
-    for i in range(5, -1, -1):
-        if pos[i] > 0:
-            highest = i
-            break
-
-    if highest < 0:
-        return pos
-
-    # Die > highest point + 1? Bear off from highest
-    if die > highest + 1:
-        pos[highest] -= 1
-        return pos
-
-    # Move from highest point that can legally move
-    for src in range(5, -1, -1):
-        dst = src - die
-        if pos[src] > 0 and dst >= 0:
-            pos[src] -= 1
-            pos[dst] += 1
-            return pos
-
-    return pos
-
-
-def apply_dice(pos: np.ndarray, d1: int, d2: int) -> np.ndarray:
-    """Apply a dice roll (d1, d2) optimally."""
-    if d1 == d2:
-        # Doubles: 4 moves
-        for _ in range(4):
-            pos = apply_single_die(pos, d1)
-    else:
-        # Try both orderings, pick better result
-        pos1 = apply_single_die(pos.copy(), d1)
-        pos1 = apply_single_die(pos1, d2)
-
-        pos2 = apply_single_die(pos.copy(), d2)
-        pos2 = apply_single_die(pos2, d1)
-
-        # Prefer fewer checkers remaining
-        if pos1.sum() <= pos2.sum():
-            pos = pos1
+for d1 in range(1, 7):
+    for d2 in range(d1, 7):
+        DICE_OUTCOMES.append((d1, d2))
+        if d1 == d2:
+            DICE_PROBS.append(1/36)  # Doubles
         else:
-            pos = pos2
+            DICE_PROBS.append(2/36)  # Non-doubles (2 orderings)
 
-    return pos
+DICE_OUTCOMES = list(DICE_OUTCOMES)
+DICE_PROBS = np.array(DICE_PROBS)
+
+
+def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, ...]]:
+    """
+    Generates all legal positions resulting from playing a single die.
+    Assumes all checkers are in the home board (a bearoff position).
+
+    Returns a list of all possible resulting positions.
+    """
+    moves = []
+    pos_list = list(pos)
+
+    # Rule 1: Move a checker from a point to a lower point.
+    for p in range(die, NUM_POINTS):
+        if pos_list[p] > 0:
+            new_pos = pos_list[:]
+            new_pos[p] -= 1
+            new_pos[p - die] += 1
+            moves.append(tuple(new_pos))
+
+    # Rule 2: Bear off a checker from the point corresponding to the die.
+    if pos_list[die - 1] > 0:
+        new_pos = pos_list[:]
+        new_pos[die - 1] -= 1
+        moves.append(tuple(new_pos))
+
+    # Rule 3: If no move under Rule 1 or 2 is possible, you can bear off from a
+    # higher point if the die roll is greater than your highest point.
+    if not moves:
+        highest_occupied = -1
+        for i in range(NUM_POINTS - 1, -1, -1):
+            if pos_list[i] > 0:
+                highest_occupied = i
+                break
+
+        if highest_occupied != -1 and die > highest_occupied + 1:
+            new_pos = pos_list[:]
+            new_pos[highest_occupied] -= 1
+            moves.append(tuple(new_pos))
+
+    return list(set(moves))
+
+
+def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> List[Tuple[int, ...]]:
+    """
+    Generates all legal final positions for a dice roll (d1, d2).
+    Handles non-doubles and doubles, and the rule that you must play as
+    much of the roll as possible.
+
+    Returns a list of ALL possible resulting positions.
+    """
+    d1, d2 = dice
+    if d1 == d2:  # Doubles
+        # Apply the die up to 4 times
+        positions: Set[Tuple[int, ...]] = {pos}
+        for _ in range(4):
+            next_positions: Set[Tuple[int, ...]] = set()
+            for p in positions:
+                moves = get_legal_moves_for_die(p, d1)
+                if moves:
+                    next_positions.update(moves)
+                else:
+                    next_positions.add(p)  # Can't move further
+            positions = next_positions
+        return list(positions)
+
+    # Non-doubles
+    two_move_plays: Set[Tuple[int, ...]] = set()
+    one_move_plays: Set[Tuple[int, ...]] = set()
+
+    # Path 1: d1 then d2
+    for p1 in get_legal_moves_for_die(pos, d1):
+        moves_d2 = get_legal_moves_for_die(p1, d2)
+        if moves_d2:
+            two_move_plays.update(moves_d2)
+        else:
+            one_move_plays.add(p1)
+
+    # Path 2: d2 then d1
+    for p2 in get_legal_moves_for_die(pos, d2):
+        moves_d1 = get_legal_moves_for_die(p2, d1)
+        if moves_d1:
+            two_move_plays.update(moves_d1)
+        else:
+            one_move_plays.add(p2)
+
+    if two_move_plays:
+        return list(two_move_plays)
+
+    if one_move_plays:
+        return list(one_move_plays)
+
+    return [pos]  # No moves possible
 
 
 def generate_positions(max_checkers: int = MAX_CHECKERS) -> List[Tuple[int, ...]]:
@@ -110,7 +150,12 @@ def generate_positions(max_checkers: int = MAX_CHECKERS) -> List[Tuple[int, ...]
 def generate_bearoff_table(max_checkers: int = MAX_CHECKERS,
                            max_iterations: int = 200,
                            tolerance: float = 1e-9) -> Tuple[np.ndarray, List[Tuple]]:
-    """Generate bearoff table with correct DP.
+    """Generate bearoff table with correct minimax DP.
+
+    Uses the CORRECT formula:
+    V(X, O) = 1 - E_dice[ min_{X'} V(O, X') ]
+
+    where min is over ALL legal moves (optimal play).
 
     Returns:
         (table, positions) where table[x_idx, o_idx] = P(X wins | X to move)
@@ -124,20 +169,22 @@ def generate_bearoff_table(max_checkers: int = MAX_CHECKERS,
     print(f"  Positions: {n:,}")
     print(f"  Table size: {n*n:,}")
 
-    # Precompute position totals and transitions
+    # Precompute position totals
     totals = np.array([sum(p) for p in positions], dtype=np.int32)
-    positions_np = np.array(positions, dtype=np.int32)
 
-    # Precompute all transitions: trans[pos_idx, dice_idx] = new_pos_idx
-    print("  Precomputing transitions...")
-    n_dice = len(ALL_DICE)
-    trans = np.zeros((n, n_dice), dtype=np.int32)
+    # Precompute ALL transitions: trans[pos_idx][dice_idx] = list of new_pos_indices
+    # This is a list of lists because each dice roll can have multiple legal moves
+    print("  Precomputing transitions (all legal moves)...")
+    n_dice = len(DICE_OUTCOMES)
+    trans: List[List[List[int]]] = []  # trans[pos_idx][dice_idx] = [new_pos_idx, ...]
 
     for i, pos in enumerate(tqdm(positions)):
-        pos_arr = np.array(pos, dtype=np.int32)
-        for j, (d1, d2) in enumerate(ALL_DICE):
-            new_pos = apply_dice(pos_arr, d1, d2)
-            trans[i, j] = pos_to_idx[tuple(new_pos)]
+        pos_trans = []
+        for j, dice in enumerate(DICE_OUTCOMES):
+            new_positions = apply_dice(pos, dice)
+            new_indices = [pos_to_idx[new_pos] for new_pos in new_positions]
+            pos_trans.append(new_indices)
+        trans.append(pos_trans)
 
     # Initialize value table
     # V(X, O) = P(X wins | X to move)
@@ -147,30 +194,23 @@ def generate_bearoff_table(max_checkers: int = MAX_CHECKERS,
     # If X has 0 checkers (borne off), X has won: V = 1
     # If O has 0 checkers but X hasn't won yet, X loses: V = 0
 
-    x_done_mask = totals == 0  # X has borne off
-    o_done_mask = totals == 0  # O has borne off
+    done_mask = totals == 0  # Position is borne off
 
     # Initialize: if X done, V=1; if O done and X not done, V=0
     for x_idx in range(n):
-        if x_done_mask[x_idx]:
+        if done_mask[x_idx]:
             table[x_idx, :] = 1.0
         else:
             for o_idx in range(n):
-                if o_done_mask[o_idx]:
+                if done_mask[o_idx]:
                     table[x_idx, o_idx] = 0.0
 
-    # Value iteration
-    # V(X, O) = sum over X's dice d1:
-    #     P(d1) * [
-    #         if X bears off after d1: 1.0
-    #         else: sum over O's dice d2:
-    #             P(d2) * [
-    #                 if O bears off after d2: 0.0
-    #                 else: V(X', O')
-    #             ]
-    #     ]
+    # Value iteration with CORRECT minimax formula:
+    # V(X, O) = 1 - E_dice[ min_{X' in legal_moves(X, dice)} V(O, X') ]
+    #
+    # X picks the move that minimizes opponent's value (= maximizes own value)
 
-    print("  Running value iteration...")
+    print("  Running value iteration (minimax)...")
     start = time.time()
 
     for iteration in range(max_iterations):
@@ -178,36 +218,39 @@ def generate_bearoff_table(max_checkers: int = MAX_CHECKERS,
 
         # For non-terminal positions only
         for x_idx in tqdm(range(n), desc=f"Iter {iteration+1}", disable=iteration > 0):
-            if x_done_mask[x_idx]:
+            if done_mask[x_idx]:
                 continue
 
+            x_pos = positions[x_idx]
+
             for o_idx in range(n):
-                if o_done_mask[o_idx]:
+                if done_mask[o_idx]:
                     continue
 
-                # Compute expected value
-                val = 0.0
-                for d1_idx, (d1a, d1b) in enumerate(ALL_DICE):
-                    x_new_idx = trans[x_idx, d1_idx]
+                # V(X, O) = 1 - E_dice[ min_{X'} V(O, X') ]
+                expected_min_opp_value = 0.0
 
-                    # Did X bear off?
-                    if x_done_mask[x_new_idx]:
-                        val += DICE_PROB * 1.0
-                    else:
-                        # O's turn
-                        inner_val = 0.0
-                        for d2_idx in range(n_dice):
-                            o_new_idx = trans[o_idx, d2_idx]
+                for dice_idx, prob in enumerate(DICE_PROBS):
+                    # Get all legal moves for this dice roll
+                    x_new_indices = trans[x_idx][dice_idx]
 
-                            # Did O bear off?
-                            if o_done_mask[o_new_idx]:
-                                inner_val += DICE_PROB * 0.0
-                            else:
-                                inner_val += DICE_PROB * old_table[x_new_idx, o_new_idx]
+                    # Find the minimum opponent value over all legal moves
+                    # (optimal play: X picks move that minimizes O's winning chance)
+                    min_opp_value = 1.0
+                    for x_new_idx in x_new_indices:
+                        if done_mask[x_new_idx]:
+                            # X borne off -> X wins -> O's value from this state is 0
+                            opp_value = 0.0
+                        else:
+                            # V(O, X') from old table
+                            opp_value = old_table[o_idx, x_new_idx]
 
-                        val += DICE_PROB * inner_val
+                        if opp_value < min_opp_value:
+                            min_opp_value = opp_value
 
-                table[x_idx, o_idx] = val
+                    expected_min_opp_value += prob * min_opp_value
+
+                table[x_idx, o_idx] = 1.0 - expected_min_opp_value
 
         # Check convergence
         diff = np.max(np.abs(table - old_table))
