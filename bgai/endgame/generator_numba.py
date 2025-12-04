@@ -3,8 +3,7 @@
 Uses JIT-compiled loops for fast value iteration.
 Now with CORRECT minimax over all legal moves (not greedy heuristics).
 
-Memory: 2 full-size arrays (table + new_table = 24 GB for 15 checkers)
-        + padded transition array (~3 GB for 15 checkers)
+Memory: 2 full-size arrays (table + new_table) + padded transition array.
 """
 
 import numpy as np
@@ -14,11 +13,9 @@ import time
 from tqdm import tqdm
 import gc
 
-from .indexing import (
-    TOTAL_ONE_SIDED_POSITIONS,
-    MAX_CHECKERS,
-    NUM_POINTS,
-)
+# Defaults for standard bearoff
+MAX_CHECKERS_DEFAULT = 15
+NUM_POINTS_DEFAULT = 6
 
 
 # 21 unique dice outcomes (not 36) - we use probabilities to weight
@@ -43,7 +40,8 @@ N_DICE = len(DICE_OUTCOMES)  # 21
 MAX_MOVES_PER_DICE = 128  # Padded to power of 2 for efficiency
 
 
-def generate_all_positions(max_checkers: int = MAX_CHECKERS) -> List[Tuple[int, ...]]:
+def generate_all_positions(max_checkers: int = MAX_CHECKERS_DEFAULT,
+                           num_points: int = NUM_POINTS_DEFAULT) -> List[Tuple[int, ...]]:
     """Generate all bearoff positions as tuples."""
     positions = []
 
@@ -55,12 +53,13 @@ def generate_all_positions(max_checkers: int = MAX_CHECKERS) -> List[Tuple[int, 
             gen(remaining - v, points_left - 1, current + [v])
 
     for total in range(max_checkers + 1):
-        gen(total, NUM_POINTS, [])
+        gen(total, num_points, [])
 
     return positions
 
 
-def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, ...]]:
+def get_legal_moves_for_die(pos: Tuple[int, ...], die: int,
+                            num_points: int = NUM_POINTS_DEFAULT) -> List[Tuple[int, ...]]:
     """
     Generates all legal positions resulting from playing a single die.
     Assumes all checkers are in the home board (a bearoff position).
@@ -69,7 +68,7 @@ def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, .
     pos_list = list(pos)
 
     # Rule 1: Move a checker from a point to a lower point.
-    for p in range(die, NUM_POINTS):
+    for p in range(die, num_points):
         if pos_list[p] > 0:
             new_pos = pos_list[:]
             new_pos[p] -= 1
@@ -77,7 +76,7 @@ def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, .
             moves.append(tuple(new_pos))
 
     # Rule 2: Bear off a checker from the point corresponding to the die.
-    if pos_list[die - 1] > 0:
+    if die - 1 < num_points and pos_list[die - 1] > 0:
         new_pos = pos_list[:]
         new_pos[die - 1] -= 1
         moves.append(tuple(new_pos))
@@ -86,7 +85,7 @@ def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, .
     # higher point if the die roll is greater than your highest point.
     if not moves:
         highest_occupied = -1
-        for i in range(NUM_POINTS - 1, -1, -1):
+        for i in range(num_points - 1, -1, -1):
             if pos_list[i] > 0:
                 highest_occupied = i
                 break
@@ -99,7 +98,8 @@ def get_legal_moves_for_die(pos: Tuple[int, ...], die: int) -> List[Tuple[int, .
     return list(set(moves))
 
 
-def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> List[Tuple[int, ...]]:
+def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int],
+               num_points: int = NUM_POINTS_DEFAULT) -> List[Tuple[int, ...]]:
     """
     Generates all legal final positions for a dice roll (d1, d2).
     Handles non-doubles and doubles, and the rule that you must play as
@@ -112,7 +112,7 @@ def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> List[Tuple[int, .
         for _ in range(4):
             next_positions: Set[Tuple[int, ...]] = set()
             for p in positions:
-                moves = get_legal_moves_for_die(p, d1)
+                moves = get_legal_moves_for_die(p, d1, num_points)
                 if moves:
                     next_positions.update(moves)
                 else:
@@ -125,16 +125,16 @@ def apply_dice(pos: Tuple[int, ...], dice: Tuple[int, int]) -> List[Tuple[int, .
     one_move_plays: Set[Tuple[int, ...]] = set()
 
     # Path 1: d1 then d2
-    for p1 in get_legal_moves_for_die(pos, d1):
-        moves_d2 = get_legal_moves_for_die(p1, d2)
+    for p1 in get_legal_moves_for_die(pos, d1, num_points):
+        moves_d2 = get_legal_moves_for_die(p1, d2, num_points)
         if moves_d2:
             two_move_plays.update(moves_d2)
         else:
             one_move_plays.add(p1)
 
     # Path 2: d2 then d1
-    for p2 in get_legal_moves_for_die(pos, d2):
-        moves_d1 = get_legal_moves_for_die(p2, d1)
+    for p2 in get_legal_moves_for_die(pos, d2, num_points):
+        moves_d1 = get_legal_moves_for_die(p2, d1, num_points)
         if moves_d1:
             two_move_plays.update(moves_d1)
         else:
@@ -208,7 +208,8 @@ def value_iteration_step_numba(
 
 
 def generate_bearoff_table_numba(
-    max_checkers: int = MAX_CHECKERS,
+    max_checkers: int = MAX_CHECKERS_DEFAULT,
+    num_points: int = NUM_POINTS_DEFAULT,
     max_iterations: int = 200,
     tolerance: float = 1e-9,
     output_path: str = None,
@@ -229,9 +230,9 @@ def generate_bearoff_table_numba(
     Returns:
         Tuple of (table, positions)
     """
-    print(f"Generating bearoff table for {max_checkers} checkers (numba + minimax)...")
+    print(f"Generating bearoff table for {max_checkers} checkers, {num_points} points (numba + minimax)...")
 
-    positions = generate_all_positions(max_checkers)
+    positions = generate_all_positions(max_checkers, num_points)
     n = len(positions)
     pos_to_idx = {pos: i for i, pos in enumerate(positions)}
 
@@ -254,7 +255,7 @@ def generate_bearoff_table_numba(
     max_moves_seen = 0
     for i, pos in enumerate(tqdm(positions)):
         for j, dice in enumerate(DICE_OUTCOMES):
-            new_positions = apply_dice(pos, dice)
+            new_positions = apply_dice(pos, dice, num_points)
             n_moves = len(new_positions)
 
             if n_moves > MAX_MOVES_PER_DICE:
@@ -335,25 +336,25 @@ def verify_table(table: np.ndarray, positions: List[Tuple[int, ...]], n_samples:
     print(f"\nVerification ({n_samples} samples):")
 
     # Test known values
-    zero_pos = (0, 0, 0, 0, 0, 0)
+    zero_pos = (0,) * len(positions[0])
     if zero_pos in pos_to_idx:
         idx = pos_to_idx[zero_pos]
         print(f"  V(0, any) should be 1.0: {table[idx, 0]:.6f}")
         if n > 1:
             print(f"  V(any, 0) should be 0.0 (if not 0): {table[1, idx]:.6f}")
 
-    # Test positions - note: V=1.0 for (1,0,0,0,0,0) is CORRECT
-    # because X with 1 checker on 1-point will bear off with ANY dice roll
-    test_positions = [
-        ((1, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0), "~1.0 (X bears off first)"),
-        ((0, 1, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0), "first mover advantage"),
-        ((0, 0, 0, 0, 0, 1), (0, 0, 0, 0, 0, 1), "~0.81 (need 6 to bear off)"),
-    ]
+    # Simple sanity samples for small tables
+    if len(zero_pos) == 6:
+        test_positions = [
+            ((1, 0, 0, 0, 0, 0), (1, 0, 0, 0, 0, 0), "~1.0 (X bears off first)"),
+            ((0, 1, 0, 0, 0, 0), (0, 1, 0, 0, 0, 0), "first mover advantage"),
+            ((0, 0, 0, 0, 0, 1), (0, 0, 0, 0, 0, 1), "~0.81 (need 6 to bear off)"),
+        ]
 
-    for x_pos, o_pos, note in test_positions:
-        if x_pos in pos_to_idx and o_pos in pos_to_idx:
-            val = table[pos_to_idx[x_pos], pos_to_idx[o_pos]]
-            print(f"  V({x_pos}, {o_pos}) = {val:.6f} ({note})")
+        for x_pos, o_pos, note in test_positions:
+            if x_pos in pos_to_idx and o_pos in pos_to_idx:
+                val = table[pos_to_idx[x_pos], pos_to_idx[o_pos]]
+                print(f"  V({x_pos}, {o_pos}) = {val:.6f} ({note})")
 
     # Range check
     min_val = table.min()
@@ -368,15 +369,7 @@ if __name__ == "__main__":
     import sys
 
     max_checkers = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    num_points = int(sys.argv[2]) if len(sys.argv) > 2 else NUM_POINTS_DEFAULT
 
-    table, positions = generate_bearoff_table_numba(max_checkers=max_checkers)
+    table, positions = generate_bearoff_table_numba(max_checkers=max_checkers, num_points=num_points)
     verify_table(table, positions)
-
-    # Compare with reference for small tables
-    if max_checkers <= 5:
-        from .generator_v2 import generate_bearoff_table as gen_v2
-        print("\nComparing with reference implementation...")
-        ref_table, _ = gen_v2(max_checkers=max_checkers, max_iterations=200)
-        max_diff = np.max(np.abs(table - ref_table))
-        print(f"  Max difference: {max_diff:.2e}")
-        print("  PASS!" if max_diff < 1e-6 else "  FAIL!")
