@@ -3,12 +3,12 @@ pgx @ git+https://github.com/sile16/pgx.git@master
 turbozero @ git+https://github.com/sile16/turbozero.git@main
 
 # JAX ecosystem
-jax<0.5.1; sys_platform == "darwin"
-jaxlib<0.5.1; sys_platform == "darwin"
-jax<0.7; sys_platform == "linux"
+# Mac uses CPU-only JAX (no jax-metal due to serialization issues)
+jax>=0.8.1; sys_platform == "darwin"
+jaxlib>=0.8.1; sys_platform == "darwin"
 jax[cuda12]; sys_platform == "linux"
 chex
-flax
+flax>=0.12.1
 
 # Distributed training
 redis
