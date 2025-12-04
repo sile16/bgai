@@ -69,7 +69,10 @@ detect_platform() {
 
     if [[ "$OS_TYPE" == "Darwin" ]]; then
         PLATFORM="mac"
-        DEVICE_TYPE="metal"
+        DEVICE_TYPE="cpu"
+        # Force CPU on Mac - Metal/MPS has serialization issues with JAX
+        export JAX_PLATFORMS=cpu
+        echo "Detected macOS - forcing JAX to use CPU (JAX_PLATFORMS=cpu)"
     elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         PLATFORM="cuda"
         DEVICE_TYPE="cuda"
