@@ -78,7 +78,7 @@ echo ""
 # =============================================================================
 # Stop existing processes
 # =============================================================================
-echo "[1/5] Stopping any existing workers..."
+echo "[1/7] Stopping any existing workers..."
 pkill -f "distributed.cli.main" 2>/dev/null || true
 sleep 2
 
@@ -97,9 +97,37 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25
 echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24GB GPU)"
 
 # =============================================================================
+# Python unbuffered output - ensure logs are written immediately
+# =============================================================================
+export PYTHONUNBUFFERED=1
+
+# =============================================================================
+# Start MLFlow tracking server
+# =============================================================================
+echo "[2/7] Starting MLFlow tracking server..."
+MLFLOW_DIR="$PROJECT_DIR/mlruns"
+mkdir -p "$MLFLOW_DIR"
+
+# Kill any existing MLFlow server
+pkill -f "mlflow server" 2>/dev/null || true
+sleep 1
+
+# Start MLFlow server (0.0.0.0 for web UI access, training worker uses localhost)
+python -m mlflow server \
+    --host 0.0.0.0 \
+    --port 5000 \
+    --backend-store-uri "sqlite:///$MLFLOW_DIR/mlflow.db" \
+    --default-artifact-root "$MLFLOW_DIR/artifacts" \
+    > "$LOG_DIR/mlflow_$TIMESTAMP.log" 2>&1 &
+MLFLOW_PID=$!
+echo "       MLFlow PID: $MLFLOW_PID"
+echo "       MLFlow UI: http://$HEAD_IP:5000"
+sleep 2
+
+# =============================================================================
 # Start Prometheus metrics with custom BGAI config
 # =============================================================================
-echo "[2/5] Starting Prometheus metrics..."
+echo "[3/7] Starting Prometheus metrics..."
 PROMETHEUS_BIN="$PROJECT_DIR/tools/prometheus/prometheus"
 PROMETHEUS_CONFIG="$PROJECT_DIR/tools/prometheus_bgai.yml"
 
@@ -109,9 +137,11 @@ if [[ ! -f "$PROMETHEUS_BIN" ]]; then
 fi
 
 if [[ -f "$PROMETHEUS_BIN" ]]; then
+    # Listen on all interfaces for network access
     "$PROMETHEUS_BIN" \
         --config.file "$PROMETHEUS_CONFIG" \
         --web.enable-lifecycle \
+        --web.listen-address="0.0.0.0:9090" \
         > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
     PROMETHEUS_PID=$!
     echo "       Prometheus PID: $PROMETHEUS_PID"
@@ -169,7 +199,7 @@ sleep 2
 # =============================================================================
 # Start Coordinator (uses config file for all settings)
 # =============================================================================
-echo "[3/4] Starting coordinator..."
+echo "[4/7] Starting coordinator..."
 python -m distributed.cli.main coordinator \
     --config-file "$CONFIG_FILE" \
     --dashboard \
@@ -189,7 +219,7 @@ fi
 # =============================================================================
 # Start Training Worker (uses config file, 0.5 GPU to share with game worker)
 # =============================================================================
-echo "[4/4] Starting training worker..."
+echo "[5/7] Starting training worker..."
 python -m distributed.cli.main training-worker \
     --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
@@ -202,7 +232,7 @@ echo "       Log: $LOG_DIR/training_$TIMESTAMP.log"
 # =============================================================================
 # Start GPU Game Worker (uses config file, 0.5 GPU to share with training worker)
 # =============================================================================
-echo "       Starting GPU game worker..."
+echo "[6/7] Starting GPU game worker..."
 python -m distributed.cli.main game-worker \
     --config-file "$CONFIG_FILE" \
     --worker-id "gpu-head" \
@@ -213,6 +243,21 @@ echo "       Game worker PID: $GAME_PID"
 echo "       Log: $LOG_DIR/game_gpu_$TIMESTAMP.log"
 
 # =============================================================================
+# Start Evaluation Worker (CPU-based, runs random and self-play evals)
+# =============================================================================
+echo "[7/7] Starting evaluation worker..."
+# Force CPU-only mode to avoid GPU memory conflicts
+JAX_PLATFORMS=cpu python -m distributed.cli.main eval-worker \
+    --config-file "$CONFIG_FILE" \
+    --eval-games 50 \
+    --eval-types "random,self_play" \
+    --num-gpus 0 \
+    > "$LOG_DIR/eval_$TIMESTAMP.log" 2>&1 &
+EVAL_PID=$!
+echo "       Eval worker PID: $EVAL_PID"
+echo "       Log: $LOG_DIR/eval_$TIMESTAMP.log"
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
@@ -221,6 +266,7 @@ echo "  All services started!"
 echo "=============================================="
 echo ""
 echo "PIDs:"
+echo "  MLFlow:          $MLFLOW_PID"
 echo "  Prometheus:      $PROMETHEUS_PID"
 if [[ -n "$GRAFANA_PID" ]]; then
 echo "  Grafana:         $GRAFANA_PID"
@@ -228,12 +274,15 @@ fi
 echo "  Coordinator:     $COORD_PID"
 echo "  Training worker: $TRAIN_PID"
 echo "  Game worker:     $GAME_PID"
+echo "  Eval worker:     $EVAL_PID"
 echo ""
-echo "Dashboards:"
-echo "  Grafana:         http://$HEAD_IP:3000"
-echo "  Prometheus:      http://$HEAD_IP:9090"
+echo "Dashboards (accessible from network):"
+echo "  Grafana:         http://$HEAD_IP:3000  (real-time cluster stats)"
+echo "  Prometheus:      http://$HEAD_IP:9090  (metrics queries)"
+echo "  MLFlow:          http://$HEAD_IP:5000  (training run history)"
 echo ""
 echo "Logs:"
+echo "  tail -f $LOG_DIR/mlflow_$TIMESTAMP.log"
 if [[ -n "$PROMETHEUS_PID" ]]; then
 echo "  tail -f $LOG_DIR/prometheus_$TIMESTAMP.log"
 fi
@@ -243,6 +292,7 @@ fi
 echo "  tail -f $LOG_DIR/coordinator_$TIMESTAMP.log"
 echo "  tail -f $LOG_DIR/training_$TIMESTAMP.log"
 echo "  tail -f $LOG_DIR/game_gpu_$TIMESTAMP.log"
+echo "  tail -f $LOG_DIR/eval_$TIMESTAMP.log"
 echo ""
 echo "Monitor all logs:"
 echo "  tail -f $LOG_DIR/*_$TIMESTAMP.log"

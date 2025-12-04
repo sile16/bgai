@@ -27,6 +27,7 @@ from ..coordinator.redis_state import (
     WORKER_TTL,
 )
 from ..device import detect_device, get_device_config, DeviceInfo
+from ..metrics import start_system_metrics_collector, stop_system_metrics_collector
 
 
 @dataclass
@@ -315,6 +316,9 @@ class BaseWorker(ABC):
         # Start heartbeat thread
         self._start_heartbeat()
 
+        # Start system metrics collector (CPU, RAM, GPU monitoring)
+        start_system_metrics_collector(self.worker_id)
+
         try:
             # Run the main loop
             result = self._run_loop(num_iterations)
@@ -335,6 +339,7 @@ class BaseWorker(ABC):
         print(f"Worker {self.worker_id}: Stopping...")
         self.running = False
         self._stop_heartbeat()
+        stop_system_metrics_collector()
         self.deregister()
 
     def _handle_signal(self, signum: int, frame) -> None:

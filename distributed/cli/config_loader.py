@@ -260,6 +260,7 @@ def get_training_worker_config(
 
     training = config.get('training', {})
     redis = config.get('redis', {})
+    mlflow = config.get('mlflow', {})
     device_cfg = get_device_config(config, device_type)
 
     # Batch size priority: CLI override > device config > global default
@@ -267,6 +268,21 @@ def get_training_worker_config(
         batch_size = batch_size_override
     else:
         batch_size = device_cfg.get('train_batch_size', training.get('batch_size', 128))
+
+    # Build MLFlow tracking URI - use detected host for proper network access
+    mlflow_uri = mlflow.get('tracking_uri')
+    if mlflow_uri:
+        # If tracking URI uses head node IP, substitute with detected reachable host
+        head = config.get('head', {})
+        head_ip = head.get('host', '')
+        head_local = head.get('host_local', '')
+        detected_host = detect_redis_host(config)
+
+        # Replace head IP with detected host in MLFlow URI
+        if head_ip and head_ip in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(head_ip, detected_host)
+        elif head_local and head_local in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(head_local, detected_host)
 
     return {
         'train_batch_size': batch_size,
@@ -284,6 +300,9 @@ def get_training_worker_config(
         # Warm tree configuration (pre-computed MCTS tree from initial position)
         'warm_tree_simulations': training.get('warm_tree_simulations', 0),
         'warm_tree_max_nodes': training.get('warm_tree_max_nodes', 10000),
+        # MLFlow tracking
+        'mlflow_tracking_uri': mlflow_uri,
+        'mlflow_experiment_name': mlflow.get('experiment_name', 'bgai-training'),
     }
 
 
@@ -307,6 +326,7 @@ def get_eval_worker_config(
 
     mcts = config.get('mcts', {})
     redis = config.get('redis', {})
+    mlflow = config.get('mlflow', {})
     device_cfg = get_device_config(config, device_type)
 
     # Batch size priority: CLI override > device config > default
@@ -315,6 +335,20 @@ def get_eval_worker_config(
     else:
         batch_size = device_cfg.get('eval_batch_size', 16)
 
+    # Build MLFlow tracking URI - use detected host for proper network access
+    mlflow_uri = mlflow.get('tracking_uri')
+    if mlflow_uri:
+        head = config.get('head', {})
+        head_ip = head.get('host', '')
+        head_local = head.get('host_local', '')
+        detected_host = detect_redis_host(config)
+
+        # Replace head IP with detected host in MLFlow URI
+        if head_ip and head_ip in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(head_ip, detected_host)
+        elif head_local and head_local in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(head_local, detected_host)
+
     return {
         'batch_size': batch_size,
         'num_simulations': mcts.get('simulations', 100),
@@ -322,6 +356,9 @@ def get_eval_worker_config(
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
+        # MLFlow tracking (shared with training worker)
+        'mlflow_tracking_uri': mlflow_uri,
+        'mlflow_experiment_name': mlflow.get('experiment_name', 'bgai-training'),
     }
 
 

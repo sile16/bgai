@@ -162,37 +162,65 @@ python -m distributed.cli.main runs stop
 python -m distributed.cli.main runs reset
 ```
 
-### Metrics & Monitoring
+### Monitoring Infrastructure
 
-Workers expose Prometheus metrics on ports 9100 (game) and 9200 (training):
-- Dynamic discovery via Redis registration
-- Grafana dashboard at `tools/grafana_bgai_dashboard.json`
-- Key metrics: `bgai_training_loss`, `bgai_games_total`, `bgai_surprise_score_*`
+The project uses a dual monitoring system:
 
-### Updating Grafana Dashboard
+| Tool | Port | Purpose | Access |
+|------|------|---------|--------|
+| **Grafana** | 3000 | Real-time cluster dashboards | `http://<HEAD_IP>:3000` |
+| **Prometheus** | 9090 | Metrics collection & queries | `http://<HEAD_IP>:9090` |
+| **MLFlow** | 5000 | Training run history & artifacts | `http://<HEAD_IP>:5000` |
 
-The dashboard is auto-provisioned from `tools/grafana_bgai_dashboard.json`.
+All monitoring tools listen on `0.0.0.0` for network access from other machines.
+
+#### Grafana (Real-time Ops Dashboard)
+
+Dashboard file: `tools/grafana_bgai_dashboard.json`
+
+**Metrics displayed:**
+- Training: model version, loss, steps/s, training rate
+- Game collection: games/min, collection rate, active workers
+- Replay buffer: size, games, surprise scores
+- **System Resources**: CPU/RAM/GPU usage per worker, GPU temperature & power
 
 **To apply dashboard changes:**
-1. Edit `tools/grafana_bgai_dashboard.json`
-2. Delete the old dashboard via API or UI:
-   ```bash
-   curl -X DELETE -u admin:admin "http://localhost:3000/api/dashboards/uid/bgai-training"
-   ```
-3. Restart Grafana to re-provision:
-   ```bash
-   pkill -f grafana-server
-   # Grafana restarts automatically via start_all_head.sh, or manually:
-   /path/to/grafana-server --homepath=... --config=... &
-   ```
+```bash
+curl -X DELETE -u admin:admin "http://localhost:3000/api/dashboards/uid/bgai-training"
+# Dashboard auto-reloads from JSON on Grafana restart
+```
 
-**Provisioning config:** `tools/grafana-11.3.0/conf/provisioning/dashboards/bgai.yaml`
-- Dashboard reloads every 30 seconds (updateIntervalSeconds)
-- Changes to existing dashboards require deletion + re-provision
+#### MLFlow (Training Run Tracking)
+
+MLFlow tracks:
+- **Run Config**: batch_size, learning_rate, L2 lambda, games_per_batch, surprise_weight
+- **Metrics**: loss, policy_loss, value_loss, steps/sec, buffer_size, model_version
+- **Artifacts**: Checkpoint files (saved every 1000 steps)
+
+Run ID is stored in Redis, enabling resume across restarts.
+
+#### Prometheus Metrics
+
+Workers expose metrics on ports 9100 (game) and 9200 (training):
+
+**Training Metrics:**
+- `bgai_training_loss`, `bgai_training_steps_total`, `bgai_training_steps_per_second`
+- `bgai_model_version`, `bgai_buffer_size`
+
+**Game Collection Metrics:**
+- `bgai_games_total`, `bgai_games_per_minute`, `bgai_collection_steps_per_second`
+
+**System Metrics (per worker):**
+- `bgai_cpu_percent`, `bgai_memory_percent`
+- `bgai_gpu_utilization_percent`, `bgai_gpu_memory_percent`
+- `bgai_gpu_temperature_celsius`, `bgai_gpu_power_watts`
+
+Dynamic discovery: Workers register in Redis, discovery updater writes to `/tmp/bgai_prometheus_targets.json`
 
 ### Configuration
 
-Edit `scripts/start_all_head.sh` for training parameters:
-- `GAMES_PER_BATCH`: Games required to trigger training (default: 10)
-- `STEPS_PER_GAME`: Training steps per collected game (default: 10)
-- `SURPRISE_WEIGHT`: Blend of uniform vs surprise-weighted sampling (default: 0.5)
+Edit `configs/distributed.yaml` for training parameters:
+- `training.games_per_batch`: Games required to trigger training (default: 10)
+- `training.steps_per_game`: Training steps per collected game (default: 10)
+- `training.surprise_weight`: Blend of uniform vs surprise-weighted sampling (default: 0.5)
+- `mlflow.tracking_uri`: MLFlow server URI (default: `http://100.105.50.111:5000`)

@@ -20,7 +20,7 @@ from .gnubg_reader import (
 # The gnubg database to compare against.
 # This file ships with 5 points and 7 checkers (header: gnubg-TS-05-07-1...).
 _SCRIPT_DIR = Path(__file__).parent
-GNUBG_DB_PATH = _SCRIPT_DIR / "gnubg/board_t57.bd"
+GNUBG_DB_PATH = _SCRIPT_DIR / "gnubg/test_ts.bd"
 
 def main():
     """Run the full validation process."""

@@ -18,7 +18,9 @@ import os
 from functools import partial
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
+from pathlib import Path
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import chex
@@ -27,6 +29,8 @@ from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
 from core.training.loss_fns import az_default_loss_fn
+
+# Bearoff table for perfect endgame values (imports lazy-loaded in methods)
 
 from .base_worker import BaseWorker, WorkerStats
 from ..serialization import (
@@ -48,6 +52,11 @@ class TrainingStats:
     experiences_at_last_train: int = 0
     current_batch_steps: int = 0
     current_batch_start_time: float = 0.0
+    # Bearoff/endgame statistics
+    bearoff_experiences: int = 0
+    non_bearoff_experiences: int = 0
+    cumulative_bearoff_value_loss: float = 0.0
+    cumulative_non_bearoff_value_loss: float = 0.0
     last_batch_duration: float = 0.0
     last_batch_steps: int = 0
     cumulative_loss: float = 0.0
@@ -92,6 +101,8 @@ class TrainingWorker(BaseWorker):
                 - checkpoint_dir: Directory for saving checkpoints (default: 'checkpoints')
                 - mlflow_tracking_uri: MLflow tracking server URI (optional)
                 - mlflow_experiment_name: MLflow experiment name (optional)
+                - bearoff_table_path: Path to bearoff table .npy file (optional)
+                - use_bearoff_values: Whether to use perfect values for bearoff positions (default: True)
             worker_id: Optional unique worker ID. Auto-generated if not provided.
         """
         super().__init__(config, worker_id)
@@ -113,6 +124,31 @@ class TrainingWorker(BaseWorker):
         # Surprise-weighted sampling configuration
         # 0 = uniform sampling, 1 = fully surprise-weighted
         self.surprise_weight = self.config.get('surprise_weight', 0.5)
+
+        # Bearoff/endgame table configuration
+        self.use_bearoff_values = self.config.get('use_bearoff_values', True)
+        self._bearoff_table = None
+        self._bearoff_table_np = None  # Keep table on CPU (too large for GPU)
+        bearoff_table_path = self.config.get('bearoff_table_path')
+        if bearoff_table_path is None:
+            # Default path
+            default_path = Path(__file__).parent.parent.parent / 'data' / 'bearoff_15.npy'
+            if default_path.exists():
+                bearoff_table_path = str(default_path)
+
+        if bearoff_table_path and self.use_bearoff_values:
+            try:
+                # Load table but DON'T convert to JAX array (too large for GPU)
+                # We'll use numpy lookups instead
+                self._bearoff_table_np = np.load(bearoff_table_path)
+                self._bearoff_table = True  # Flag indicating table is loaded
+                print(f"Worker {self.worker_id}: Loaded bearoff table from {bearoff_table_path}")
+                print(f"Worker {self.worker_id}: Table shape: {self._bearoff_table_np.shape}, "
+                      f"size: {self._bearoff_table_np.nbytes / 1e9:.2f} GB")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Failed to load bearoff table: {e}")
+                self._bearoff_table = None
+                self._bearoff_table_np = None
 
         # Warm tree configuration
         # Number of MCTS simulations for warm tree (0 to disable)
@@ -158,6 +194,127 @@ class TrainingWorker(BaseWorker):
     def worker_type(self) -> str:
         return 'training'
 
+    # =========================================================================
+    # Bearoff/Endgame Value Methods
+    # =========================================================================
+
+    def _get_bearoff_value_np(self, board: np.ndarray, cur_player: int) -> float:
+        """Get perfect bearoff value from the table (numpy version).
+
+        Args:
+            board: Board array of shape (28,)
+            cur_player: Current player (0 for X, 1 for O)
+
+        Returns:
+            Perfect value from current player's perspective
+        """
+        if self._bearoff_table_np is None:
+            return 0.0
+
+        # Extract X's home board (points 0-5)
+        # X's point 1 = pgx index 0, ..., X's point 6 = pgx index 5
+        x_pos = np.maximum(0, board[0:6])
+
+        # Extract O's home board (points 18-23, stored as negative)
+        # O's point 1 = pgx index 23, O's point 6 = pgx index 18
+        # Flip the order so o_pos[0] = O's point closest to bear off
+        o_pos = np.maximum(0, -board[23:17:-1])
+
+        # Look up in table using numpy indexing function
+        from bgai.endgame.indexing import position_to_index_fast
+        x_idx = position_to_index_fast(x_pos)
+        o_idx = position_to_index_fast(o_pos)
+
+        # Table stores P(X wins | X to move)
+        # Full table format: table[x_idx, o_idx]
+        value_x_to_move = float(self._bearoff_table_np[x_idx, o_idx])
+
+        # If it's O's turn, the value is from O's perspective
+        # For simplicity, we return value from current player's perspective
+        # If cur_player == 0 (X), return value_x_to_move
+        # If cur_player == 1 (O), return 1 - value_x_to_move
+        if cur_player == 0:
+            return value_x_to_move
+        else:
+            return 1.0 - value_x_to_move
+
+    def _apply_bearoff_values_to_batch(
+        self,
+        batch: BaseExperience,
+    ) -> Tuple[BaseExperience, Dict[str, jnp.ndarray]]:
+        """Replace rewards with perfect bearoff values where applicable.
+
+        Uses numpy for bearoff detection and table lookup (table is too large for GPU),
+        then converts results back to JAX arrays.
+
+        Args:
+            batch: Batch of experiences
+
+        Returns:
+            Tuple of (modified_batch, bearoff_metrics)
+        """
+        if self._bearoff_table_np is None or not self.use_bearoff_values:
+            return batch, {'bearoff_count': jnp.array(0), 'total_count': jnp.array(batch.reward.shape[0])}
+
+        batch_size = batch.observation_nn.shape[0]
+
+        # Convert batch data to numpy for processing
+        obs_np = np.array(batch.observation_nn)
+        cur_player_np = np.array(batch.cur_player_id)
+        rewards_np = np.array(batch.reward)
+
+        # Process each experience
+        is_bearoff_list = []
+        perfect_values_list = []
+
+        for i in range(batch_size):
+            # Decode observation to board
+            board = np.round(obs_np[i, :28] * 15).astype(np.int8)
+
+            # Check if bearoff position (numpy version)
+            # Board layout: [0]=current bar, [1-24]=points 1-24, [25]=opponent bar
+            # For bearoff: both bars empty, X only in home (points 1-6), O only in home (points 19-24)
+            bar_empty = (board[0] == 0) and (board[25] == 0)
+            # X (positive) outside home if pieces on points 7-24 (indices 7:25)
+            x_outside = np.any(board[7:25] > 0)
+            # O (negative) outside home if pieces on points 1-18 (indices 1:19)
+            o_outside = np.any(board[1:19] < 0)
+            is_bo = bar_empty and not x_outside and not o_outside
+
+            is_bearoff_list.append(is_bo)
+
+            if is_bo:
+                # Get perfect value
+                perfect_val = self._get_bearoff_value_np(board, int(cur_player_np[i]))
+                perfect_values_list.append(perfect_val)
+            else:
+                perfect_values_list.append(0.0)
+
+        is_bearoff = np.array(is_bearoff_list)
+        perfect_values = np.array(perfect_values_list)
+
+        # Update rewards for bearoff positions
+        new_rewards = rewards_np.copy()
+        for i in range(batch_size):
+            if is_bearoff[i]:
+                cur_p = int(cur_player_np[i])
+                opp_p = 1 - cur_p
+                new_rewards[i, cur_p] = perfect_values[i]
+                new_rewards[i, opp_p] = 1.0 - perfect_values[i]
+
+        # Convert back to JAX and create new batch
+        new_rewards_jax = jnp.array(new_rewards)
+        modified_batch = batch.replace(reward=new_rewards_jax)
+
+        # Metrics
+        bearoff_count = int(np.sum(is_bearoff))
+        metrics = {
+            'bearoff_count': jnp.array(bearoff_count),
+            'total_count': jnp.array(batch_size),
+        }
+
+        return modified_batch, metrics
+
     def _setup_mlflow(self) -> None:
         """Set up MLflow tracking if configured."""
         if not self.mlflow_tracking_uri:
@@ -172,18 +329,32 @@ class TrainingWorker(BaseWorker):
 
             # Check if we should resume an existing run
             run_id = self.state.get_run_id()
+            is_new_run = False
+
             if run_id:
-                # Resume existing run
-                self._mlflow_run = mlflow.start_run(run_id=run_id)
-                print(f"Worker {self.worker_id}: Resumed MLflow run {run_id}")
+                # Try to resume existing run
+                try:
+                    self._mlflow_run = mlflow.start_run(run_id=run_id)
+                    print(f"Worker {self.worker_id}: Resumed MLflow run {run_id}")
+                except Exception as resume_error:
+                    # Run doesn't exist (e.g., MLFlow DB was reset), create new one
+                    print(f"Worker {self.worker_id}: MLflow run {run_id} not found, creating new run")
+                    self._mlflow_run = mlflow.start_run()
+                    new_run_id = self._mlflow_run.info.run_id
+                    self.state.set_run_id(new_run_id)
+                    print(f"Worker {self.worker_id}: Started new MLflow run {new_run_id}")
+                    run_id = new_run_id
+                    is_new_run = True
             else:
                 # Start new run
                 self._mlflow_run = mlflow.start_run()
                 run_id = self._mlflow_run.info.run_id
                 self.state.set_run_id(run_id)
                 print(f"Worker {self.worker_id}: Started MLflow run {run_id}")
+                is_new_run = True
 
-                # Log configuration parameters
+            # Log configuration parameters for new runs
+            if is_new_run:
                 mlflow.log_params({
                     'train_batch_size': self.train_batch_size,
                     'learning_rate': self.learning_rate,
@@ -579,6 +750,16 @@ class TrainingWorker(BaseWorker):
             traceback.print_exc()
             return None
 
+        # Apply perfect bearoff values where applicable
+        bearoff_metrics = None
+        if self._bearoff_table is not None and self.use_bearoff_values:
+            try:
+                jax_batch, bearoff_metrics = self._apply_bearoff_values_to_batch(jax_batch)
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Error applying bearoff values: {e}")
+                import traceback
+                traceback.print_exc()
+
         # Perform training step
         self._train_state, metrics = self._train_step(
             self._train_state,
@@ -587,6 +768,17 @@ class TrainingWorker(BaseWorker):
 
         # Convert metrics to Python floats
         metrics = {k: float(v) for k, v in metrics.items()}
+
+        # Add bearoff metrics
+        if bearoff_metrics is not None:
+            bearoff_count = int(bearoff_metrics['bearoff_count'])
+            total_count = int(bearoff_metrics['total_count'])
+            metrics['bearoff_count'] = bearoff_count
+            metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
+
+            # Update training stats
+            self._training_stats.bearoff_experiences += bearoff_count
+            self._training_stats.non_bearoff_experiences += (total_count - bearoff_count)
 
         self._total_steps += 1
         self.stats.training_steps += 1
@@ -798,6 +990,18 @@ class TrainingWorker(BaseWorker):
                 'total_games': current_games,
                 'model_version': self.current_model_version,
             }
+
+            # Add bearoff metrics if available
+            if 'bearoff_pct' in batch_metrics:
+                mlflow_metrics['bearoff_pct'] = batch_metrics.get('bearoff_pct', 0)
+                mlflow_metrics['bearoff_count'] = batch_metrics.get('bearoff_count', 0)
+                # Compute overall bearoff percentage
+                total_bearoff = self._training_stats.bearoff_experiences
+                total_non_bearoff = self._training_stats.non_bearoff_experiences
+                total_exp = total_bearoff + total_non_bearoff
+                if total_exp > 0:
+                    mlflow_metrics['bearoff_pct_overall'] = 100.0 * total_bearoff / total_exp
+
             self._log_mlflow_metrics(mlflow_metrics, step=self._total_steps)
 
             # Update Prometheus metrics
@@ -851,7 +1055,8 @@ class TrainingWorker(BaseWorker):
             except Exception as e:
                 print(f"Worker {self.worker_id}: Failed to refresh metrics registration: {e}")
 
-            print(
+            # Build log message with optional bearoff stats
+            log_msg = (
                 f"Worker {self.worker_id}: Batch complete! "
                 f"step={self._total_steps}, "
                 f"loss={batch_metrics.get('loss', 0):.4f}, "
@@ -861,6 +1066,9 @@ class TrainingWorker(BaseWorker):
                 f"overall_steps/s={overall_steps_per_sec:.1f}, "
                 f"version={self.current_model_version}"
             )
+            if 'bearoff_pct' in batch_metrics:
+                log_msg += f", bearoff={batch_metrics.get('bearoff_pct', 0):.1f}%"
+            print(log_msg)
 
             last_log_time = time.time()
 
@@ -869,13 +1077,10 @@ class TrainingWorker(BaseWorker):
             self._push_weights_to_redis()
             self._save_checkpoint()
 
-        # End MLflow run
-        if self._mlflow_run is not None:
-            try:
-                import mlflow
-                mlflow.end_run()
-            except Exception as e:
-                print(f"Worker {self.worker_id}: MLflow end run error: {e}")
+        # Note: Don't call mlflow.end_run() here - the run is shared with eval workers
+        # and should persist across worker restarts. The run will be ended manually
+        # via the CLI or when the experiment is complete.
+        self._mlflow_run = None
 
         # Mark worker as stopped
         metrics.worker_status.labels(
@@ -906,6 +1111,12 @@ class TrainingWorker(BaseWorker):
         buffer_size = self.buffer.get_size() if self.buffer else 0
         current_games = self._get_current_games_count() if self.buffer else 0
 
+        # Compute bearoff percentage
+        total_bearoff = self._training_stats.bearoff_experiences
+        total_non_bearoff = self._training_stats.non_bearoff_experiences
+        total_exp = total_bearoff + total_non_bearoff
+        bearoff_pct = 100.0 * total_bearoff / max(total_exp, 1)
+
         base_stats.update({
             'train_batch_size': self.train_batch_size,
             'learning_rate': self.learning_rate,
@@ -922,6 +1133,11 @@ class TrainingWorker(BaseWorker):
             'last_batch_duration': self._training_stats.last_batch_duration,
             'last_batch_steps': self._training_stats.last_batch_steps,
             'avg_loss': self._training_stats.avg_loss,
+            # Bearoff/endgame stats
+            'bearoff_experiences': total_bearoff,
+            'non_bearoff_experiences': total_non_bearoff,
+            'bearoff_pct': bearoff_pct,
+            'bearoff_table_loaded': self._bearoff_table is not None,
         })
         return base_stats
 

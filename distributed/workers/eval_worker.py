@@ -34,6 +34,7 @@ from .base_worker import BaseWorker, WorkerStats
 from ..serialization import deserialize_weights
 from ..buffer.redis_buffer import RedisReplayBuffer
 from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
+from ..coordinator.redis_state import create_state_manager
 
 
 class EvalType(Enum):
@@ -157,6 +158,18 @@ class EvalWorker(BaseWorker):
         # RNG key
         self._rng_key = jax.random.PRNGKey(int(time.time() * 1000) % (2**31))
 
+        # MLflow configuration
+        self.mlflow_tracking_uri = self.config.get('mlflow_tracking_uri')
+        self.mlflow_experiment_name = self.config.get('mlflow_experiment_name', 'bgai-training')
+        self._mlflow_run = None
+
+        # Create state manager for getting run ID
+        self.state = create_state_manager({
+            'redis_host': redis_host,
+            'redis_port': redis_port,
+            'redis_password': redis_password,
+        })
+
     @property
     def worker_type(self) -> str:
         return 'eval'
@@ -269,11 +282,19 @@ class EvalWorker(BaseWorker):
         )
 
     def _setup_gnubg_evaluator(self) -> None:
-        """Set up the GNUBG evaluator."""
+        """Set up the GNUBG evaluator with configurable settings."""
         try:
-            from bgai.gnubg_evaluator import GnubgEvaluator
-            self._gnubg_evaluator = GnubgEvaluator(self._env)
+            from bgai.gnubg_evaluator import GnubgEvaluator, GnubgSettings
+
+            # Get gnubg settings from config
+            gnubg_config = self.config.get('gnubg', {})
+            self._gnubg_evaluator = GnubgEvaluator(self._env, settings=gnubg_config)
+
+            # Log settings
+            settings = self._gnubg_evaluator.get_settings()
             print(f"Worker {self.worker_id}: GNUBG evaluator initialized")
+            print(f"  ply={settings.ply}, shortcuts={settings.shortcuts}, "
+                  f"osdb={settings.osdb}, move_filters={settings.move_filters}")
         except ImportError as e:
             print(f"Worker {self.worker_id}: GNUBG not available: {e}")
             self._gnubg_evaluator = None
@@ -333,6 +354,100 @@ class EvalWorker(BaseWorker):
                 )
 
         self._random_evaluator = RandomEvaluator(self._env)
+
+    def _setup_mlflow(self) -> None:
+        """Set up MLflow tracking if configured."""
+        if not self.mlflow_tracking_uri:
+            print(f"Worker {self.worker_id}: MLflow not configured, skipping")
+            return
+
+        try:
+            import mlflow
+
+            mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+            mlflow.set_experiment(self.mlflow_experiment_name)
+
+            # Get run ID from Redis (shared with training worker)
+            run_id = self.state.get_run_id()
+
+            if run_id:
+                # Resume existing run (same run as training worker)
+                try:
+                    self._mlflow_run = mlflow.start_run(run_id=run_id)
+                    print(f"Worker {self.worker_id}: Attached to MLflow run {run_id}")
+                except Exception as resume_error:
+                    print(f"Worker {self.worker_id}: Could not attach to run {run_id}: {resume_error}")
+                    self._mlflow_run = None
+            else:
+                print(f"Worker {self.worker_id}: No MLflow run ID found in Redis")
+                self._mlflow_run = None
+
+        except Exception as e:
+            print(f"Worker {self.worker_id}: MLflow setup error: {e}")
+            self._mlflow_run = None
+
+    def _log_mlflow_eval_metrics(self, result: 'EvalResult') -> None:
+        """Log evaluation metrics to MLflow.
+
+        Args:
+            result: EvalResult from an evaluation run.
+        """
+        if self._mlflow_run is None:
+            return
+
+        try:
+            import mlflow
+
+            # Use eval_type as prefix for metrics
+            prefix = f"eval_{result.eval_type}"
+
+            metrics = {
+                f'{prefix}_win_rate': result.win_rate,
+                f'{prefix}_games_played': result.games_played,
+                f'{prefix}_wins': result.wins,
+                f'{prefix}_losses': result.losses,
+                f'{prefix}_draws': result.draws,
+                f'{prefix}_avg_game_length': result.avg_game_length,
+                f'{prefix}_avg_points_won': result.avg_points_won,
+                f'{prefix}_duration_seconds': result.duration_seconds,
+            }
+
+            # Log with model version as step for tracking over training
+            mlflow.log_metrics(metrics, step=result.model_version)
+
+            print(
+                f"Worker {self.worker_id}: Logged MLflow metrics for "
+                f"{result.eval_type} v{result.model_version}"
+            )
+
+        except Exception as e:
+            print(f"Worker {self.worker_id}: MLflow logging error: {e}")
+
+    def _log_mlflow_gnubg_params(self) -> None:
+        """Log GNUBG settings as MLflow params (once per run).
+
+        This records the GNUBG configuration used for evaluation so we can
+        compare results across runs with different settings.
+        """
+        if self._mlflow_run is None or self._gnubg_evaluator is None:
+            return
+
+        try:
+            import mlflow
+
+            # Get settings dict from evaluator
+            settings_dict = self._gnubg_evaluator.get_settings_dict()
+
+            # Convert move_filters list to string for MLflow params
+            settings_dict['gnubg_move_filters'] = str(settings_dict['gnubg_move_filters'])
+
+            mlflow.log_params(settings_dict)
+            print(f"Worker {self.worker_id}: Logged GNUBG settings to MLflow")
+
+        except Exception as e:
+            # Params may already be logged from a previous worker
+            if "already logged" not in str(e).lower():
+                print(f"Worker {self.worker_id}: MLflow GNUBG params logging: {e}")
 
     def _initialize_params(self) -> None:
         """Initialize neural network parameters from Redis."""
@@ -602,12 +717,15 @@ class EvalWorker(BaseWorker):
                 step_keys,
             )
 
+            # For self_play, opponent is also MCTS and needs full interface
+            is_mcts = eval_type == EvalType.SELF_PLAY.value
             opp_outputs = self._eval_batch_opponent(
                 opponent_evaluator,
                 opp_eval_states,
                 env_states,
                 metadatas,
                 step_keys,
+                is_mcts=is_mcts,
             )
 
             # Select action based on current player
@@ -695,17 +813,39 @@ class EvalWorker(BaseWorker):
         env_states,
         metadatas,
         keys,
+        is_mcts: bool = False,
     ):
-        """Evaluate a batch with opponent evaluator."""
+        """Evaluate a batch with opponent evaluator.
 
-        def eval_single(eval_state, env_state, key):
-            return evaluator.evaluate(
-                key=key,
-                eval_state=eval_state,
-                env_state=env_state,
-            )
-
-        return jax.vmap(eval_single)(eval_states, env_states, keys)
+        Args:
+            evaluator: The evaluator to use.
+            eval_states: Evaluator states for each game.
+            env_states: Environment states for each game.
+            metadatas: Game metadata for each game.
+            keys: Random keys for each game.
+            is_mcts: If True, use MCTS-style interface with full parameters.
+        """
+        if is_mcts:
+            # MCTS evaluators need the full interface
+            def eval_single(eval_state, env_state, metadata, key):
+                return evaluator.evaluate(
+                    key=key,
+                    eval_state=eval_state,
+                    env_state=env_state,
+                    root_metadata=metadata,
+                    params=self._nn_params,
+                    env_step_fn=self._env_step_fn,
+                )
+            return jax.vmap(eval_single)(eval_states, env_states, metadatas, keys)
+        else:
+            # Simple evaluators (random, gnubg) use basic interface
+            def eval_single(eval_state, env_state, key):
+                return evaluator.evaluate(
+                    key=key,
+                    eval_state=eval_state,
+                    env_state=env_state,
+                )
+            return jax.vmap(eval_single)(eval_states, env_states, keys)
 
     def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:
         """Main evaluation loop.
@@ -726,6 +866,13 @@ class EvalWorker(BaseWorker):
         self._setup_gnubg_evaluator()
         self._setup_random_evaluator()
         self._initialize_params()
+
+        # Set up MLflow tracking
+        self._setup_mlflow()
+
+        # Log GNUBG settings to MLflow (if gnubg eval is enabled)
+        if EvalType.GNUBG.value in self.enabled_eval_types:
+            self._log_mlflow_gnubg_params()
 
         # Start Prometheus metrics server
         metrics_port = self.config.get('metrics_port', 9300)
@@ -804,6 +951,9 @@ class EvalWorker(BaseWorker):
 
                 # Update metrics
                 self._update_metrics(result, metrics)
+
+                # Log to MLflow
+                self._log_mlflow_eval_metrics(result)
             else:
                 # Failed, remove from in-progress
                 task_id = f"v{model_version}:{eval_type}"
@@ -813,6 +963,10 @@ class EvalWorker(BaseWorker):
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='eval'
         ).set(0)
+
+        # End MLflow run (don't call end_run as we're sharing with training worker)
+        # Just clear our reference
+        self._mlflow_run = None
 
         # Cleanup
         self.buffer.close()

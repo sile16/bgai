@@ -7,6 +7,9 @@ port from each worker.
 Workers register their metrics endpoints in Redis for dynamic discovery.
 A background thread updates the Prometheus service discovery file.
 
+System metrics (CPU, RAM, GPU, GPU RAM) are collected automatically via a
+background thread using psutil and pynvml.
+
 Usage:
     from distributed.metrics import get_metrics, start_metrics_server
 
@@ -25,7 +28,7 @@ import os
 import socket
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from prometheus_client import (
     Counter,
     Gauge,
@@ -35,6 +38,19 @@ from prometheus_client import (
     start_http_server,
     REGISTRY,
 )
+
+# Optional imports for system metrics
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    import pynvml
+    HAS_PYNVML = True
+except ImportError:
+    HAS_PYNVML = False
 
 
 class BGAIMetrics:
@@ -282,6 +298,110 @@ class BGAIMetrics:
             'bgai_worker_status',
             'Worker status (1=running, 0=stopped)',
             ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # System Metrics (CPU, RAM, GPU, GPU RAM)
+        # =================================================================
+        self.cpu_percent = Gauge(
+            'bgai_cpu_percent',
+            'CPU utilization percentage (0-100)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.cpu_count = Gauge(
+            'bgai_cpu_count',
+            'Number of CPU cores',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.memory_used_bytes = Gauge(
+            'bgai_memory_used_bytes',
+            'System RAM used in bytes',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.memory_total_bytes = Gauge(
+            'bgai_memory_total_bytes',
+            'Total system RAM in bytes',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.memory_percent = Gauge(
+            'bgai_memory_percent',
+            'System RAM utilization percentage (0-100)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.gpu_utilization_percent = Gauge(
+            'bgai_gpu_utilization_percent',
+            'GPU compute utilization percentage (0-100)',
+            ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        self.gpu_memory_used_bytes = Gauge(
+            'bgai_gpu_memory_used_bytes',
+            'GPU memory used in bytes',
+            ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        self.gpu_memory_total_bytes = Gauge(
+            'bgai_gpu_memory_total_bytes',
+            'Total GPU memory in bytes',
+            ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        self.gpu_memory_percent = Gauge(
+            'bgai_gpu_memory_percent',
+            'GPU memory utilization percentage (0-100)',
+            ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        self.gpu_temperature = Gauge(
+            'bgai_gpu_temperature_celsius',
+            'GPU temperature in Celsius',
+            ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        self.gpu_power_watts = Gauge(
+            'bgai_gpu_power_watts',
+            'GPU power draw in watts',
+            ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # Worker Task Status
+        # =================================================================
+        self.current_task = Info(
+            'bgai_current_task',
+            'Current task being performed by the worker',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.task_iterations = Counter(
+            'bgai_task_iterations_total',
+            'Total iterations/steps of current task',
+            ['worker_id', 'task_type'],
+            registry=self.registry,
+        )
+
+        self.task_duration_seconds = Gauge(
+            'bgai_task_duration_seconds',
+            'Time spent on current task in seconds',
+            ['worker_id', 'task_type'],
             registry=self.registry,
         )
 
@@ -576,3 +696,221 @@ def start_discovery_updater(
     )
     _discovery_updater.start()
     return _discovery_updater
+
+
+# =============================================================================
+# System Metrics Collector
+# =============================================================================
+
+class SystemMetricsCollector(threading.Thread):
+    """Background thread that collects system metrics (CPU, RAM, GPU).
+
+    Collects metrics every `update_interval` seconds and updates Prometheus gauges.
+    Works on both NVIDIA GPUs (via pynvml) and non-GPU systems (via psutil).
+    """
+
+    def __init__(
+        self,
+        worker_id: str,
+        update_interval: float = 5.0,
+        gpu_indices: Optional[List[int]] = None,
+    ):
+        """Initialize the system metrics collector.
+
+        Args:
+            worker_id: Unique worker identifier for metric labels.
+            update_interval: Seconds between metric collections.
+            gpu_indices: List of GPU indices to monitor (None = all available).
+        """
+        super().__init__(daemon=True)
+        self.worker_id = worker_id
+        self.update_interval = update_interval
+        self.gpu_indices = gpu_indices
+        self._stop_event = threading.Event()
+        self._nvml_initialized = False
+        self._gpu_handles: List[Any] = []
+        self._gpu_names: List[str] = []
+
+    def _init_nvml(self) -> bool:
+        """Initialize NVML for GPU monitoring."""
+        if not HAS_PYNVML:
+            return False
+
+        try:
+            pynvml.nvmlInit()
+            self._nvml_initialized = True
+
+            # Get GPU handles
+            device_count = pynvml.nvmlDeviceGetCount()
+            indices = self.gpu_indices if self.gpu_indices else list(range(device_count))
+
+            for idx in indices:
+                if idx < device_count:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                    name = pynvml.nvmlDeviceGetName(handle)
+                    if isinstance(name, bytes):
+                        name = name.decode('utf-8')
+                    self._gpu_handles.append((idx, handle))
+                    self._gpu_names.append(name)
+
+            return True
+        except Exception as e:
+            print(f"Failed to initialize NVML: {e}")
+            return False
+
+    def _shutdown_nvml(self):
+        """Shutdown NVML."""
+        if self._nvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_initialized = False
+
+    def _collect_cpu_metrics(self, metrics: BGAIMetrics):
+        """Collect CPU and memory metrics."""
+        if not HAS_PSUTIL:
+            return
+
+        try:
+            # CPU metrics
+            cpu_percent = psutil.cpu_percent(interval=None)
+            cpu_count = psutil.cpu_count()
+
+            metrics.cpu_percent.labels(worker_id=self.worker_id).set(cpu_percent)
+            metrics.cpu_count.labels(worker_id=self.worker_id).set(cpu_count)
+
+            # Memory metrics
+            mem = psutil.virtual_memory()
+            metrics.memory_used_bytes.labels(worker_id=self.worker_id).set(mem.used)
+            metrics.memory_total_bytes.labels(worker_id=self.worker_id).set(mem.total)
+            metrics.memory_percent.labels(worker_id=self.worker_id).set(mem.percent)
+
+        except Exception as e:
+            print(f"Error collecting CPU metrics: {e}")
+
+    def _collect_gpu_metrics(self, metrics: BGAIMetrics):
+        """Collect GPU metrics via NVML."""
+        if not self._nvml_initialized:
+            return
+
+        try:
+            for (idx, handle), name in zip(self._gpu_handles, self._gpu_names):
+                # GPU utilization
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                metrics.gpu_utilization_percent.labels(
+                    worker_id=self.worker_id,
+                    gpu_index=str(idx),
+                    gpu_name=name,
+                ).set(util.gpu)
+
+                # GPU memory
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                metrics.gpu_memory_used_bytes.labels(
+                    worker_id=self.worker_id,
+                    gpu_index=str(idx),
+                    gpu_name=name,
+                ).set(mem_info.used)
+                metrics.gpu_memory_total_bytes.labels(
+                    worker_id=self.worker_id,
+                    gpu_index=str(idx),
+                    gpu_name=name,
+                ).set(mem_info.total)
+                metrics.gpu_memory_percent.labels(
+                    worker_id=self.worker_id,
+                    gpu_index=str(idx),
+                    gpu_name=name,
+                ).set(100.0 * mem_info.used / mem_info.total if mem_info.total > 0 else 0)
+
+                # GPU temperature
+                try:
+                    temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                    metrics.gpu_temperature.labels(
+                        worker_id=self.worker_id,
+                        gpu_index=str(idx),
+                        gpu_name=name,
+                    ).set(temp)
+                except Exception:
+                    pass
+
+                # GPU power
+                try:
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW to W
+                    metrics.gpu_power_watts.labels(
+                        worker_id=self.worker_id,
+                        gpu_index=str(idx),
+                        gpu_name=name,
+                    ).set(power)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"Error collecting GPU metrics: {e}")
+
+    def run(self):
+        """Main collection loop."""
+        # Initialize NVML if available
+        self._init_nvml()
+
+        # Initialize CPU percent (first call always returns 0)
+        if HAS_PSUTIL:
+            psutil.cpu_percent(interval=None)
+
+        metrics = get_metrics()
+
+        while not self._stop_event.is_set():
+            try:
+                self._collect_cpu_metrics(metrics)
+                self._collect_gpu_metrics(metrics)
+            except Exception as e:
+                print(f"Error in system metrics collection: {e}")
+
+            self._stop_event.wait(self.update_interval)
+
+        self._shutdown_nvml()
+
+    def stop(self):
+        """Stop the collector thread."""
+        self._stop_event.set()
+
+
+# Global system metrics collector instance
+_system_metrics_collector: Optional[SystemMetricsCollector] = None
+
+
+def start_system_metrics_collector(
+    worker_id: str,
+    update_interval: float = 5.0,
+    gpu_indices: Optional[List[int]] = None,
+) -> Optional[SystemMetricsCollector]:
+    """Start the system metrics collector thread.
+
+    Args:
+        worker_id: Unique worker identifier for metric labels.
+        update_interval: Seconds between metric collections.
+        gpu_indices: List of GPU indices to monitor (None = all available).
+
+    Returns:
+        The SystemMetricsCollector thread, or None if already running.
+    """
+    global _system_metrics_collector
+
+    if _system_metrics_collector is not None and _system_metrics_collector.is_alive():
+        return None
+
+    _system_metrics_collector = SystemMetricsCollector(
+        worker_id=worker_id,
+        update_interval=update_interval,
+        gpu_indices=gpu_indices,
+    )
+    _system_metrics_collector.start()
+    print(f"System metrics collector started for worker {worker_id}")
+    return _system_metrics_collector
+
+
+def stop_system_metrics_collector():
+    """Stop the system metrics collector thread."""
+    global _system_metrics_collector
+    if _system_metrics_collector is not None:
+        _system_metrics_collector.stop()
+        _system_metrics_collector = None

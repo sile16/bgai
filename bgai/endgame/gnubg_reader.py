@@ -285,6 +285,85 @@ def compare_with_gnubg(our_table: np.ndarray, gnubg_path: str,
 
     return result
 
+def compare_with_gnubg_reversed(our_table: np.ndarray, gnubg_path: str,
+                                our_positions: List[Tuple[int, ...]]) -> dict:
+    """Compare our table with gnubg database using REVERSED tuple convention.
+
+    Args:
+        our_table: Our computed win probability table.
+        gnubg_path: Path to gnubg .bd file.
+        our_positions: List of position tuples in our index order.
+
+    Returns:
+        Dict with comparison statistics.
+    """
+    print("Comparing with gnubg (reversed tuple convention)...")
+    gnubg_table, n_points, max_checkers = read_gnubg_ts_database(gnubg_path)
+
+    # Build our position->index lookup
+    our_pos_to_idx = {pos: i for i, pos in enumerate(our_positions)}
+
+    # gnubg positions are indexed with their own convention.
+    gnubg_positions = generate_all_positions(n_points, max_checkers)
+    gnubg_pos_to_idx = {pos: i for i, pos in enumerate(gnubg_positions)}
+
+
+    # Compare values for positions that exist in both
+    diffs = []
+    max_diff = 0.0
+    max_diff_pos = None
+
+    for x_pos in our_positions:
+        if len(x_pos) != n_points:
+            continue
+        if sum(x_pos) > max_checkers:
+            continue
+        our_x_idx = our_pos_to_idx[x_pos]
+
+        for o_pos in our_positions:
+            if len(o_pos) != n_points:
+                continue
+            if sum(o_pos) > max_checkers:
+                continue
+            our_o_idx = our_pos_to_idx[o_pos]
+
+            gnubg_x_pos = tuple(reversed(x_pos))
+            gnubg_o_pos = tuple(reversed(o_pos))
+
+            if gnubg_x_pos not in gnubg_pos_to_idx or gnubg_o_pos not in gnubg_pos_to_idx:
+                continue
+
+            gnubg_x_idx = gnubg_pos_to_idx[gnubg_x_pos]
+            gnubg_o_idx = gnubg_pos_to_idx[gnubg_o_pos]
+
+
+            our_val = our_table[our_x_idx, our_o_idx]
+            gnubg_val = gnubg_table[gnubg_x_idx, gnubg_o_idx]
+
+            diff = abs(our_val - gnubg_val)
+            diffs.append(diff)
+
+            if diff > max_diff:
+                max_diff = diff
+                max_diff_pos = (x_pos, o_pos, our_val, gnubg_val)
+
+    if not diffs:
+        raise ValueError("No positions were compared. Check checker counts and position generation.")
+
+    diffs = np.array(diffs)
+
+    result = {
+        'n_compared': len(diffs),
+        'max_diff': max_diff,
+        'mean_diff': np.mean(diffs),
+        'std_diff': np.std(diffs),
+        'max_diff_position': max_diff_pos,
+        'pct_within_0_01': np.mean(diffs < 0.01) * 100,
+        'pct_within_0_001': np.mean(diffs < 0.001) * 100,
+    }
+
+    return result
+
 
 def print_comparison_report(result: dict):
     """Print comparison report."""

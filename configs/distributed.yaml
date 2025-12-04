@@ -41,6 +41,18 @@ game:
   temperature_end: 0.2    # Final exploitation
 
 # =============================================================================
+# GNU BACKGAMMON EVALUATION SETTINGS
+# =============================================================================
+# These settings control GNUBG evaluation strength for the gnubg eval type.
+# Higher ply and more move filter candidates = stronger but slower evaluation.
+
+gnubg:
+  ply: 2                  # Search depth (0=fastest, 1=medium, 2=strongest)
+  shortcuts: 0            # Evaluation shortcuts (0=disabled, 1=faster but weaker)
+  osdb: 1                 # One-sided bearoff database (0=disabled, 1=enabled)
+  move_filters: [8, 4, 2, 2]  # Candidates at each ply level
+
+# =============================================================================
 # INFRASTRUCTURE
 # =============================================================================
 
@@ -56,7 +68,9 @@ head:
   host_local: "192.168.20.40"  # LAN fallback
 
 mlflow:
-  tracking_uri: "http://100.105.50.111:5000"
+  # Use localhost since only the training worker on the head node needs MLFlow
+  # This avoids DNS rebinding security issues with external IPs
+  tracking_uri: "http://localhost:5000"
   experiment_name: "bgai-training"
   artifact_location: "./mlruns"
 
