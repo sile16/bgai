@@ -72,18 +72,22 @@ for arg in "$@"; do
 done
 
 # Generate worker ID if not provided
+# Detect platform for worker ID prefix and JAX configuration
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || hostname)
+OS_TYPE=$(uname -s)
+if [[ "$OS_TYPE" == "Darwin" ]]; then
+    PLATFORM_TAG="mac"
+    # Force CPU on Mac - Metal/MPS has serialization issues with JAX
+    export JAX_PLATFORMS=cpu
+    echo "Detected macOS - forcing JAX to use CPU (JAX_PLATFORMS=cpu)"
+elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    PLATFORM_TAG="cuda"
+else
+    PLATFORM_TAG="cpu"
+fi
+
 if [[ -z "$WORKER_ID" ]]; then
-    HOSTNAME_SHORT=$(hostname -s 2>/dev/null || hostname)
-    # Detect platform for worker ID prefix
-    OS_TYPE=$(uname -s)
-    if [[ "$OS_TYPE" == "Darwin" ]]; then
-        PLATFORM_TAG="mac"
-    elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        PLATFORM_TAG="cuda"
-    else
-        PLATFORM_TAG="cpu"
-    fi
-    WORKER_ID="${PLATFORM_TAG}-${HOSTNAME_SHORT}"
+    WORKER_ID="${PLATFORM_TAG}-${HOSTNAME_SHORT}-game"
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
