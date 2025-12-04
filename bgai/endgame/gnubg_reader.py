@@ -18,6 +18,23 @@ from math import comb
 from pathlib import Path
 
 
+def read_gnubg_header(path: str) -> Tuple[int, int, str]:
+    """Read header only from a gnubg two-sided database.
+
+    Returns:
+        (n_points, max_checkers, header_string)
+    """
+    with open(path, 'rb') as f:
+        header = f.read(40)
+    header_str = header[:32].decode('utf-8', errors='replace').rstrip('x\n')
+    parts = header_str.split('-')
+    if len(parts) < 4 or parts[1] != 'TS':
+        raise ValueError(f"Invalid two-sided database header: {header_str}")
+    n_points = int(parts[2])
+    max_checkers = int(parts[3])
+    return n_points, max_checkers, header_str
+
+
 def count_positions(points: int, max_checkers: int) -> int:
     """Count total positions for given points and max checkers.
 
@@ -202,7 +219,7 @@ def verify_indexing(n_points: int = 6, max_checkers: int = 6):
 
 def compare_with_gnubg(our_table: np.ndarray, gnubg_path: str,
                        our_positions: List[Tuple[int, ...]]) -> dict:
-    """Compare our table with gnubg database, handling convention differences.
+    """Compare our table with gnubg database using gnubg's indexing.
 
     Args:
         our_table: Our computed win probability table.
@@ -212,16 +229,9 @@ def compare_with_gnubg(our_table: np.ndarray, gnubg_path: str,
     Returns:
         Dict with comparison statistics.
     """
-    print("Comparing with gnubg, applying position convention fix...")
+    print("Comparing with gnubg...")
     gnubg_table, n_points, max_checkers = read_gnubg_ts_database(gnubg_path)
-
-    # gnubg's position index mapping is different from ours.
-    # We must use the gnubg-specific index calculation.
-    gnubg_positions = generate_all_positions(n_points, max_checkers)
-    gnubg_pos_to_idx = {
-        pos: position_index_gnubg(pos, n_points, max_checkers)
-        for pos in gnubg_positions
-    }
+    # gnubg files use the same tuple ordering as our code (index 0 = nearest point).
 
     # Build our position->index lookup
     our_pos_to_idx = {pos: i for i, pos in enumerate(our_positions)}
@@ -232,55 +242,21 @@ def compare_with_gnubg(our_table: np.ndarray, gnubg_path: str,
     max_diff_pos = None
 
     for x_pos in our_positions:
+        if len(x_pos) != n_points:
+            continue
         if sum(x_pos) > max_checkers:
             continue
         our_x_idx = our_pos_to_idx[x_pos]
 
         for o_pos in our_positions:
+            if len(o_pos) != n_points:
+                continue
             if sum(o_pos) > max_checkers:
                 continue
             our_o_idx = our_pos_to_idx[o_pos]
 
-            # --- CONVENTION FIX ---
-            # Our convention: tuple[0] is 1-point, tuple[5] is 6-point
-            # gnubg convention: tuple[0] is 6-point, tuple[5] is 1-point
-            # To look up a position from our table in the gnubg table, we must
-            # reverse the tuples.
-            gnubg_x_pos_our_convention = tuple(reversed(x_pos))
-            gnubg_o_pos_our_convention = tuple(reversed(o_pos))
-
-            # The gnubg database is indexed by gnubg's position convention.
-            # However, the position tuples in gnubg_pos_to_idx are in our convention.
-            # So we need to use the original x_pos and o_pos to look up the index.
-            # No, the gnubg database is indexed using gnubg's indexing scheme, but the
-            # keys in gnubg_pos_to_idx are tuples that follow gnubg's convention.
-            # The tuple reversal is correct.
-
-            if gnubg_x_pos_our_convention not in gnubg_pos_to_idx or gnubg_o_pos_our_convention not in gnubg_pos_to_idx:
-                continue
-
-            # The gnubg database is indexed with its own convention.
-            # The keys in gnubg_pos_to_idx are tuples that follow our convention.
-            # The reversal is to match the position representation.
-            # The indexing is a separate issue.
-
-            # Let's reconsider.
-            # our_table is indexed by our_pos_to_idx.
-            # gnubg_table is indexed by gnubg's native index.
-            # To get a value from gnubg_table for a position (x_pos, o_pos) in our convention,
-            # we need to:
-            # 1. Convert x_pos and o_pos to gnubg's convention (reverse tuples).
-            # 2. Get the gnubg index for the converted positions.
-            # 3. Look up in gnubg_table.
-
-            gnubg_x_pos = tuple(reversed(x_pos))
-            gnubg_o_pos = tuple(reversed(o_pos))
-
-            if sum(gnubg_x_pos) > max_checkers or sum(gnubg_o_pos) > max_checkers:
-                continue
-
-            gnubg_x_idx = position_index_gnubg(gnubg_x_pos, n_points, max_checkers)
-            gnubg_o_idx = position_index_gnubg(gnubg_o_pos, n_points, max_checkers)
+            gnubg_x_idx = position_index_gnubg(x_pos, n_points, max_checkers)
+            gnubg_o_idx = position_index_gnubg(o_pos, n_points, max_checkers)
 
             our_val = our_table[our_x_idx, our_o_idx]
             gnubg_val = gnubg_table[gnubg_x_idx, gnubg_o_idx]
