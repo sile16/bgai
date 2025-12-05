@@ -103,7 +103,7 @@ class BaseWorker(ABC):
 
         # Configuration
         self.heartbeat_interval = self.config.get('heartbeat_interval', HEARTBEAT_INTERVAL)
-        self.metrics_port = self.config.get('metrics_port', 9100)
+        # metrics_port is set later by _get_default_metrics_port() after worker_type is available
 
         # State
         self.running = False
@@ -122,6 +122,13 @@ class BaseWorker(ABC):
     def worker_type(self) -> str:
         """Return the worker type string ('game', 'training', 'eval')."""
         pass
+
+    @property
+    def metrics_port(self) -> int:
+        """Get the metrics port, using worker-type-specific defaults."""
+        default_ports = {'game': 9100, 'training': 9200, 'eval': 9300}
+        default = default_ports.get(self.worker_type, 9100)
+        return self.config.get('metrics_port', default)
 
     @abstractmethod
     def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:

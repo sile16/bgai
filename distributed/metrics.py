@@ -578,18 +578,21 @@ def update_prometheus_discovery_file(
     """
     workers = get_registered_workers(redis_client)
 
-    # Group by worker type
-    game_targets = []
-    training_targets = []
+    # Group by worker type (using sets to deduplicate endpoints)
+    game_targets = set()
+    training_targets = set()
+    eval_targets = set()
 
     for worker_id, info in workers.items():
         endpoint = info.get("endpoint", "")
         worker_type = info.get("worker_type", "unknown")
 
         if worker_type == "game":
-            game_targets.append(endpoint)
+            game_targets.add(endpoint)
         elif worker_type == "training":
-            training_targets.append(endpoint)
+            training_targets.add(endpoint)
+        elif worker_type == "eval":
+            eval_targets.add(endpoint)
 
     # Build Prometheus file_sd_configs format
     discovery = []
@@ -597,13 +600,19 @@ def update_prometheus_discovery_file(
     if game_targets:
         discovery.append({
             "labels": {"job": "bgai_game_workers", "worker_type": "game"},
-            "targets": game_targets,
+            "targets": sorted(game_targets),
         })
 
     if training_targets:
         discovery.append({
             "labels": {"job": "bgai_training_workers", "worker_type": "training"},
-            "targets": training_targets,
+            "targets": sorted(training_targets),
+        })
+
+    if eval_targets:
+        discovery.append({
+            "labels": {"job": "bgai_eval_workers", "worker_type": "eval"},
+            "targets": sorted(eval_targets),
         })
 
     # Write atomically
