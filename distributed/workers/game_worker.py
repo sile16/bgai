@@ -71,7 +71,20 @@ class GameWorker(BaseWorker):
         self.num_simulations = self.config.get('num_simulations', 100)
         self.max_nodes = self.config.get('max_nodes', 400)
         self.max_episode_steps = self.config.get('max_episode_steps', 500)
+
+        # Temperature schedule: start high (exploration) -> end low (exploitation)
+        # If temperature_start/end are defined, use linear decay over episode progress
+        self.temperature_start = self.config.get('temperature_start')
+        self.temperature_end = self.config.get('temperature_end')
         self.temperature = self.config.get('temperature', 1.0)
+        self._use_temperature_schedule = (
+            self.temperature_start is not None and
+            self.temperature_end is not None
+        )
+        # Current temperature (updated each step if using schedule)
+        self._current_temperature = (
+            self.temperature_start if self._use_temperature_schedule else self.temperature
+        )
 
         # Initialize Redis buffer (uses same connection info)
         redis_host = self.config.get('redis_host', 'localhost')
@@ -261,6 +274,7 @@ class GameWorker(BaseWorker):
             'episode_experiences': [[] for _ in range(self.batch_size)],
             'episode_value_preds': [[] for _ in range(self.batch_size)],
             'episode_ids': [None] * self.batch_size,
+            'episode_steps': [0] * self.batch_size,  # Track steps per episode for temperature schedule
         }
 
     def _replicate_warm_tree(self, warm_tree):
@@ -277,6 +291,31 @@ class GameWorker(BaseWorker):
             return jnp.stack([x] * self.batch_size, axis=0)
 
         return jax.tree_util.tree_map(stack_leaves, warm_tree)
+
+    def _calculate_temperature(self, step: int, max_steps: int) -> float:
+        """Calculate temperature based on game progress.
+
+        Uses linear decay from temperature_start to temperature_end over the
+        course of an episode. This encourages exploration early in the game
+        and exploitation (stronger play) later.
+
+        Args:
+            step: Current step in the episode.
+            max_steps: Maximum steps in the episode.
+
+        Returns:
+            Temperature value for MCTS action selection.
+        """
+        if not self._use_temperature_schedule:
+            return self.temperature
+
+        # Linear interpolation: start -> end over game progress
+        progress = min(1.0, step / max(1, max_steps))
+        temperature = (
+            self.temperature_start * (1 - progress) +
+            self.temperature_end * progress
+        )
+        return float(temperature)
 
     def _check_and_update_model(self) -> None:
         """Check for and apply model updates from Redis."""
@@ -336,6 +375,14 @@ class GameWorker(BaseWorker):
         metadatas = state['metadatas']
         eval_states = state['eval_states']
 
+        # Update temperature based on average episode progress
+        if self._use_temperature_schedule:
+            avg_step = sum(state['episode_steps']) / max(1, len(state['episode_steps']))
+            self._current_temperature = self._calculate_temperature(
+                int(avg_step), self.max_episode_steps
+            )
+            self._evaluator.temperature = self._current_temperature
+
         # Step all environments
         step_keys = jax.random.split(key, self.batch_size)
 
@@ -363,6 +410,7 @@ class GameWorker(BaseWorker):
                     'cur_player_id': metadatas.cur_player_id[i],
                 }
                 state['episode_experiences'][i].append(exp)
+                state['episode_steps'][i] += 1  # Track episode progress for temperature
 
                 eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
                 value_pred = float(self._evaluator.get_value(eval_state_i))
@@ -386,6 +434,7 @@ class GameWorker(BaseWorker):
                 state['episode_experiences'][i] = []
                 state['episode_value_preds'][i] = []
                 state['episode_ids'][i] = None
+                state['episode_steps'][i] = 0  # Reset step counter for new episode
 
         self._collection_state['env_states'] = new_env_states
         self._collection_state['metadatas'] = new_metadatas
@@ -454,6 +503,12 @@ class GameWorker(BaseWorker):
         # Setup and JIT compile the batched step function
         print(f"Worker {self.worker_id}: JIT compiling batched step function...")
         self._setup_batched_step()
+
+        # Log temperature schedule info
+        if self._use_temperature_schedule:
+            print(f"Worker {self.worker_id}: Temperature schedule: {self.temperature_start:.2f} -> {self.temperature_end:.2f}")
+        else:
+            print(f"Worker {self.worker_id}: Static temperature: {self.temperature:.2f}")
 
         # Start Prometheus metrics server
         metrics_port = self.config.get('metrics_port', 9100)
@@ -530,6 +585,11 @@ class GameWorker(BaseWorker):
                     worker_id=self.worker_id, worker_type='game'
                 ).set(self.current_model_version)
 
+                # Log current MCTS temperature
+                metrics.mcts_temperature.labels(
+                    worker_id=self.worker_id
+                ).set(self._current_temperature)
+
                 # Refresh metrics registration
                 try:
                     register_metrics_endpoint(
@@ -542,11 +602,12 @@ class GameWorker(BaseWorker):
                 except Exception:
                     pass
 
+                temp_str = f", temp={self._current_temperature:.2f}" if self._use_temperature_schedule else ""
                 print(
                     f"Worker {self.worker_id}: "
                     f"iter={iteration}, games={total_games}, "
                     f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}, "
-                    f"model_v{self.current_model_version}"
+                    f"model_v{self.current_model_version}{temp_str}"
                 )
 
         # Mark worker as stopped
@@ -572,7 +633,10 @@ class GameWorker(BaseWorker):
             'batch_size': self.batch_size,
             'num_simulations': self.num_simulations,
             'max_nodes': self.max_nodes,
-            'temperature': self.temperature,
+            'temperature': self._current_temperature,
+            'temperature_schedule': self._use_temperature_schedule,
+            'temperature_start': self.temperature_start,
+            'temperature_end': self.temperature_end,
             'buffer_size': self.buffer.get_size() if self.buffer else 0,
         })
         return base_stats

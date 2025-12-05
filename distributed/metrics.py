@@ -52,6 +52,13 @@ try:
 except ImportError:
     HAS_PYNVML = False
 
+# TPU monitoring via libtpu SDK (available when jax[tpu] is installed)
+try:
+    from libtpu.sdk import tpumonitoring
+    HAS_TPU_MONITORING = True
+except ImportError:
+    HAS_TPU_MONITORING = False
+
 
 class BGAIMetrics:
     """Container for all BGAI training metrics."""
@@ -224,6 +231,13 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.mcts_temperature = Gauge(
+            'bgai_mcts_temperature',
+            'Current MCTS exploration temperature (decays over game progress)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
         self.weight_updates_total = Counter(
             'bgai_weight_updates_total',
             'Total weight updates pushed',
@@ -378,6 +392,44 @@ class BGAIMetrics:
             'bgai_gpu_power_watts',
             'GPU power draw in watts',
             ['worker_id', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # TPU Metrics (via libtpu SDK)
+        # =================================================================
+        self.tpu_duty_cycle_percent = Gauge(
+            'bgai_tpu_duty_cycle_percent',
+            'TPU TensorCore duty cycle percentage (0-100)',
+            ['worker_id', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_tensor_core_utilization = Gauge(
+            'bgai_tpu_tensor_core_utilization',
+            'TPU Tensor Core utilization percentage (0-100)',
+            ['worker_id', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_hbm_memory_used_bytes = Gauge(
+            'bgai_tpu_hbm_memory_used_bytes',
+            'TPU High Bandwidth Memory used in bytes',
+            ['worker_id', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_hbm_memory_total_bytes = Gauge(
+            'bgai_tpu_hbm_memory_total_bytes',
+            'TPU High Bandwidth Memory total in bytes',
+            ['worker_id', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_hbm_memory_percent = Gauge(
+            'bgai_tpu_hbm_memory_percent',
+            'TPU High Bandwidth Memory utilization percentage (0-100)',
+            ['worker_id', 'tpu_index'],
             registry=self.registry,
         )
 
@@ -856,6 +908,72 @@ class SystemMetricsCollector(threading.Thread):
         except Exception as e:
             print(f"Error collecting GPU metrics: {e}")
 
+    def _collect_tpu_metrics(self, metrics: BGAIMetrics):
+        """Collect TPU metrics via libtpu SDK.
+
+        Uses the libtpu.sdk.tpumonitoring module to collect TPU metrics
+        including duty cycle, tensor core utilization, and HBM memory usage.
+        """
+        if not HAS_TPU_MONITORING:
+            return
+
+        try:
+            # Get available metrics from libtpu
+            # The SDK provides metrics like duty_cycle_pct, tensor_core_util_pct,
+            # hbm_capacity_total, hbm_capacity_usage, etc.
+            supported = tpumonitoring.list_supported_metrics()
+
+            # Collect metrics for each TPU chip
+            # The actual metric names may vary by TPU generation
+            for tpu_idx in range(8):  # Max 8 TPU cores per host typically
+                try:
+                    # Duty cycle percentage
+                    if 'duty_cycle_pct' in supported:
+                        duty_cycle = tpumonitoring.get_metric('duty_cycle_pct', chip=tpu_idx)
+                        if duty_cycle is not None:
+                            metrics.tpu_duty_cycle_percent.labels(
+                                worker_id=self.worker_id,
+                                tpu_index=str(tpu_idx),
+                            ).set(duty_cycle)
+
+                    # Tensor core utilization
+                    if 'tensor_core_util_pct' in supported:
+                        tc_util = tpumonitoring.get_metric('tensor_core_util_pct', chip=tpu_idx)
+                        if tc_util is not None:
+                            metrics.tpu_tensor_core_utilization.labels(
+                                worker_id=self.worker_id,
+                                tpu_index=str(tpu_idx),
+                            ).set(tc_util)
+
+                    # HBM memory
+                    if 'hbm_capacity_total' in supported and 'hbm_capacity_usage' in supported:
+                        hbm_total = tpumonitoring.get_metric('hbm_capacity_total', chip=tpu_idx)
+                        hbm_used = tpumonitoring.get_metric('hbm_capacity_usage', chip=tpu_idx)
+                        if hbm_total is not None and hbm_used is not None:
+                            metrics.tpu_hbm_memory_total_bytes.labels(
+                                worker_id=self.worker_id,
+                                tpu_index=str(tpu_idx),
+                            ).set(hbm_total)
+                            metrics.tpu_hbm_memory_used_bytes.labels(
+                                worker_id=self.worker_id,
+                                tpu_index=str(tpu_idx),
+                            ).set(hbm_used)
+                            if hbm_total > 0:
+                                metrics.tpu_hbm_memory_percent.labels(
+                                    worker_id=self.worker_id,
+                                    tpu_index=str(tpu_idx),
+                                ).set(100.0 * hbm_used / hbm_total)
+
+                except Exception:
+                    # No more TPU chips or metric not available for this chip
+                    break
+
+        except Exception as e:
+            # Only log once to avoid spam
+            if not hasattr(self, '_tpu_error_logged'):
+                print(f"Error collecting TPU metrics: {e}")
+                self._tpu_error_logged = True
+
     def run(self):
         """Main collection loop."""
         # Initialize NVML if available
@@ -865,12 +983,17 @@ class SystemMetricsCollector(threading.Thread):
         if HAS_PSUTIL:
             psutil.cpu_percent(interval=None)
 
+        # Log TPU availability
+        if HAS_TPU_MONITORING:
+            print(f"TPU monitoring available for worker {self.worker_id}")
+
         metrics = get_metrics()
 
         while not self._stop_event.is_set():
             try:
                 self._collect_cpu_metrics(metrics)
                 self._collect_gpu_metrics(metrics)
+                self._collect_tpu_metrics(metrics)
             except Exception as e:
                 print(f"Error in system metrics collection: {e}")
 

@@ -228,11 +228,21 @@ def get_game_worker_config(
     else:
         batch_size = device_cfg.get('game_batch_size', game.get('batch_size', 16))
 
+    # Temperature schedule: start high for exploration, decay to low for exploitation
+    # If temperature_start/end are defined, use schedule; otherwise use static temperature
+    temp_start = game.get('temperature_start')
+    temp_end = game.get('temperature_end')
+    static_temp = mcts.get('temperature', 1.0)
+
     return {
         'batch_size': batch_size,
         'num_simulations': mcts.get('simulations', 100),
         'max_nodes': mcts.get('max_nodes', 400),
-        'temperature': mcts.get('temperature', 1.0),
+        # Static temperature (used if no schedule defined)
+        'temperature': static_temp,
+        # Temperature schedule (None means use static)
+        'temperature_start': temp_start,
+        'temperature_end': temp_end,
         'max_episode_steps': game.get('max_episode_steps', 500),
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
