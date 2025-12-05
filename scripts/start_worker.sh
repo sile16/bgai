@@ -162,7 +162,8 @@ echo "=============================================="
 echo "Platform:     $PLATFORM ($DEVICE_TYPE)"
 echo "Worker types: ${WORKER_TYPES[*]}"
 echo "Worker ID:    $WORKER_ID_BASE"
-echo "Redis:        $HEAD_IP:$REDIS_PORT"
+echo "Head node:    $HEAD_IP (Redis port: $REDIS_PORT)"
+echo "MLflow:       http://$HEAD_IP:5000"
 echo "Config file:  $CONFIG_FILE"
 if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
     echo "Game batch:   $CUSTOM_GAME_BATCH (override)"
@@ -207,6 +208,7 @@ start_game_worker() {
     local cmd="python -m distributed.cli.main game-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --worker-id $worker_id"
+    cmd="$cmd --head-ip $HEAD_IP"
 
     if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_GAME_BATCH"
@@ -261,6 +263,7 @@ start_eval_worker() {
     local cmd="python -m distributed.cli.main eval-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --worker-id $worker_id"
+    cmd="$cmd --head-ip $HEAD_IP"
 
     if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_EVAL_BATCH"

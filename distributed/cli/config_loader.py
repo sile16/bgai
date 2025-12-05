@@ -243,7 +243,8 @@ def get_game_worker_config(
 def get_training_worker_config(
     config: Dict[str, Any],
     device_type: Optional[str] = None,
-    batch_size_override: Optional[int] = None
+    batch_size_override: Optional[int] = None,
+    head_ip: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extract training worker configuration with device-specific batch size.
 
@@ -251,6 +252,7 @@ def get_training_worker_config(
         config: Full configuration dictionary.
         device_type: Device type. Auto-detected if None.
         batch_size_override: Override batch size (from CLI --batch-size).
+        head_ip: Head node IP for MLflow/services. Uses auto-detection if None.
 
     Returns:
         Training worker config dict.
@@ -269,20 +271,28 @@ def get_training_worker_config(
     else:
         batch_size = device_cfg.get('train_batch_size', training.get('batch_size', 128))
 
-    # Build MLFlow tracking URI - use detected host for proper network access
+    # Build MLFlow tracking URI - use head_ip if provided, else auto-detect
     mlflow_uri = mlflow.get('tracking_uri')
     if mlflow_uri:
-        # If tracking URI uses head node IP, substitute with detected reachable host
-        head = config.get('head', {})
-        head_ip = head.get('host', '')
-        head_local = head.get('host_local', '')
-        detected_host = detect_redis_host(config)
+        # Determine the target host for MLflow
+        if head_ip:
+            # Use explicitly provided head IP
+            target_host = head_ip
+        else:
+            # Auto-detect by finding reachable head node (same as Redis detection)
+            target_host = detect_redis_host(config)
 
-        # Replace head IP with detected host in MLFlow URI
-        if head_ip and head_ip in mlflow_uri:
-            mlflow_uri = mlflow_uri.replace(head_ip, detected_host)
-        elif head_local and head_local in mlflow_uri:
-            mlflow_uri = mlflow_uri.replace(head_local, detected_host)
+        # Replace localhost, head IPs, etc. with target host
+        head = config.get('head', {})
+        config_head_ip = head.get('host', '')
+        config_head_local = head.get('host_local', '')
+
+        if 'localhost' in mlflow_uri or '127.0.0.1' in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace('localhost', target_host).replace('127.0.0.1', target_host)
+        elif config_head_ip and config_head_ip in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(config_head_ip, target_host)
+        elif config_head_local and config_head_local in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(config_head_local, target_host)
 
     return {
         'train_batch_size': batch_size,
@@ -309,7 +319,8 @@ def get_training_worker_config(
 def get_eval_worker_config(
     config: Dict[str, Any],
     device_type: Optional[str] = None,
-    batch_size_override: Optional[int] = None
+    batch_size_override: Optional[int] = None,
+    head_ip: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extract evaluation worker configuration.
 
@@ -317,6 +328,7 @@ def get_eval_worker_config(
         config: Full configuration dictionary.
         device_type: Device type. Auto-detected if None.
         batch_size_override: Override batch size (from CLI --batch-size).
+        head_ip: Head node IP for MLflow/services. Uses auto-detection if None.
 
     Returns:
         Eval worker config dict.
@@ -335,19 +347,28 @@ def get_eval_worker_config(
     else:
         batch_size = device_cfg.get('eval_batch_size', 16)
 
-    # Build MLFlow tracking URI - use detected host for proper network access
+    # Build MLFlow tracking URI - use head_ip if provided, else auto-detect
     mlflow_uri = mlflow.get('tracking_uri')
     if mlflow_uri:
-        head = config.get('head', {})
-        head_ip = head.get('host', '')
-        head_local = head.get('host_local', '')
-        detected_host = detect_redis_host(config)
+        # Determine the target host for MLflow
+        if head_ip:
+            # Use explicitly provided head IP
+            target_host = head_ip
+        else:
+            # Auto-detect by finding reachable head node (same as Redis detection)
+            target_host = detect_redis_host(config)
 
-        # Replace head IP with detected host in MLFlow URI
-        if head_ip and head_ip in mlflow_uri:
-            mlflow_uri = mlflow_uri.replace(head_ip, detected_host)
-        elif head_local and head_local in mlflow_uri:
-            mlflow_uri = mlflow_uri.replace(head_local, detected_host)
+        # Replace localhost, head IPs, etc. with target host
+        head = config.get('head', {})
+        config_head_ip = head.get('host', '')
+        config_head_local = head.get('host_local', '')
+
+        if 'localhost' in mlflow_uri or '127.0.0.1' in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace('localhost', target_host).replace('127.0.0.1', target_host)
+        elif config_head_ip and config_head_ip in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(config_head_ip, target_host)
+        elif config_head_local and config_head_local in mlflow_uri:
+            mlflow_uri = mlflow_uri.replace(config_head_local, target_host)
 
     return {
         'batch_size': batch_size,

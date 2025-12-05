@@ -373,8 +373,8 @@ class EvalWorker(BaseWorker):
             if run_id:
                 # Resume existing run (same run as training worker)
                 try:
-                    self._mlflow_run = mlflow.start_run(run_id=run_id)
-                    print(f"Worker {self.worker_id}: Attached to MLflow run {run_id}")
+                    self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
+                    print(f"Worker {self.worker_id}: Attached to MLflow run {run_id} (system metrics enabled)")
                 except Exception as resume_error:
                     print(f"Worker {self.worker_id}: Could not attach to run {run_id}: {resume_error}")
                     self._mlflow_run = None

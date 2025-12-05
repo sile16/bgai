@@ -168,7 +168,8 @@ def start_training_worker(args):
 
     # Get device-specific config with optional batch size override
     batch_override = args.batch_size if args.batch_size != 128 else None
-    config = get_training_worker_config(yaml_config, device_type, batch_override)
+    head_ip = getattr(args, 'head_ip', None)
+    config = get_training_worker_config(yaml_config, device_type, batch_override, head_ip=head_ip)
 
     # CLI overrides
     if args.redis_host != 'localhost':
@@ -235,7 +236,8 @@ def start_eval_worker(args):
 
     # Get device-specific config with optional batch size override
     batch_override = args.batch_size if args.batch_size != 16 else None
-    config = get_eval_worker_config(yaml_config, device_type, batch_override)
+    head_ip = getattr(args, 'head_ip', None)
+    config = get_eval_worker_config(yaml_config, device_type, batch_override, head_ip=head_ip)
 
     # CLI overrides
     if args.redis_host != 'localhost':
@@ -549,6 +551,12 @@ def main():
         default=1.0,
         help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
     )
+    game_parser.add_argument(
+        '--head-ip',
+        type=str,
+        default=None,
+        help='Head node IP for MLflow/services (auto-detected if not provided)'
+    )
     game_parser.set_defaults(func=start_game_worker)
 
     # =========================================================================
@@ -672,6 +680,12 @@ def main():
         default=1.0,
         help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
     )
+    train_parser.add_argument(
+        '--head-ip',
+        type=str,
+        default=None,
+        help='Head node IP for MLflow/services (auto-detected if not provided)'
+    )
     train_parser.set_defaults(func=start_training_worker)
 
     # =========================================================================
@@ -764,6 +778,12 @@ def main():
         type=float,
         default=1.0,
         help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
+    )
+    eval_parser.add_argument(
+        '--head-ip',
+        type=str,
+        default=None,
+        help='Head node IP for MLflow/services (auto-detected if not provided)'
     )
     eval_parser.set_defaults(func=start_eval_worker)
 
