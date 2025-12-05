@@ -14,31 +14,42 @@
 # GLOBAL TRAINING SETTINGS (applies to ALL workers)
 # =============================================================================
 
+
+game:
+  max_episode_steps: 500  # Max moves per game, safety to prevent infinite moves, todo; log metric: max_episode_limit_hit_count
+  short_game: True # starting position is a mid game position rather than complete beginning
+  simple_doubles: False # simple doubles only plays doubles to limit randomness
+
 mcts:
-  simulations: 100        # MCTS iterations per move (GLOBAL)
+  collect_simulations: 100        # MCTS iterations per move (GLOBAL)    changed to collect specifically
+  eval_simulations: 50         # added specifically for eval ,
   max_nodes: 400          # Maximum tree size (GLOBAL)
-  temperature: 1.0        # Exploration temperature
-  discount: -1.0          # -1 for two-player zero-sum games
+  warm_tree_simulations: 400     # MCTS sims for warm tree (0 = disabled)
+
+
+  # this is removed, we don't use a static temp, temperature: 0.5        # Exploration temperature                   
+  # this is no longer used , we use multi steps per player and this would breka and doesn't make sense. discount: -1.0          # -1 for two-player zero-sum games
   persist_tree: true      # Keep tree between moves
+  temperature_start: 0.8  # Initial exploration
+  temperature_end: 0.2    # Final exploitation
+  # batch_size this should be specific to the hardware, 
 
 training:
-  batch_size: 128         # Samples per training step
+  batch_size: 128         # Samples per training step, 
   learning_rate: 0.0003   # Adam learning rate
+  bearoff_value_weight: 2.0
+  lookup_learning_weight: 1.5         # this is for future if we have specific anchor positions with a confidence value AND policy
+  # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
+  # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
   l2_reg_lambda: 0.0001   # L2 regularization
-  games_per_batch: 10     # New games before training step
-  steps_per_game: 10      # Training steps per collected game
+  games_per_batch: 10     # New games before training step 
+  #steps_per_game: 10      # Training steps per collected game Removed .... we should train on all the steps
   surprise_weight: 0.5    # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_interval: 1000
   max_checkpoints: 5
   # Warm tree: pre-computed deep MCTS tree from initial position
   # Set to 0 to disable. Game workers use this as starting point.
-  warm_tree_simulations: 0     # MCTS sims for warm tree (0 = disabled)
-  warm_tree_max_nodes: 10000   # Max nodes in warm tree
 
-game:
-  max_episode_steps: 500  # Max moves per game
-  temperature_start: 1.0  # Initial exploration
-  temperature_end: 0.2    # Final exploitation
 
 # =============================================================================
 # GNU BACKGAMMON EVALUATION SETTINGS
@@ -58,6 +69,7 @@ gnubg:
 
 redis:
   host: "100.105.50.111"  # Head node (Tailscale IP)
+  host_local: "192.168.20.40"  # LAN fallback
   port: 6379
   password: "bgai-password"
   buffer_capacity: 100000   # Max experiences

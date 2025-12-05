@@ -189,7 +189,7 @@ def get_coordinator_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'redis_password': redis.get('password'),
         'heartbeat_timeout': coord.get('heartbeat_timeout', 30.0),
         'heartbeat_interval': coord.get('heartbeat_interval', 10.0),
-        'mcts_simulations': mcts.get('simulations', 100),
+        'mcts_simulations': mcts.get('collect_simulations', mcts.get('simulations', 100)),
         'mcts_max_nodes': mcts.get('max_nodes', 400),
         'train_batch_size': training.get('batch_size', 128),
         'game_batch_size': config.get('game', {}).get('batch_size', 16),
@@ -228,22 +228,25 @@ def get_game_worker_config(
     else:
         batch_size = device_cfg.get('game_batch_size', game.get('batch_size', 16))
 
-    # Temperature schedule: start high for exploration, decay to low for exploitation
-    # If temperature_start/end are defined, use schedule; otherwise use static temperature
-    temp_start = game.get('temperature_start')
-    temp_end = game.get('temperature_end')
-    static_temp = mcts.get('temperature', 1.0)
+    # Temperature schedule: now in mcts section
+    # start high for exploration, decay to low for exploitation
+    temp_start = mcts.get('temperature_start')
+    temp_end = mcts.get('temperature_end')
 
     return {
         'batch_size': batch_size,
-        'num_simulations': mcts.get('simulations', 100),
+        # collect_simulations is used for game generation (was just 'simulations')
+        'num_simulations': mcts.get('collect_simulations', mcts.get('simulations', 100)),
         'max_nodes': mcts.get('max_nodes', 400),
-        # Static temperature (used if no schedule defined)
-        'temperature': static_temp,
-        # Temperature schedule (None means use static)
+        # Temperature schedule (None means use static default of 1.0)
+        'temperature': 1.0,  # Default if no schedule
         'temperature_start': temp_start,
         'temperature_end': temp_end,
+        # Game settings
         'max_episode_steps': game.get('max_episode_steps', 500),
+        'short_game': game.get('short_game', True),
+        'simple_doubles': game.get('simple_doubles', False),
+        # Redis connection
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
@@ -304,6 +307,8 @@ def get_training_worker_config(
         elif config_head_local and config_head_local in mlflow_uri:
             mlflow_uri = mlflow_uri.replace(config_head_local, target_host)
 
+    mcts = config.get('mcts', {})
+
     return {
         'train_batch_size': batch_size,
         'learning_rate': training.get('learning_rate', 3e-4),
@@ -315,14 +320,23 @@ def get_training_worker_config(
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
         'games_per_training_batch': training.get('games_per_batch', 10),
-        'steps_per_game': training.get('steps_per_game', 10),
+        # steps_per_game removed - now trains on all available steps
         'surprise_weight': training.get('surprise_weight', 0.5),
-        # Warm tree configuration (pre-computed MCTS tree from initial position)
-        'warm_tree_simulations': training.get('warm_tree_simulations', 0),
-        'warm_tree_max_nodes': training.get('warm_tree_max_nodes', 10000),
+        # Bearoff/endgame weights
+        'bearoff_value_weight': training.get('bearoff_value_weight', 2.0),
+        'lookup_learning_weight': training.get('lookup_learning_weight', 1.5),
+        # Warm tree configuration (now in mcts section)
+        'warm_tree_simulations': mcts.get('warm_tree_simulations', 0),
+        'warm_tree_max_nodes': mcts.get('warm_tree_max_nodes', 10000),
         # MLFlow tracking
         'mlflow_tracking_uri': mlflow_uri,
         'mlflow_experiment_name': mlflow.get('experiment_name', 'bgai-training'),
+        # Pass full config sections for MLflow param logging
+        'mcts': mcts,
+        'game': config.get('game', {}),
+        'network': config.get('network', {}),
+        'redis': redis,
+        'gnubg': config.get('gnubg', {}),
     }
 
 
@@ -382,7 +396,8 @@ def get_eval_worker_config(
 
     return {
         'batch_size': batch_size,
-        'num_simulations': mcts.get('simulations', 100),
+        # eval_simulations is used for evaluation (can be different from collect)
+        'num_simulations': mcts.get('eval_simulations', mcts.get('collect_simulations', mcts.get('simulations', 100))),
         'max_nodes': mcts.get('max_nodes', 400),
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
@@ -396,16 +411,22 @@ def get_eval_worker_config(
 def print_config_summary(config: Dict[str, Any], device_type: str):
     """Print a summary of the loaded configuration."""
     mcts = config.get('mcts', {})
+    game = config.get('game', {})
     device_cfg = get_device_config(config, device_type)
     redis_host = detect_redis_host(config)
     redis_port = config.get('redis', {}).get('port', 6379)
 
+    collect_sims = mcts.get('collect_simulations', mcts.get('simulations', 100))
+    eval_sims = mcts.get('eval_simulations', collect_sims)
+
     print(f"\n=== Configuration Summary ===")
     print(f"Device type: {device_type}")
     print(f"Redis host: {redis_host}:{redis_port} (auto-detected)")
-    print(f"MCTS simulations: {mcts.get('simulations', 100)} (global)")
-    print(f"MCTS max nodes: {mcts.get('max_nodes', 400)} (global)")
-    print(f"Game batch size: {device_cfg.get('game_batch_size', 'default')}")
-    print(f"Train batch size: {device_cfg.get('train_batch_size', 'default')}")
-    print(f"Eval batch size: {device_cfg.get('eval_batch_size', 'default')}")
+    print(f"MCTS collect sims: {collect_sims}, eval sims: {eval_sims}")
+    print(f"MCTS max nodes: {mcts.get('max_nodes', 400)}")
+    print(f"Temperature: {mcts.get('temperature_start', 0.8)} -> {mcts.get('temperature_end', 0.2)}")
+    print(f"Game: short_game={game.get('short_game', True)}, simple_doubles={game.get('simple_doubles', False)}")
+    print(f"Batch sizes: game={device_cfg.get('game_batch_size', 'default')}, "
+          f"train={device_cfg.get('train_batch_size', 'default')}, "
+          f"eval={device_cfg.get('eval_batch_size', 'default')}")
     print()

@@ -212,7 +212,9 @@ class TrainingWorker(BaseWorker):
         # Training triggers after this many new games collected
         self.games_per_training_batch = self.config.get('games_per_training_batch', 10)
         # Number of training steps to run per collected game
-        self.steps_per_game = self.config.get('steps_per_game', 10)
+        # Default high to train on most experiences (avg game ~60 moves / batch_size)
+        # Set to 0 to auto-calculate based on buffer size
+        self.steps_per_game = self.config.get('steps_per_game', 50)
 
         # Surprise-weighted sampling configuration
         # 0 = uniform sampling, 1 = fully surprise-weighted
@@ -464,17 +466,60 @@ class TrainingWorker(BaseWorker):
                 print(f"Worker {self.worker_id}: Started MLflow run {run_id} (system metrics enabled)")
                 is_new_run = True
 
-            # Log configuration parameters for new runs
+            # Log ALL configuration parameters for new runs
+            # MLflow allows comparing params between runs in the UI
             if is_new_run:
+                # Training params
                 mlflow.log_params({
                     'train_batch_size': self.train_batch_size,
                     'learning_rate': self.learning_rate,
                     'l2_reg_lambda': self.l2_reg_lambda,
                     'games_per_training_batch': self.games_per_training_batch,
-                    'steps_per_game': self.steps_per_game,
                     'surprise_weight': self.surprise_weight,
                     'min_buffer_size': self.min_buffer_size,
                     'checkpoint_interval': self.checkpoint_interval,
+                    # Bearoff/endgame params
+                    'use_bearoff_values': self.use_bearoff_values,
+                    'bearoff_value_weight': self.bearoff_value_weight,
+                    'lookup_learning_weight': self.config.get('lookup_learning_weight', 1.5),
+                    # Warm tree params (now from mcts section)
+                    'warm_tree_simulations': self.warm_tree_simulations,
+                    'warm_tree_max_nodes': self.warm_tree_max_nodes,
+                })
+                # Log MCTS and game params from config (may not be set on training worker)
+                mcts_config = self.config.get('mcts', {})
+                game_config = self.config.get('game', {})
+                network_config = self.config.get('network', {})
+                redis_config = self.config.get('redis', {})
+                gnubg_config = self.config.get('gnubg', {})
+                mlflow.log_params({
+                    # MCTS params (used by game workers)
+                    'mcts_collect_simulations': mcts_config.get('collect_simulations', mcts_config.get('simulations', 100)),
+                    'mcts_eval_simulations': mcts_config.get('eval_simulations', 50),
+                    'mcts_max_nodes': mcts_config.get('max_nodes', 400),
+                    'mcts_persist_tree': mcts_config.get('persist_tree', True),
+                    # Temperature schedule (now in mcts section)
+                    'mcts_temperature_start': mcts_config.get('temperature_start', 0.8),
+                    'mcts_temperature_end': mcts_config.get('temperature_end', 0.2),
+                    # Game params
+                    'max_episode_steps': game_config.get('max_episode_steps', 500),
+                    'short_game': game_config.get('short_game', True),
+                    'simple_doubles': game_config.get('simple_doubles', False),
+                    # Network architecture
+                    'network_hidden_dim': network_config.get('hidden_dim', 256),
+                    'network_num_blocks': network_config.get('num_blocks', 6),
+                })
+                # Redis buffer settings (affects data retention)
+                mlflow.log_params({
+                    'buffer_capacity': redis_config.get('buffer_capacity', 100000),
+                    'episode_capacity': redis_config.get('episode_capacity', 5000),
+                })
+                # GNUBG evaluation settings (for eval workers)
+                mlflow.log_params({
+                    'gnubg_ply': gnubg_config.get('ply', 2),
+                    'gnubg_shortcuts': gnubg_config.get('shortcuts', 0),
+                    'gnubg_osdb': gnubg_config.get('osdb', 1),
+                    'gnubg_move_filters': str(gnubg_config.get('move_filters', [8, 4, 2, 2])),
                 })
 
         except Exception as e:
@@ -939,10 +984,10 @@ class TrainingWorker(BaseWorker):
             metrics['bearoff_count'] = bearoff_count
             metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
 
-            # Compute separate value losses for bearoff vs non-bearoff positions
+            # Compute separate losses for bearoff vs non-bearoff positions
             is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
             if bearoff_count > 0:
-                # Get value predictions for the batch (no grad computation)
+                # Get predictions for the batch (no grad computation)
                 pred_policy, pred_value = self._train_state.apply_fn(
                     {'params': self._train_state.params},
                     x=jax_batch.observation_nn,
@@ -950,26 +995,45 @@ class TrainingWorker(BaseWorker):
                 )
                 pred_value = pred_value.squeeze()
 
+                # Mask invalid actions in policy for softmax
+                pred_policy = jnp.where(
+                    jax_batch.policy_mask,
+                    pred_policy,
+                    jnp.finfo(jnp.float32).min
+                )
+
                 # Get target values
                 current_player = jax_batch.cur_player_id
                 target_value = jax_batch.reward[jnp.arange(jax_batch.reward.shape[0]), current_player]
 
-                # Compute squared errors
-                squared_errors = (pred_value - target_value) ** 2
+                # Compute per-sample value squared errors
+                value_squared_errors = (pred_value - target_value) ** 2
 
-                # Bearoff value loss (MSE for bearoff positions only)
+                # Compute per-sample policy cross-entropy
+                policy_ce = optax.softmax_cross_entropy(pred_policy, jax_batch.policy_weights)
+
                 bearoff_mask_float = is_bearoff_mask.astype(jnp.float32)
-                bearoff_value_loss = jnp.sum(squared_errors * bearoff_mask_float) / max(bearoff_count, 1)
-                metrics['bearoff_value_loss'] = float(bearoff_value_loss)
-
-                # Non-bearoff value loss
                 non_bearoff_count = total_count - bearoff_count
                 non_bearoff_mask_float = (1.0 - bearoff_mask_float)
+
+                # Bearoff value loss (MSE for bearoff positions only)
+                bearoff_value_loss = jnp.sum(value_squared_errors * bearoff_mask_float) / max(bearoff_count, 1)
+                metrics['bearoff_value_loss'] = float(bearoff_value_loss)
+
+                # Bearoff policy loss (cross-entropy for bearoff positions only)
+                bearoff_policy_loss = jnp.sum(policy_ce * bearoff_mask_float) / max(bearoff_count, 1)
+                metrics['bearoff_policy_loss'] = float(bearoff_policy_loss)
+
+                # Non-bearoff value loss
                 if non_bearoff_count > 0:
-                    non_bearoff_value_loss = jnp.sum(squared_errors * non_bearoff_mask_float) / non_bearoff_count
+                    non_bearoff_value_loss = jnp.sum(value_squared_errors * non_bearoff_mask_float) / non_bearoff_count
                     metrics['non_bearoff_value_loss'] = float(non_bearoff_value_loss)
+                    # Non-bearoff policy loss
+                    non_bearoff_policy_loss = jnp.sum(policy_ce * non_bearoff_mask_float) / non_bearoff_count
+                    metrics['non_bearoff_policy_loss'] = float(non_bearoff_policy_loss)
                 else:
                     metrics['non_bearoff_value_loss'] = 0.0
+                    metrics['non_bearoff_policy_loss'] = 0.0
 
                 # Update cumulative stats
                 self._training_stats.cumulative_bearoff_value_loss += float(bearoff_value_loss) * bearoff_count
@@ -977,7 +1041,9 @@ class TrainingWorker(BaseWorker):
             else:
                 # No bearoff positions - all are non-bearoff
                 metrics['bearoff_value_loss'] = 0.0
+                metrics['bearoff_policy_loss'] = 0.0
                 metrics['non_bearoff_value_loss'] = metrics.get('value_loss', 0.0)
+                metrics['non_bearoff_policy_loss'] = metrics.get('policy_loss', 0.0)
 
             # Update experience counts
             self._training_stats.bearoff_experiences += bearoff_count
@@ -1184,38 +1250,32 @@ class TrainingWorker(BaseWorker):
             elapsed = time.time() - start_time
             overall_steps_per_sec = self._total_steps / max(elapsed, 0.001)
 
-            # Log to MLflow
+            # Log to MLflow - ordered by importance for ML dashboard
+            # Priority: overall loss > value/policy > bearoff losses
+
+            # Compute overall loss (sum of value + policy, unweighted for interpretability)
+            value_loss = batch_metrics.get('non_bearoff_value_loss', batch_metrics.get('value_loss', 0))
+            policy_loss = batch_metrics.get('non_bearoff_policy_loss', batch_metrics.get('policy_loss', 0))
+            overall_loss = value_loss + policy_loss
+
             mlflow_metrics = {
-                'loss': batch_metrics.get('loss', 0),
-                'policy_loss': batch_metrics.get('policy_loss', 0),
-                'value_loss': batch_metrics.get('value_loss', 0),
-                'batch_steps': batch_metrics.get('batch_steps', 0),
-                'batch_duration': batch_metrics.get('batch_duration', 0),
+                # 1. Overall loss - single number to track training progress
+                'loss': overall_loss,
+                # 2. Core losses (non-bearoff = main game positions)
+                'value_loss': value_loss,
+                'policy_loss': policy_loss,
+                # 3. Bearoff-specific losses (endgame positions with known-perfect values)
+                'bearoff_value_loss': batch_metrics.get('bearoff_value_loss', 0),
+                'bearoff_policy_loss': batch_metrics.get('bearoff_policy_loss', 0),
+                # 4. Training context
+                'bearoff_train_pct': batch_metrics.get('bearoff_pct', 0),
                 'steps_per_sec': batch_metrics.get('steps_per_sec', 0),
-                'overall_steps_per_sec': overall_steps_per_sec,
+                'total_train_steps': self._total_steps,
                 'buffer_size': buffer_size,
                 'total_games': current_games,
+                'games_this_batch': new_games,
                 'model_version': self.current_model_version,
             }
-
-            # Add bearoff metrics if available
-            if 'bearoff_pct' in batch_metrics:
-                mlflow_metrics['bearoff_pct'] = batch_metrics.get('bearoff_pct', 0)
-                mlflow_metrics['bearoff_count'] = batch_metrics.get('bearoff_count', 0)
-                # Add separate value loss metrics for bearoff vs non-bearoff
-                mlflow_metrics['bearoff_value_loss'] = batch_metrics.get('bearoff_value_loss', 0)
-                mlflow_metrics['non_bearoff_value_loss'] = batch_metrics.get('non_bearoff_value_loss', 0)
-                # Compute overall bearoff percentage
-                total_bearoff = self._training_stats.bearoff_experiences
-                total_non_bearoff = self._training_stats.non_bearoff_experiences
-                total_exp = total_bearoff + total_non_bearoff
-                if total_exp > 0:
-                    mlflow_metrics['bearoff_pct_overall'] = 100.0 * total_bearoff / total_exp
-                # Add cumulative average value losses
-                if self._training_stats.bearoff_value_loss_count > 0:
-                    mlflow_metrics['bearoff_value_loss_avg'] = self._training_stats.avg_bearoff_value_loss
-                if self._training_stats.non_bearoff_value_loss_count > 0:
-                    mlflow_metrics['non_bearoff_value_loss_avg'] = self._training_stats.avg_non_bearoff_value_loss
 
             self._log_mlflow_metrics(mlflow_metrics, step=self._total_steps)
 
