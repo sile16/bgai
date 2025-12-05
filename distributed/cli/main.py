@@ -53,8 +53,13 @@ def configure_gpu_fraction(num_gpus: float) -> None:
     Args:
         num_gpus: Fraction of GPU to use (0.0-1.0).
                   Use 0.5 to share GPU between two processes.
+                  Use 0 to force CPU-only mode.
     """
-    if num_gpus < 1.0:
+    if num_gpus == 0:
+        # Force CPU-only mode - don't use GPU at all
+        os.environ['JAX_PLATFORMS'] = 'cpu'
+        print("Forcing CPU-only mode (JAX_PLATFORMS=cpu)")
+    elif num_gpus < 1.0:
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(num_gpus)
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
         print(f"GPU memory fraction set to {num_gpus}")
