@@ -28,7 +28,7 @@ from ..serialization import (
     deserialize_warm_tree,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
 
 
 class GameWorker(BaseWorker):
@@ -556,6 +556,11 @@ class GameWorker(BaseWorker):
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(1)
+
+        # Game worker is always in collecting phase when running
+        metrics.worker_phase.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(WorkerPhase.COLLECTING)
 
         print(f"Worker {self.worker_id}: Starting game collection loop...")
 

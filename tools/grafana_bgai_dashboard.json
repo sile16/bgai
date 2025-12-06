@@ -207,6 +207,133 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "dark-gray", "index": 0, "text": "Idle" } }, "type": "value" },
+            { "options": { "1": { "color": "green", "index": 1, "text": "Collecting" } }, "type": "value" },
+            { "options": { "2": { "color": "blue", "index": 2, "text": "Training" } }, "type": "value" },
+            { "options": { "3": { "color": "orange", "index": 3, "text": "Warm Tree" } }, "type": "value" },
+            { "options": { "4": { "color": "purple", "index": 4, "text": "Checkpoint" } }, "type": "value" },
+            { "options": { "5": { "color": "yellow", "index": 5, "text": "Sampling" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "dark-gray", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 5 },
+      "id": 200,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "expr": "bgai_worker_phase{worker_type=\"training\"}",
+          "legendFormat": "Training Worker",
+          "refId": "A"
+        }
+      ],
+      "title": "Training Worker Phase",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "dark-gray", "index": 0, "text": "Idle" } }, "type": "value" },
+            { "options": { "1": { "color": "green", "index": 1, "text": "Collecting" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "dark-gray", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 5 },
+      "id": 201,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "expr": "bgai_worker_phase{worker_type=\"game\"}",
+          "legendFormat": "{{ worker_id }}",
+          "refId": "A"
+        }
+      ],
+      "title": "Game Workers Phase",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [
+            { "options": { "0": { "index": 0, "text": "Idle" } }, "type": "value" },
+            { "options": { "1": { "index": 1, "text": "Collecting" } }, "type": "value" },
+            { "options": { "2": { "index": 2, "text": "Training" } }, "type": "value" },
+            { "options": { "3": { "index": 3, "text": "Warm Tree" } }, "type": "value" },
+            { "options": { "4": { "index": 4, "text": "Checkpoint" } }, "type": "value" },
+            { "options": { "5": { "index": 5, "text": "Sampling" } }, "type": "value" }
+          ],
+          "max": 5,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 5 },
+      "id": 202,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "bgai_worker_phase",
+          "legendFormat": "{{ worker_id }}",
+          "refId": "A"
+        }
+      ],
+      "title": "Worker Phase Timeline",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": {
             "axisCenteredZero": false,
@@ -344,32 +471,32 @@
       },
       "targets": [
         {
-          "expr": "bgai_value_loss_per_outcome{outcome=\"win\"}",
+          "expr": "max(bgai_value_loss_per_outcome{outcome=\"win\"})",
           "legendFormat": "Win",
           "refId": "A"
         },
         {
-          "expr": "bgai_value_loss_per_outcome{outcome=\"gammon_win\"}",
+          "expr": "max(bgai_value_loss_per_outcome{outcome=\"gammon_win\"})",
           "legendFormat": "Gammon Win",
           "refId": "B"
         },
         {
-          "expr": "bgai_value_loss_per_outcome{outcome=\"backgammon_win\"}",
+          "expr": "max(bgai_value_loss_per_outcome{outcome=\"backgammon_win\"})",
           "legendFormat": "Backgammon Win",
           "refId": "C"
         },
         {
-          "expr": "bgai_value_loss_per_outcome{outcome=\"loss\"}",
+          "expr": "max(bgai_value_loss_per_outcome{outcome=\"loss\"})",
           "legendFormat": "Loss",
           "refId": "D"
         },
         {
-          "expr": "bgai_value_loss_per_outcome{outcome=\"gammon_loss\"}",
+          "expr": "max(bgai_value_loss_per_outcome{outcome=\"gammon_loss\"})",
           "legendFormat": "Gammon Loss",
           "refId": "E"
         },
         {
-          "expr": "bgai_value_loss_per_outcome{outcome=\"backgammon_loss\"}",
+          "expr": "max(bgai_value_loss_per_outcome{outcome=\"backgammon_loss\"})",
           "legendFormat": "Backgammon Loss",
           "refId": "F"
         }
@@ -417,22 +544,22 @@
       },
       "targets": [
         {
-          "expr": "bgai_predicted_outcome_prob{outcome=\"win\"}",
+          "expr": "max(bgai_predicted_outcome_prob{outcome=\"win\"})",
           "legendFormat": "Pred Win",
           "refId": "A"
         },
         {
-          "expr": "bgai_target_outcome_prob{outcome=\"win\"}",
+          "expr": "max(bgai_target_outcome_prob{outcome=\"win\"})",
           "legendFormat": "Target Win",
           "refId": "B"
         },
         {
-          "expr": "bgai_predicted_outcome_prob{outcome=\"loss\"}",
+          "expr": "max(bgai_predicted_outcome_prob{outcome=\"loss\"})",
           "legendFormat": "Pred Loss",
           "refId": "C"
         },
         {
-          "expr": "bgai_target_outcome_prob{outcome=\"loss\"}",
+          "expr": "max(bgai_target_outcome_prob{outcome=\"loss\"})",
           "legendFormat": "Target Loss",
           "refId": "D"
         }
@@ -480,22 +607,22 @@
       },
       "targets": [
         {
-          "expr": "bgai_predicted_outcome_prob{outcome=\"gammon_win\"}",
+          "expr": "max(bgai_predicted_outcome_prob{outcome=\"gammon_win\"})",
           "legendFormat": "Pred Gammon Win",
           "refId": "A"
         },
         {
-          "expr": "bgai_target_outcome_prob{outcome=\"gammon_win\"}",
+          "expr": "max(bgai_target_outcome_prob{outcome=\"gammon_win\"})",
           "legendFormat": "Target Gammon Win",
           "refId": "B"
         },
         {
-          "expr": "bgai_predicted_outcome_prob{outcome=\"gammon_loss\"}",
+          "expr": "max(bgai_predicted_outcome_prob{outcome=\"gammon_loss\"})",
           "legendFormat": "Pred Gammon Loss",
           "refId": "C"
         },
         {
-          "expr": "bgai_target_outcome_prob{outcome=\"gammon_loss\"}",
+          "expr": "max(bgai_target_outcome_prob{outcome=\"gammon_loss\"})",
           "legendFormat": "Target Gammon Loss",
           "refId": "D"
         }
@@ -543,12 +670,12 @@
       },
       "targets": [
         {
-          "expr": "bgai_value_accuracy",
+          "expr": "max(bgai_value_accuracy)",
           "legendFormat": "Value Accuracy",
           "refId": "A"
         },
         {
-          "expr": "bgai_policy_accuracy",
+          "expr": "max(bgai_policy_accuracy)",
           "legendFormat": "Policy Accuracy",
           "refId": "B"
         }
@@ -582,7 +709,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_value_accuracy",
+          "expr": "max(bgai_value_accuracy)",
           "legendFormat": "Value Accuracy",
           "refId": "A"
         }
@@ -616,7 +743,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_policy_accuracy",
+          "expr": "max(bgai_policy_accuracy)",
           "legendFormat": "Policy Accuracy",
           "refId": "A"
         }
@@ -648,7 +775,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_loss{loss_type=\"value\"}",
+          "expr": "max(bgai_training_loss{loss_type=\"value\"})",
           "legendFormat": "Value Loss",
           "refId": "A"
         }
@@ -680,7 +807,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_loss{loss_type=\"policy\"}",
+          "expr": "max(bgai_training_loss{loss_type=\"policy\"})",
           "legendFormat": "Policy Loss",
           "refId": "A"
         }
@@ -920,7 +1047,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_games_per_minute",
+          "expr": "max by (worker_id) (bgai_games_per_minute)",
           "legendFormat": "{{worker_id}}",
           "refId": "A"
         }
@@ -966,7 +1093,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_collection_steps_per_second",
+          "expr": "max by (worker_id) (bgai_collection_steps_per_second)",
           "legendFormat": "{{worker_id}}",
           "refId": "A"
         }
@@ -1368,7 +1495,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_cpu_percent",
+          "expr": "max by (host) (bgai_cpu_percent)",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -1416,7 +1543,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_memory_percent",
+          "expr": "max by (host) (bgai_memory_percent)",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -1464,7 +1591,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_gpu_utilization_percent",
+          "expr": "max by (host, gpu_index, gpu_name) (bgai_gpu_utilization_percent)",
           "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
@@ -1512,7 +1639,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_gpu_memory_percent",
+          "expr": "max by (host, gpu_index, gpu_name) (bgai_gpu_memory_percent)",
           "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
@@ -1558,7 +1685,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_gpu_temperature_celsius",
+          "expr": "max by (host, gpu_index, gpu_name) (bgai_gpu_temperature_celsius)",
           "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
@@ -1604,7 +1731,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_gpu_power_watts",
+          "expr": "max by (host, gpu_index, gpu_name) (bgai_gpu_power_watts)",
           "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
@@ -1805,17 +1932,17 @@
       },
       "targets": [
         {
-          "expr": "bgai_eval_win_rate{eval_type=\"random\"}",
+          "expr": "max by (eval_type, model_version) (bgai_eval_win_rate{eval_type=\"random\"})",
           "legendFormat": "vs Random (v{{model_version}})",
           "refId": "A"
         },
         {
-          "expr": "bgai_eval_win_rate{eval_type=\"gnubg\"}",
+          "expr": "max by (eval_type, model_version) (bgai_eval_win_rate{eval_type=\"gnubg\"})",
           "legendFormat": "vs GNUBG (v{{model_version}})",
           "refId": "B"
         },
         {
-          "expr": "bgai_eval_win_rate{eval_type=\"self_play\"}",
+          "expr": "max by (eval_type, model_version) (bgai_eval_win_rate{eval_type=\"self_play\"})",
           "legendFormat": "Self-Play (v{{model_version}})",
           "refId": "C"
         }
@@ -1893,7 +2020,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_eval_win_rate{eval_type=\"random\"}",
+          "expr": "max(bgai_eval_win_rate{eval_type=\"random\"})",
           "legendFormat": "vs Random",
           "refId": "A"
         }
@@ -1925,7 +2052,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_eval_win_rate{eval_type=\"gnubg\"}",
+          "expr": "max(bgai_eval_win_rate{eval_type=\"gnubg\"})",
           "legendFormat": "vs GNUBG",
           "refId": "A"
         }
@@ -1957,7 +2084,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_eval_win_rate{eval_type=\"self_play\"}",
+          "expr": "max(bgai_eval_win_rate{eval_type=\"self_play\"})",
           "legendFormat": "Self-Play",
           "refId": "A"
         }
@@ -1989,7 +2116,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_eval_avg_game_length",
+          "expr": "max(bgai_eval_avg_game_length)",
           "legendFormat": "Avg Length",
           "refId": "A"
         }

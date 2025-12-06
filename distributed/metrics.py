@@ -60,6 +60,19 @@ except ImportError:
     HAS_TPU_MONITORING = False
 
 
+# =================================================================
+# Worker Phase Constants
+# =================================================================
+class WorkerPhase:
+    """Constants for worker phase tracking."""
+    IDLE = 0           # Waiting for work
+    COLLECTING = 1     # Game worker: collecting experiences via MCTS
+    TRAINING = 2       # Training worker: running gradient descent
+    WARM_TREE = 3      # Training worker: building warm tree with MCTS
+    CHECKPOINT = 4     # Training worker: saving checkpoint
+    SAMPLING = 5       # Training worker: sampling from replay buffer
+
+
 class BGAIMetrics:
     """Container for all BGAI training metrics."""
 
@@ -350,6 +363,23 @@ class BGAIMetrics:
             'bgai_worker_status',
             'Worker status (1=running, 0=stopped)',
             ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        # Worker phase tracking for pipeline visibility
+        # Phase values: 0=idle, 1=collecting, 2=training, 3=warm_tree_building, 4=checkpointing
+        self.worker_phase = Gauge(
+            'bgai_worker_phase',
+            'Current worker phase (0=idle, 1=collecting, 2=training, 3=warm_tree, 4=checkpoint)',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.phase_duration_seconds = Histogram(
+            'bgai_phase_duration_seconds',
+            'Duration of each worker phase',
+            ['worker_id', 'phase'],
+            buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300],
             registry=self.registry,
         )
 

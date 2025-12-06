@@ -177,7 +177,7 @@ from ..serialization import (
     serialize_warm_tree,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
 
 
 @dataclass
@@ -921,6 +921,12 @@ class TrainingWorker(BaseWorker):
             return False
 
         try:
+            # Set warm tree building phase
+            metrics = get_metrics()
+            metrics.worker_phase.labels(
+                worker_id=self.worker_id, worker_type='training'
+            ).set(WorkerPhase.WARM_TREE)
+
             start_time = time.time()
             print(f"Worker {self.worker_id}: Building warm tree ({self.warm_tree_simulations} sims)...")
 
@@ -961,6 +967,11 @@ class TrainingWorker(BaseWorker):
                 f"Worker {self.worker_id}: Warm tree built and pushed "
                 f"(v{self.current_model_version}, {tree_size_mb:.2f} MB, {duration:.1f}s)"
             )
+
+            # Record warm tree phase duration
+            metrics.phase_duration_seconds.labels(
+                worker_id=self.worker_id, phase='warm_tree'
+            ).observe(duration)
 
             return True
 
@@ -1372,10 +1383,36 @@ class TrainingWorker(BaseWorker):
 
         start_time = time.time()
         last_log_time = start_time
+        phase_start_time = start_time
+        current_phase = WorkerPhase.IDLE
+
+        def set_phase(phase: int, phase_name: str = None):
+            """Set worker phase and record duration of previous phase."""
+            nonlocal phase_start_time, current_phase
+            # Record duration of previous phase
+            phase_duration = time.time() - phase_start_time
+            if current_phase != WorkerPhase.IDLE:  # Don't record idle durations
+                phase_names = {
+                    WorkerPhase.TRAINING: 'training',
+                    WorkerPhase.WARM_TREE: 'warm_tree',
+                    WorkerPhase.CHECKPOINT: 'checkpoint',
+                    WorkerPhase.SAMPLING: 'sampling',
+                }
+                prev_phase_name = phase_names.get(current_phase, 'unknown')
+                metrics.phase_duration_seconds.labels(
+                    worker_id=self.worker_id, phase=prev_phase_name
+                ).observe(phase_duration)
+            # Set new phase
+            current_phase = phase
+            phase_start_time = time.time()
+            metrics.worker_phase.labels(
+                worker_id=self.worker_id, worker_type='training'
+            ).set(phase)
 
         # Initialize tracking
         self._training_stats.games_at_last_train = self._get_current_games_count()
         self._training_stats.experiences_at_last_train = self.buffer.get_size()
+        set_phase(WorkerPhase.IDLE)
 
         while self.running:
             # Check if training is active
@@ -1432,11 +1469,17 @@ class TrainingWorker(BaseWorker):
                 f"{new_games} new games -> {target_steps} training steps"
             )
 
+            # Set training phase
+            set_phase(WorkerPhase.TRAINING)
+
             # Run training epoch (game collection continues in parallel)
             batch_metrics = self._run_training_batch(target_steps)
 
             # Push updated weights to Redis
             self._push_weights_to_redis()
+
+            # Back to idle after training completes
+            set_phase(WorkerPhase.IDLE)
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games
