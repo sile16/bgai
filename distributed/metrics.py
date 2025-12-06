@@ -500,6 +500,7 @@ class BGAIMetrics:
 _metrics: Optional[BGAIMetrics] = None
 _metrics_lock = threading.Lock()
 _server_started = False
+_server_port: Optional[int] = None
 
 
 def get_metrics() -> BGAIMetrics:
@@ -515,25 +516,27 @@ def get_metrics() -> BGAIMetrics:
         return _metrics
 
 
-def start_metrics_server(port: int = 9100) -> bool:
+def start_metrics_server(port: int = 9100) -> Optional[int]:
     """Start the Prometheus metrics HTTP server.
 
     Args:
         port: Port to serve metrics on.
 
     Returns:
-        True if server started, False if already running.
+        The actual port the server is running on, or None if failed to start.
+        Returns the existing port if server was already running.
     """
-    global _server_started
+    global _server_started, _server_port
     with _metrics_lock:
         if _server_started:
-            return False
+            return _server_port
 
         try:
             start_http_server(port)
             _server_started = True
+            _server_port = port
             print(f"Prometheus metrics server started on port {port}")
-            return True
+            return port
         except Exception as e:
             print(f"Failed to start metrics server on port {port}: {e}")
             # Try alternative ports
@@ -541,19 +544,21 @@ def start_metrics_server(port: int = 9100) -> bool:
                 try:
                     start_http_server(alt_port)
                     _server_started = True
+                    _server_port = alt_port
                     print(f"Prometheus metrics server started on port {alt_port}")
-                    return True
+                    return alt_port
                 except Exception:
                     continue
-            return False
+            return None
 
 
 def reset_metrics():
     """Reset the global metrics instance (for testing)."""
-    global _metrics, _server_started
+    global _metrics, _server_started, _server_port
     with _metrics_lock:
         _metrics = None
         _server_started = False
+        _server_port = None
 
 
 # =============================================================================

@@ -422,7 +422,11 @@ class GameWorker(BaseWorker):
                 eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
                 value_pred = float(self._evaluator.get_value(eval_state_i))
                 cur_player = int(metadatas.cur_player_id[i])
-                value_pred_p0 = value_pred if cur_player == 0 else -value_pred
+                # get_value returns equity in [0, 1] from current player's perspective
+                # Convert to player 0's perspective for consistent surprise scoring
+                # For player 0: use value directly (P(p0 wins))
+                # For player 1: use 1 - value (opponent's win prob = our loss prob)
+                value_pred_p0 = value_pred if cur_player == 0 else 1.0 - value_pred
                 state['episode_value_preds'][i].append(value_pred_p0)
 
             terminated = terminateds[i]
@@ -524,11 +528,14 @@ class GameWorker(BaseWorker):
             print(f"Worker {self.worker_id}: Static temperature: {self.temperature:.2f}")
 
         # Start Prometheus metrics server
-        metrics_port = self.config.get('metrics_port', 9100)
-        start_metrics_server(metrics_port)
+        metrics_port_config = self.config.get('metrics_port', 9100)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint for dynamic discovery
+        # Register metrics endpoint for dynamic discovery (use actual bound port)
         try:
             register_metrics_endpoint(
                 self.buffer.redis,

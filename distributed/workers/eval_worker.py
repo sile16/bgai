@@ -912,11 +912,14 @@ class EvalWorker(BaseWorker):
             self._log_mlflow_gnubg_params()
 
         # Start Prometheus metrics server
-        metrics_port = self.config.get('metrics_port', 9300)
-        start_metrics_server(metrics_port)
+        metrics_port_config = self.config.get('metrics_port', 9300)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint
+        # Register metrics endpoint (use actual bound port)
         register_metrics_endpoint(
             self.buffer.redis,
             worker_id=self.worker_id,

@@ -911,6 +911,10 @@ class TrainingWorker(BaseWorker):
         # Apply gradients
         new_state = train_state.apply_gradients(grads=grads)
 
+        # Update batch_stats if present (for BatchNorm layers)
+        if updates and 'batch_stats' in updates and hasattr(new_state, 'batch_stats'):
+            new_state = new_state.replace(batch_stats=updates['batch_stats'])
+
         # Add loss to metrics
         metrics = {**metrics, 'loss': loss}
 
@@ -947,6 +951,10 @@ class TrainingWorker(BaseWorker):
 
         # Apply gradients
         new_state = train_state.apply_gradients(grads=grads)
+
+        # Update batch_stats if present (for BatchNorm layers)
+        if updates and 'batch_stats' in updates and hasattr(new_state, 'batch_stats'):
+            new_state = new_state.replace(batch_stats=updates['batch_stats'])
 
         # Add loss to metrics
         metrics = {**metrics, 'loss': loss}
@@ -1200,11 +1208,14 @@ class TrainingWorker(BaseWorker):
         self._setup_mlflow()
 
         # Start Prometheus metrics server
-        metrics_port = self.config.get('metrics_port', 9200)
-        start_metrics_server(metrics_port)
+        metrics_port_config = self.config.get('metrics_port', 9200)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint for dynamic discovery
+        # Register metrics endpoint for dynamic discovery (use actual bound port)
         try:
             register_metrics_endpoint(
                 self.buffer.redis,
