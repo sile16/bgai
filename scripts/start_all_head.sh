@@ -89,12 +89,16 @@ export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
 # =============================================================================
-# JAX memory configuration - prevent first process from grabbing all GPU RAM
-# Based on benchmarks: game worker ~2GB, training worker ~2GB
-# Set to 25% each (6GB) for headroom (24GB total GPU)
+# JAX memory configuration - use cudaMallocAsync allocator for dynamic memory
+# This replaces the BFC preallocated pool with a growing memory pool.
+# Benefits:
+#   - No need for XLA_PYTHON_CLIENT_MEM_FRACTION
+#   - Multiple workers can share GPU memory dynamically
+#   - Enables jax.devices()[0].memory_stats() for per-worker memory tracking
+# See: https://docs.jax.dev/en/latest/gpu_memory_allocation.html
 # =============================================================================
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25
-echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24GB GPU)"
+export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
+echo "JAX memory allocator: cuda_async (dynamic allocation, no preallocation)"
 
 # =============================================================================
 # Disable XLA command buffers to prevent CUDA graph OOM errors

@@ -436,6 +436,38 @@ class BGAIMetrics:
         )
 
         # =================================================================
+        # JAX Memory Metrics (per-worker, requires cuda_async allocator)
+        # These track actual JAX memory usage, not just GPU allocation
+        # =================================================================
+        self.jax_memory_bytes_in_use = Gauge(
+            'bgai_jax_memory_bytes_in_use',
+            'JAX memory currently in use (bytes)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.jax_memory_peak_bytes = Gauge(
+            'bgai_jax_memory_peak_bytes',
+            'JAX peak memory usage (bytes)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.jax_memory_bytes_limit = Gauge(
+            'bgai_jax_memory_bytes_limit',
+            'JAX memory limit (bytes)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.jax_memory_num_allocs = Gauge(
+            'bgai_jax_memory_num_allocs',
+            'Number of JAX memory allocations',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        # =================================================================
         # TPU Metrics (via libtpu SDK)
         # =================================================================
         self.tpu_duty_cycle_percent = Gauge(
@@ -1022,6 +1054,45 @@ class SystemMetricsCollector(threading.Thread):
                 print(f"Error collecting TPU metrics: {e}")
                 self._tpu_error_logged = True
 
+    def _collect_jax_memory_metrics(self, metrics: BGAIMetrics):
+        """Collect JAX memory metrics via device.memory_stats().
+
+        Requires XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async to get meaningful stats.
+        With the default BFC allocator, bytes_in_use will always be 0.
+        """
+        try:
+            import jax
+            devices = jax.devices()
+            if not devices:
+                return
+
+            # Get memory stats from primary device
+            device = devices[0]
+            stats = device.memory_stats()
+
+            if stats:
+                metrics.jax_memory_bytes_in_use.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('bytes_in_use', 0))
+
+                metrics.jax_memory_peak_bytes.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('peak_bytes_in_use', 0))
+
+                metrics.jax_memory_bytes_limit.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('bytes_limit', 0))
+
+                metrics.jax_memory_num_allocs.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('num_allocs', 0))
+
+        except Exception as e:
+            # Only log once to avoid spam
+            if not hasattr(self, '_jax_error_logged'):
+                print(f"Error collecting JAX memory metrics: {e}")
+                self._jax_error_logged = True
+
     def run(self):
         """Main collection loop."""
         # Initialize NVML if available
@@ -1041,6 +1112,7 @@ class SystemMetricsCollector(threading.Thread):
             try:
                 self._collect_cpu_metrics(metrics)
                 self._collect_gpu_metrics(metrics)
+                self._collect_jax_memory_metrics(metrics)
                 self._collect_tpu_metrics(metrics)
             except Exception as e:
                 print(f"Error in system metrics collection: {e}")
