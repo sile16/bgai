@@ -21,35 +21,29 @@ game:
   simple_doubles: False # simple doubles only plays doubles to limit randomness
 
 mcts:
-  collect_simulations: 100        # MCTS iterations per move (GLOBAL)    changed to collect specifically
+  collect_simulations: 100     # MCTS iterations per move (GLOBAL)    changed to collect specifically
   eval_simulations: 50         # added specifically for eval ,
-  max_nodes: 400          # Maximum tree size (GLOBAL)
-  warm_tree_simulations: 400     # MCTS sims for warm tree (0 = disabled)
-
-
-  # this is removed, we don't use a static temp, temperature: 0.5        # Exploration temperature                   
-  # this is no longer used , we use multi steps per player and this would breka and doesn't make sense. discount: -1.0          # -1 for two-player zero-sum games
-  persist_tree: true      # Keep tree between moves
-  temperature_start: 0.8  # Initial exploration
-  temperature_end: 0.2    # Final exploitation
-  # batch_size this should be specific to the hardware, 
+  max_nodes: 400               # Maximum tree size (GLOBAL)
+  warm_tree_simulations: 400   # MCTS sims for warm tree (0 = disabled)
+  persist_tree: true           # Keep tree between moves
+  temperature_start: 0.8       # Initial exploration
+  temperature_end: 0.2         
+  temperature_epochs:  50      # The number of epochs it takes to go from start to end, then we just stay at ending temp 
 
 training:
-  batch_size: 128         # Samples per training step, 
-  learning_rate: 0.0003   # Adam learning rate
-  bearoff_value_weight: 2.0
-  lookup_learning_weight: 1.5         # this is for future if we have specific anchor positions with a confidence value AND policy
+  batch_size: 128                  # Samples per training step, 
+  learning_rate: 0.0003            # Adam learning rate
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
-  l2_reg_lambda: 0.0001   # L2 regularization
-  games_per_batch: 10     # New games before training step 
-  #steps_per_game: 10      # Training steps per collected game Removed .... we should train on all the steps
-  surprise_weight: 0.5    # Blend of uniform (0) vs surprise-weighted (1) sampling
-  checkpoint_interval: 1000
+  bearoff_enabled: False           # disable bearoff DB completely
+  bearoff_value_weight: 2.0        # the learning rate multiplier for values pulled from bearoff db
+  lookup_enabled: False            # disables the lookup positions.
+  lookup_learning_weight: 1.5      # this is for future if we have specific anchor positions with value AND policy
+  l2_reg_lambda: 0.0001            # L2 regularization
+  games_per_epoch: 10              # New games before training step 
+  surprise_weight: 0.5             # Blend of uniform (0) vs surprise-weighted (1) sampling
+  checkpoint_epoch_interval: 5     # number of epochs berfore we write checkpoint to disk
   max_checkpoints: 5
-  # Warm tree: pre-computed deep MCTS tree from initial position
-  # Set to 0 to disable. Game workers use this as starting point.
-
 
 # =============================================================================
 # GNU BACKGAMMON EVALUATION SETTINGS
@@ -58,18 +52,18 @@ training:
 # Higher ply and more move filter candidates = stronger but slower evaluation.
 
 gnubg:
-  ply: 2                  # Search depth (0=fastest, 1=medium, 2=strongest)
+  ply: 1                  # Search depth (0=fastest, 1=medium, 2=strongest)
   shortcuts: 0            # Evaluation shortcuts (0=disabled, 1=faster but weaker)
   osdb: 1                 # One-sided bearoff database (0=disabled, 1=enabled)
-  move_filters: [8, 4, 2, 2]  # Candidates at each ply level
+  #  what is this? move_filters: [8, 4, 2, 2]  # Candidates at each ply level
 
 # =============================================================================
 # INFRASTRUCTURE
 # =============================================================================
 
 redis:
-  host: "100.105.50.111"  # Head node (Tailscale IP)
-  host_local: "192.168.20.40"  # LAN fallback
+  # use head host host: "100.105.50.111"  # Head node (Tailscale IP)
+  # use head host_local host_local: "192.168.20.40"  # LAN fallback
   port: 6379
   password: "bgai-password"
   buffer_capacity: 100000   # Max experiences
@@ -82,7 +76,8 @@ head:
 mlflow:
   # Use localhost since only the training worker on the head node needs MLFlow
   # This avoids DNS rebinding security issues with external IPs
-  tracking_uri: "http://localhost:5000"
+  # removed, use head host or head host_localtracking_uri: "http://localhost:5000"
+  port: 5000
   experiment_name: "bgai-training"
   artifact_location: "./mlruns"
 
@@ -99,6 +94,8 @@ network:
   hidden_dim: 256
   num_blocks: 6
   num_actions: 156          # Backgammon action space
+  # does this incorporate the new output value dimension size? 
+
 
 # =============================================================================
 # DEVICE-SPECIFIC BATCH SIZES
@@ -110,10 +107,12 @@ network:
 device_configs:
   cuda:
     # NVIDIA GPUs (RTX 4090, etc.)
-    game_batch_size: 64
+    game_batch_size: 256
+    game_gpu_memory_fraction: 0.5
     train_batch_size: 256
+    train_gpu_memory_fraction: 0.3
     eval_batch_size: 32
-    gpu_memory_fraction: 0.25  # Allow multiple workers per GPU
+    eval_gpu_memory_fraction: 0.1
 
   metal:
     # Apple Silicon (M1, M2, M3)
