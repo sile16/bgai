@@ -31,7 +31,7 @@ mcts:
   temperature_epochs:  50      # The number of epochs it takes to go from start to end, then we just stay at ending temp 
 
 training:
-  batch_size: 128                  # Samples per training step, 
+  batch_size: 512                  # Samples per training step, 
   learning_rate: 0.0003            # Adam learning rate
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.

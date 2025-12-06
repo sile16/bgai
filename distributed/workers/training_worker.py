@@ -1327,20 +1327,11 @@ class TrainingWorker(BaseWorker):
                 f"{new_games} new games -> {target_steps} training steps"
             )
 
-            # Pause game collection during training epoch (avoid GPU contention)
-            self.state.set_collection_paused(True)
-            print(f"Worker {self.worker_id}: Paused game collection for training epoch")
+            # Run training epoch (game collection continues in parallel)
+            batch_metrics = self._run_training_batch(target_steps)
 
-            try:
-                # Run training epoch
-                batch_metrics = self._run_training_batch(target_steps)
-
-                # Push updated weights to Redis
-                self._push_weights_to_redis()
-            finally:
-                # Resume game collection after training epoch
-                self.state.set_collection_paused(False)
-                print(f"Worker {self.worker_id}: Resumed game collection")
+            # Push updated weights to Redis
+            self._push_weights_to_redis()
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games
