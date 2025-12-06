@@ -1,0 +1,18 @@
+[package]
+name = "bearoff"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bearoff"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module", "abi3-py39"] }
+numpy = "0.20"
+ndarray = { version = "0.15", features = ["rayon"] }
+rayon = "1.7"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bkgm = "0.3"
