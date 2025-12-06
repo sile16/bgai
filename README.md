@@ -18,6 +18,8 @@ Backgammon AI based on Alpha Zero training methodology.
 - **MLflow Integration**: Eval metrics and GNUBG settings logged to MLflow
 - **Bearoff Detection Fix**: Corrected board index mapping for bearoff position detection
 - **Redis-only Architecture**: Removed Ray dependency - standalone Python workers
+- **Bearoff Generator**: New Rust/Pyo3 cubeful two-sided generator matching gnubg;
+  legacy Python generators and bundled gnubg sources were removed.
 
 ## Features
 

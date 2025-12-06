@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import math
 import jax
 import jax.numpy as jnp
 import chex
@@ -28,6 +29,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
+from bgai.endgame.packed_table import BearoffLookup, pack_upper, solve_size_to_n
 from core.training.loss_fns import az_default_loss_fn
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
@@ -128,7 +130,9 @@ class TrainingWorker(BaseWorker):
         # Bearoff/endgame table configuration
         self.use_bearoff_values = self.config.get('use_bearoff_values', True)
         self._bearoff_table = None
-        self._bearoff_table_np = None  # Keep table on CPU (too large for GPU)
+        # Keep table on CPU (too large for GPU). Stored as [win, gammon_win, loss, gammon_loss].
+        self._bearoff_table_np = None
+        self._bearoff_lookup: Optional[BearoffLookup] = None
         bearoff_table_path = self.config.get('bearoff_table_path')
         if bearoff_table_path is None:
             # Default path
@@ -139,16 +143,19 @@ class TrainingWorker(BaseWorker):
         if bearoff_table_path and self.use_bearoff_values:
             try:
                 # Load table but DON'T convert to JAX array (too large for GPU)
-                # We'll use numpy lookups instead
-                self._bearoff_table_np = np.load(bearoff_table_path)
+                # We'll use numpy lookups instead. Supports legacy (n, n) win-prob
+                # tables by expanding to the new (n, n, 4) format or packed upper.
+                self._bearoff_lookup, self._bearoff_table_np = self._load_bearoff_table(bearoff_table_path)
                 self._bearoff_table = True  # Flag indicating table is loaded
+                shape_str = self._bearoff_table_np.shape
+                size_gb = self._bearoff_table_np.nbytes / 1e9
                 print(f"Worker {self.worker_id}: Loaded bearoff table from {bearoff_table_path}")
-                print(f"Worker {self.worker_id}: Table shape: {self._bearoff_table_np.shape}, "
-                      f"size: {self._bearoff_table_np.nbytes / 1e9:.2f} GB")
+                print(f"Worker {self.worker_id}: Table shape: {shape_str}, size: {size_gb:.2f} GB")
             except Exception as e:
                 print(f"Worker {self.worker_id}: Failed to load bearoff table: {e}")
                 self._bearoff_table = None
                 self._bearoff_table_np = None
+                self._bearoff_lookup = None
 
         # Warm tree configuration
         # Number of MCTS simulations for warm tree (0 to disable)
@@ -198,45 +205,108 @@ class TrainingWorker(BaseWorker):
     # Bearoff/Endgame Value Methods
     # =========================================================================
 
+    def _load_bearoff_table(self, path: str) -> Tuple[BearoffLookup, np.ndarray]:
+        """Load bearoff table in packed or full form.
+
+        Normalizes to float32 and returns both the lookup wrapper and the
+        underlying numpy array (kept for size logging).
+        """
+        table = np.load(path, mmap_mode='r')
+        packed = False
+        n = None
+
+        if table.ndim == 1:
+            # Packed flat (entries*4) not supported
+            raise ValueError(f"Unexpected 1D bearoff table shape {table.shape}")
+
+        if table.ndim == 2 and table.shape[1] in (4, 7) and table.shape[0] != table.shape[1]:
+            # Packed upper: (entries, 4 or 7)
+            packed = True
+            n = solve_size_to_n(table.shape[0])
+            table = table.astype(np.float32, copy=False)
+            lookup = BearoffLookup(table, packed=True, n=n)
+            return lookup, table
+
+        if table.ndim == 2:
+            # Legacy file storing P(win) only. Assume no gammons in the table.
+            win = table.astype(np.float32, copy=False)
+            loss = 1.0 - win
+            zeros = np.zeros_like(win, dtype=np.float32)
+            equity = (2.0 * win - 1.0)  # cubeless equity
+            full = np.stack([win, zeros, loss, zeros, equity, equity, -equity], axis=-1)
+            n = full.shape[0]
+            lookup = BearoffLookup(full, packed=False, n=n)
+            return lookup, full
+
+        if table.ndim == 3 and table.shape[-1] in (4, 7):
+            n = table.shape[0]
+            lookup = BearoffLookup(table.astype(np.float32, copy=False), packed=False, n=n)
+            return lookup, table
+
+        raise ValueError(
+            f"Unexpected bearoff table shape {table.shape}; expected packed (entries,4|7), legacy (n,n), or full (n,n,4|7)"
+        )
+
     def _get_bearoff_value_np(self, board: np.ndarray, cur_player: int) -> float:
-        """Get perfect bearoff value from the table (numpy version).
+        """Get perfect bearoff equity from the table (numpy version).
+
+        Equity is scaled to [-1, 1] using cubeless points (no cube).
 
         Args:
             board: Board array of shape (28,)
             cur_player: Current player (0 for X, 1 for O)
 
         Returns:
-            Perfect value from current player's perspective
+            Equity from current player's perspective.
         """
         if self._bearoff_table_np is None:
             return 0.0
 
         # Extract X's home board (points 0-5)
-        # X's point 1 = pgx index 0, ..., X's point 6 = pgx index 5
         x_pos = np.maximum(0, board[0:6])
 
         # Extract O's home board (points 18-23, stored as negative)
-        # O's point 1 = pgx index 23, O's point 6 = pgx index 18
         # Flip the order so o_pos[0] = O's point closest to bear off
         o_pos = np.maximum(0, -board[23:17:-1])
 
-        # Look up in table using numpy indexing function
         from bgai.endgame.indexing import position_to_index_fast
+
         x_idx = position_to_index_fast(x_pos)
         o_idx = position_to_index_fast(o_pos)
 
-        # Table stores P(X wins | X to move)
-        # Full table format: table[x_idx, o_idx]
-        value_x_to_move = float(self._bearoff_table_np[x_idx, o_idx])
+        probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player)
+        p_win = probs[0]
+        p_gammon_win = probs[1]
+        p_gammon_loss = probs[3]
 
-        # If it's O's turn, the value is from O's perspective
-        # For simplicity, we return value from current player's perspective
-        # If cur_player == 0 (X), return value_x_to_move
-        # If cur_player == 1 (O), return 1 - value_x_to_move
-        if cur_player == 0:
-            return value_x_to_move
-        else:
-            return 1.0 - value_x_to_move
+        # Cubeless equity with gammons valued at 2 points
+        equity = (2.0 * p_win - 1.0) + (p_gammon_win - p_gammon_loss)
+        return float(equity)
+
+    def _get_bearoff_prob_vector(self, x_idx: int, o_idx: int, cur_player: int) -> np.ndarray:
+        """Return [win, gammon_win, loss, gammon_loss, (opt cube eq...)] for current player."""
+        if self._bearoff_lookup is None:
+            return np.zeros(4, dtype=np.float32)
+
+        return self._bearoff_lookup.probs_for_player(x_idx, o_idx, cur_player)
+
+    def _get_bearoff_target_probs(self, x_idx: int, o_idx: int, cur_player: int) -> np.ndarray:
+        """Get 6-way probability distribution for bearoff position.
+
+        Returns:
+            [single win, gammon win, backgammon win,
+             single loss, gammon loss, backgammon loss]
+        """
+        probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player)
+        win, gammon_win, loss, gammon_loss = probs
+        return np.array([
+            win - gammon_win,   # single win
+            gammon_win,         # gammon win
+            0.0,                # backgammon win (impossible in bearoff)
+            loss - gammon_loss, # single loss
+            gammon_loss,        # gammon loss
+            0.0,                # backgammon loss (impossible)
+        ], dtype=np.float32)
 
     def _apply_bearoff_values_to_batch(
         self,
@@ -262,10 +332,12 @@ class TrainingWorker(BaseWorker):
         obs_np = np.array(batch.observation_nn)
         cur_player_np = np.array(batch.cur_player_id)
         rewards_np = np.array(batch.reward)
+        from bgai.endgame.indexing import position_to_index_fast
 
         # Process each experience
         is_bearoff_list = []
         perfect_values_list = []
+        target_probs_list = []
 
         for i in range(batch_size):
             # Decode observation to board
@@ -285,10 +357,20 @@ class TrainingWorker(BaseWorker):
 
             if is_bo:
                 # Get perfect value
-                perfect_val = self._get_bearoff_value_np(board, int(cur_player_np[i]))
+                cur_player = int(cur_player_np[i])
+
+                # Index positions for lookup
+                x_pos = np.maximum(0, board[0:6])
+                o_pos = np.maximum(0, -board[23:17:-1])
+                x_idx = position_to_index_fast(x_pos)
+                o_idx = position_to_index_fast(o_pos)
+
+                perfect_val = self._get_bearoff_value_np(board, cur_player)
                 perfect_values_list.append(perfect_val)
+                target_probs_list.append(self._get_bearoff_target_probs(x_idx, o_idx, cur_player))
             else:
                 perfect_values_list.append(0.0)
+                target_probs_list.append(None)
 
         is_bearoff = np.array(is_bearoff_list)
         perfect_values = np.array(perfect_values_list)
@@ -299,8 +381,9 @@ class TrainingWorker(BaseWorker):
             if is_bearoff[i]:
                 cur_p = int(cur_player_np[i])
                 opp_p = 1 - cur_p
+                # Equity from current player's perspective; zero-sum for opponent
                 new_rewards[i, cur_p] = perfect_values[i]
-                new_rewards[i, opp_p] = 1.0 - perfect_values[i]
+                new_rewards[i, opp_p] = -perfect_values[i]
 
         # Convert back to JAX and create new batch
         new_rewards_jax = jnp.array(new_rewards)
@@ -312,6 +395,10 @@ class TrainingWorker(BaseWorker):
             'bearoff_count': jnp.array(bearoff_count),
             'total_count': jnp.array(batch_size),
         }
+        valid_targets = [tp for tp in target_probs_list if tp is not None]
+        if valid_targets:
+            stacked = np.stack(valid_targets)
+            metrics['bearoff_avg_gammon_win'] = jnp.array(float(np.mean(stacked[:, 1])))
 
         return modified_batch, metrics
 
@@ -775,6 +862,8 @@ class TrainingWorker(BaseWorker):
             total_count = int(bearoff_metrics['total_count'])
             metrics['bearoff_count'] = bearoff_count
             metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
+            if 'bearoff_avg_gammon_win' in bearoff_metrics:
+                metrics['bearoff_avg_gammon_win'] = float(bearoff_metrics['bearoff_avg_gammon_win'])
 
             # Update training stats
             self._training_stats.bearoff_experiences += bearoff_count
