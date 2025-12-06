@@ -187,9 +187,10 @@ fi
 
 # =============================================================================
 # Start Prometheus discovery updater (watches Redis for worker registrations)
+# No GPU needed - disable CUDA to prevent memory allocation
 # =============================================================================
 echo "       Starting Prometheus discovery updater..."
-python -c "
+CUDA_VISIBLE_DEVICES="" python -c "
 from distributed.metrics import start_discovery_updater
 import time
 updater = start_discovery_updater(
@@ -208,9 +209,10 @@ sleep 2
 
 # =============================================================================
 # Start Coordinator (uses config file for all settings)
+# No GPU needed - disable CUDA to prevent memory allocation
 # =============================================================================
 echo "[4/7] Starting coordinator..."
-python -m distributed.cli.main coordinator \
+CUDA_VISIBLE_DEVICES="" python -m distributed.cli.main coordinator \
     --config-file "$CONFIG_FILE" \
     --dashboard \
     > "$LOG_DIR/coordinator_$TIMESTAMP.log" 2>&1 &
