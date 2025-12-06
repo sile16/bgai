@@ -299,15 +299,32 @@ class RedisReplayBuffer:
             >>> batch = buffer.sample_batch(128)
             >>> jax_batch = batch_experiences_to_jax(batch)
         """
-        # Get candidate experience IDs
-        all_exp_ids = self.redis.lrange(self.EXPERIENCE_LIST, 0, -1)
-
-        if not all_exp_ids:
+        # Get total buffer size
+        total_size = self.redis.llen(self.EXPERIENCE_LIST)
+        if total_size == 0:
             return []
 
-        # Filter valid experiences
+        # Sample from a window at the start (most recent experiences)
+        # Old experiences may be orphaned (evicted data but metadata remains)
+        # Use larger window to increase variety while preferring recent data
+        sample_window = min(batch_size * 20, total_size)  # Window of 20x batch size
+        offset = 0  # Start from most recent
+
+        # Get candidate experience IDs from the window
+        candidate_ids = self.redis.lrange(
+            self.EXPERIENCE_LIST, offset, offset + sample_window - 1
+        )
+
+        if not candidate_ids:
+            return []
+
+        # Randomly shuffle candidates to avoid bias
+        candidate_ids = list(candidate_ids)
+        np.random.shuffle(candidate_ids)
+
+        # Filter valid experiences (with early exit)
         valid_ids = []
-        for exp_id_bytes in all_exp_ids:
+        for exp_id_bytes in candidate_ids:
             exp_id = exp_id_bytes.decode() if isinstance(exp_id_bytes, bytes) else exp_id_bytes
             exp_key = f"{self.EXPERIENCE_KEY}{exp_id}"
 
@@ -328,7 +345,7 @@ class RedisReplayBuffer:
             valid_ids.append(exp_id)
 
             # Early exit if we have enough candidates
-            if len(valid_ids) >= batch_size * 3:
+            if len(valid_ids) >= batch_size * 2:
                 break
 
         if not valid_ids:
@@ -454,14 +471,23 @@ class RedisReplayBuffer:
         if not high_surprise_episodes:
             return self.sample_batch(batch_size, min_model_version)
 
-        # Filter by model version and build weighted list
-        valid_episodes = []
-        weights = []
+        # Filter by model version and build weighted list using pipeline
+        # First, fetch all model versions in a single pipeline
+        pipe = self.redis.pipeline()
+        episode_ids = []
+        episode_scores = []
         for ep_id_bytes, score in high_surprise_episodes:
             ep_id = ep_id_bytes.decode() if isinstance(ep_id_bytes, bytes) else ep_id_bytes
             episode_key = f"{self.EPISODE_KEY}{ep_id}"
+            pipe.hget(episode_key, b'model_version')
+            episode_ids.append(ep_id)
+            episode_scores.append(score)
 
-            model_ver_bytes = self.redis.hget(episode_key, b'model_version')
+        model_versions = pipe.execute()
+
+        valid_episodes = []
+        weights = []
+        for ep_id, score, model_ver_bytes in zip(episode_ids, episode_scores, model_versions):
             if model_ver_bytes:
                 model_ver = int(model_ver_bytes)
                 if model_ver >= min_model_version:
@@ -485,15 +511,27 @@ class RedisReplayBuffer:
         )
         sampled_episodes = [valid_episodes[i] for i in sampled_episode_indices]
 
-        # Get experiences from sampled episodes
+        # Get experiences from sampled episodes using pipeline
+        # Get unique episodes to avoid duplicate lookups
+        unique_episodes = list(set(sampled_episodes))
+        pipe = self.redis.pipeline()
+        for ep_id in unique_episodes:
+            episode_key = f"{self.EPISODE_KEY}{ep_id}"
+            pipe.hget(episode_key, b'num_experiences')
+
+        num_experiences_results = pipe.execute()
+
+        # Build mapping from episode to num_experiences
+        ep_to_num_exp = {}
+        for ep_id, num_exp_bytes in zip(unique_episodes, num_experiences_results):
+            if num_exp_bytes:
+                ep_to_num_exp[ep_id] = int(num_exp_bytes)
+
+        # Build experience IDs from sampled episodes
         all_exp_ids = []
         for ep_id in sampled_episodes:
-            # Get experience count for this episode
-            episode_key = f"{self.EPISODE_KEY}{ep_id}"
-            num_exp_bytes = self.redis.hget(episode_key, b'num_experiences')
-            if num_exp_bytes:
-                num_exp = int(num_exp_bytes)
-                # Add all experience IDs from this episode
+            if ep_id in ep_to_num_exp:
+                num_exp = ep_to_num_exp[ep_id]
                 for i in range(num_exp):
                     all_exp_ids.append(f"{ep_id}:{i}")
 
@@ -521,6 +559,13 @@ class RedisReplayBuffer:
                     'model_version': int(result.get(b'model_version', b'0')),
                     'final_rewards': result.get(b'final_rewards', b''),
                 })
+
+        # If surprise-weighted sampling didn't get enough samples (orphaned episodes),
+        # fall back to uniform sampling from recent experiences
+        if len(batch) < batch_size:
+            fallback_batch = self.sample_batch(batch_size, min_model_version)
+            if fallback_batch:
+                return fallback_batch
 
         return batch
 

@@ -31,7 +31,7 @@ mcts:
   temperature_epochs:  50      # The number of epochs it takes to go from start to end, then we just stay at ending temp 
 
 training:
-  batch_size: 512                  # Samples per training step, 
+  batch_size: 256                  # Samples per training step, 
   learning_rate: 0.0003            # Adam learning rate
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
@@ -40,7 +40,7 @@ training:
   lookup_enabled: False            # disables the lookup positions.
   lookup_learning_weight: 1.5      # this is for future if we have specific anchor positions with value AND policy
   l2_reg_lambda: 0.0001            # L2 regularization
-  games_per_epoch: 10              # New games before training step 
+  games_per_epoch: 5               # New games before training step (lower = more frequent training) 
   surprise_weight: 0.5             # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_epoch_interval: 5     # number of epochs berfore we write checkpoint to disk
   max_checkpoints: 5
