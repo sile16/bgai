@@ -42,9 +42,9 @@ class SimpleNet(nn.Module):
             x = nn.Dense(self.hidden_dim)(x)
             x = x + r
         policy = nn.Dense(self.num_actions)(x)
-        value = nn.Dense(1)(x)
-        value = jnp.squeeze(value, -1)
-        return policy, value
+        # 6-way value head for backgammon outcome distribution
+        value_logits = nn.Dense(6)(x)
+        return policy, value_logits
 
 
 def create_eval_fn(model, params):

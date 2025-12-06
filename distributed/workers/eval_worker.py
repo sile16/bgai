@@ -240,9 +240,15 @@ class EvalWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
+            """ResNet-style network with 6-way value head for backgammon outcomes.
+
+            Value head outputs logits for 6 outcomes:
+            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
+            value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
             def __call__(self, x, train: bool = False):
@@ -254,9 +260,9 @@ class EvalWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                value = nn.Dense(1)(x)
-                value = jnp.squeeze(value, axis=-1)
-                return policy_logits, value
+                # 6-way value head: outputs logits, converted to probs by evaluator
+                value_logits = nn.Dense(self.value_head_out_size)(x)
+                return policy_logits, value_logits
 
         self._nn_model = ResNetTurboZero(
             self._env.num_actions,

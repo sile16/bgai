@@ -69,11 +69,11 @@ class ResNetTurboZero(nn.Module):
         for _ in range(self.num_blocks):
             x = ResBlockV2(self.hidden_dim)(x)
         policy_logits = nn.Dense(self.num_actions)(x)
+        # 6-way value head for backgammon outcome distribution
         v = nn.LayerNorm()(x)
         v = nn.relu(v)
-        v = nn.Dense(1)(v)
-        v = jnp.squeeze(v, -1)
-        return policy_logits, v
+        value_logits = nn.Dense(6)(v)
+        return policy_logits, value_logits
 
 
 def create_hybrid_eval_fn_batched(model, params, gpu_device, cpu_device):

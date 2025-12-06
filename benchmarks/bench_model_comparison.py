@@ -172,10 +172,9 @@ class ModelComparisonBenchmark(BaseBenchmark):
                     # Policy head
                     policy_logits = nn.Dense(self.num_actions)(x)
 
-                    # Value head
-                    value = nn.Dense(1)(x)
-                    value = jnp.squeeze(value, axis=-1)
-                    return policy_logits, value
+                    # 6-way value head for backgammon outcome distribution
+                    value_logits = nn.Dense(6)(x)
+                    return policy_logits, value_logits
 
             # Create network instance and store it
             self.network = ResNetTurboZero(self.bg_env.num_actions, num_hidden=128, num_blocks=5)

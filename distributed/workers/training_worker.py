@@ -29,6 +29,7 @@ from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
 from core.training.loss_fns import az_default_loss_fn
+from core.evaluators.mcts.equity import terminal_value_probs_from_reward, probs_to_equity
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
 
@@ -40,10 +41,11 @@ def weighted_az_loss_fn(
     sample_weights: jnp.ndarray,
     l2_reg_lambda: float = 0.0001,
 ) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
-    """AlphaZero loss function with per-sample weighting.
+    """AlphaZero loss function with per-sample weighting and 6-way value head.
 
     This allows us to weight bearoff samples more heavily since they have
-    known-perfect target values.
+    known-perfect target values. Value loss is cross-entropy over 6 outcomes:
+    [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
 
     Args:
         params: Neural network parameters
@@ -60,8 +62,8 @@ def weighted_az_loss_fn(
         if hasattr(train_state, 'batch_stats') else {'params': params}
     mutables = ['batch_stats'] if hasattr(train_state, 'batch_stats') else []
 
-    # Get predictions
-    (pred_policy, pred_value), updates = train_state.apply_fn(
+    # Get predictions - value head now outputs 6-way logits
+    (pred_policy_logits, pred_value_logits), updates = train_state.apply_fn(
         variables,
         x=experience.observation_nn,
         train=True,
@@ -69,23 +71,28 @@ def weighted_az_loss_fn(
     )
 
     # Set invalid actions in policy to -inf
-    pred_policy = jnp.where(
+    pred_policy_logits = jnp.where(
         experience.policy_mask,
-        pred_policy,
+        pred_policy_logits,
         jnp.finfo(jnp.float32).min
     )
 
     # Compute per-sample policy loss (cross entropy)
-    policy_loss_per_sample = optax.softmax_cross_entropy(pred_policy, experience.policy_weights)
+    policy_loss_per_sample = optax.softmax_cross_entropy(pred_policy_logits, experience.policy_weights)
     # Apply weights and average
     policy_loss = jnp.sum(policy_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
 
-    # Select appropriate value from experience.reward
+    # Select appropriate reward from experience.reward for current player
     current_player = experience.cur_player_id
-    target_value = experience.reward[jnp.arange(experience.reward.shape[0]), current_player]
+    batch_indices = jnp.arange(experience.reward.shape[0])
+    target_reward = experience.reward[batch_indices, current_player]
 
-    # Compute per-sample value loss (squared error)
-    value_loss_per_sample = optax.l2_loss(pred_value.squeeze(), target_value)
+    # Convert scalar reward to 6-way target probability distribution
+    target_value_probs = terminal_value_probs_from_reward(target_reward)
+
+    # Compute per-sample value loss (cross-entropy over 6 outcomes)
+    pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
+    value_loss_per_sample = -(target_value_probs * pred_value_log_probs).sum(axis=-1)
     # Apply weights and average
     value_loss = jnp.sum(value_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
 
@@ -99,19 +106,23 @@ def weighted_az_loss_fn(
     loss = policy_loss + value_loss + l2_reg
 
     # Compute metrics (unweighted for interpretability)
-    pred_policy_probs = jax.nn.softmax(pred_policy, axis=-1)
+    pred_policy_probs = jax.nn.softmax(pred_policy_logits, axis=-1)
     pred_top1 = jnp.argmax(pred_policy_probs, axis=-1)
     target_top1 = jnp.argmax(experience.policy_weights, axis=-1)
     policy_accuracy = jnp.mean(pred_top1 == target_top1)
 
-    value_abs_error = jnp.mean(jnp.abs(pred_value.squeeze() - target_value))
+    # Value accuracy: top-1 match between predicted and target outcome
+    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
+    value_top1 = jnp.argmax(pred_value_probs, axis=-1)
+    target_value_top1 = jnp.argmax(target_value_probs, axis=-1)
+    value_accuracy = jnp.mean(value_top1 == target_value_top1)
 
     aux_metrics = {
         'policy_loss': policy_loss,
         'value_loss': value_loss,
         'l2_reg': l2_reg,
         'policy_accuracy': policy_accuracy,
-        'value_abs_error': value_abs_error,
+        'value_accuracy': value_accuracy,
     }
     return loss, (aux_metrics, updates)
 
@@ -226,7 +237,7 @@ class TrainingWorker(BaseWorker):
         # Higher values emphasize learning accurate values for endgame positions
         self.bearoff_value_weight = self.config.get('bearoff_value_weight', 2.0)
         self._bearoff_table = None
-        self._bearoff_table_np = None  # Keep table on CPU (too large for GPU)
+        self._bearoff_table_np = None  # Full table kept on CPU (too large for GPU)
         bearoff_table_path = self.config.get('bearoff_table_path')
         if bearoff_table_path is None:
             # Default path
@@ -236,8 +247,8 @@ class TrainingWorker(BaseWorker):
 
         if bearoff_table_path and self.use_bearoff_values:
             try:
-                # Load table but DON'T convert to JAX array (too large for GPU)
-                # We'll use numpy lookups instead
+                # Load full table - can't use symmetry because V(i,j) + V(j,i) != 1
+                # (the player to move has an advantage)
                 self._bearoff_table_np = np.load(bearoff_table_path)
                 self._bearoff_table = True  # Flag indicating table is loaded
                 print(f"Worker {self.worker_id}: Loaded bearoff table from {bearoff_table_path}")
@@ -296,48 +307,6 @@ class TrainingWorker(BaseWorker):
     # Bearoff/Endgame Value Methods
     # =========================================================================
 
-    def _get_bearoff_value_np(self, board: np.ndarray, cur_player: int) -> float:
-        """Get perfect bearoff value from the table (numpy version).
-
-        The board is always from the CURRENT player's perspective in pgx:
-        - Positive values = current player's pieces
-        - Negative values = opponent's pieces
-        - Current player's home = points 18-23 (they bear off from high to off)
-        - Opponent's home = points 0-5 (from cur player's view)
-
-        The bearoff DB stores P(first_idx wins | first_idx to move).
-        We index with [cur_player_position, opponent_position].
-
-        Args:
-            board: Board array of shape (28,) from current player's perspective
-            cur_player: Current player (0 or 1) - not used since board is already rotated
-
-        Returns:
-            Perfect value from current player's perspective (win probability)
-        """
-        if self._bearoff_table_np is None:
-            return 0.0
-
-        from bgai.endgame.indexing import position_to_index_fast
-
-        # Current player's pieces are positive, in their home (points 18-23)
-        # Extract in order from point closest to bearing off (23) to furthest (18)
-        cur_home = np.maximum(0, board[23:17:-1])  # [pt23, pt22, pt21, pt20, pt19, pt18]
-
-        # Opponent's pieces are negative, in their home (points 0-5)
-        # Extract in order from point closest to bearing off (0) to furthest (5)
-        opp_home = np.maximum(0, -board[0:6])  # [pt0, pt1, pt2, pt3, pt4, pt5]
-
-        # Look up in table
-        cur_idx = position_to_index_fast(cur_home)
-        opp_idx = position_to_index_fast(opp_home)
-
-        # Table stores P(first_idx wins | first_idx to move)
-        # Current player is first index, so this is their win probability
-        value_cur_to_move = float(self._bearoff_table_np[cur_idx, opp_idx])
-
-        return value_cur_to_move
-
     def _apply_bearoff_values_to_batch(
         self,
         batch: BaseExperience,
@@ -346,6 +315,8 @@ class TrainingWorker(BaseWorker):
 
         Uses numpy for bearoff detection and table lookup (table is too large for GPU),
         then converts results back to JAX arrays.
+
+        OPTIMIZED: Fully vectorized - no Python for-loops over batch.
 
         Args:
             batch: Batch of experiences
@@ -372,53 +343,83 @@ class TrainingWorker(BaseWorker):
         cur_player_np = np.array(batch.cur_player_id)
         rewards_np = np.array(batch.reward)
 
-        # Process each experience
-        is_bearoff_list = []
-        perfect_values_list = []
+        # Decode observations to boards (batch_size, 28)
+        boards = np.round(obs_np[:, :28] * 15).astype(np.int8)
 
-        for i in range(batch_size):
-            # Decode observation to board
-            board = np.round(obs_np[i, :28] * 15).astype(np.int8)
+        # =========================================================================
+        # Vectorized bearoff detection
+        # =========================================================================
+        # Board layout (pgx): [0-23]=points 0-23, [24]=cur_bar, [25]=opp_bar, [26]=cur_borne, [27]=opp_borne
+        # Current player pieces are positive, opponent pieces are negative
+        # Current player home = points 18-23, opponent home = points 0-5
+        # For bearoff: both bars empty, cur player only in home (18-23), opp only in home (0-5)
 
-            # Check if bearoff position (numpy version)
-            # Board layout (pgx): [0-23]=points 0-23, [24]=cur_bar, [25]=opp_bar, [26]=cur_borne, [27]=opp_borne
-            # Current player pieces are positive, opponent pieces are negative
-            # From pgx _home_board(): current player home = points 18-23, opponent home = points 0-5
-            # For bearoff: both bars empty, cur player only in home (points 18-23), opp only in home (points 0-5)
-            bar_empty = (board[24] == 0) and (board[25] == 0)
-            # Current player (positive) outside home if pieces on points 0-17 (indices 0:18)
-            cur_outside = np.any(board[0:18] > 0)
-            # Opponent (negative) outside home if pieces on points 6-23 (indices 6:24)
-            opp_outside = np.any(board[6:24] < 0)
-            is_bo = bar_empty and not cur_outside and not opp_outside
+        # Check bars empty (vectorized)
+        bar_empty = (boards[:, 24] == 0) & (boards[:, 25] == 0)
 
-            is_bearoff_list.append(is_bo)
+        # Current player (positive) outside home if pieces on points 0-17
+        cur_outside = np.any(boards[:, 0:18] > 0, axis=1)
 
-            if is_bo:
-                # Get perfect value
-                perfect_val = self._get_bearoff_value_np(board, int(cur_player_np[i]))
-                perfect_values_list.append(perfect_val)
-            else:
-                perfect_values_list.append(0.0)
+        # Opponent (negative) outside home if pieces on points 6-23
+        opp_outside = np.any(boards[:, 6:24] < 0, axis=1)
 
-        is_bearoff = np.array(is_bearoff_list)
-        perfect_values = np.array(perfect_values_list)
+        # Bearoff position mask
+        is_bearoff = bar_empty & ~cur_outside & ~opp_outside
 
-        # Update rewards for bearoff positions
-        new_rewards = rewards_np.copy()
-        for i in range(batch_size):
-            if is_bearoff[i]:
-                cur_p = int(cur_player_np[i])
-                opp_p = 1 - cur_p
-                new_rewards[i, cur_p] = perfect_values[i]
-                new_rewards[i, opp_p] = 1.0 - perfect_values[i]
+        # =========================================================================
+        # Vectorized bearoff value lookup (only for bearoff positions)
+        # =========================================================================
+        bearoff_count = int(np.sum(is_bearoff))
+
+        if bearoff_count > 0:
+            from bgai.endgame.indexing import position_to_index_lut
+
+            # Extract boards that are in bearoff
+            bearoff_boards = boards[is_bearoff]  # (bearoff_count, 28)
+
+            # Current player's pieces are positive, in their home (points 18-23)
+            # Extract in order from point closest to bearing off (23) to furthest (18)
+            cur_home = np.maximum(0, bearoff_boards[:, 23:17:-1])  # (bearoff_count, 6)
+
+            # Opponent's pieces are negative, in their home (points 0-5)
+            # Extract in order from point closest to bearing off (0) to furthest (5)
+            opp_home = np.maximum(0, -bearoff_boards[:, 0:6])  # (bearoff_count, 6)
+
+            # Ultra-fast index computation using precomputed lookup table
+            cur_indices = position_to_index_lut(cur_home)  # (bearoff_count,)
+            opp_indices = position_to_index_lut(opp_home)  # (bearoff_count,)
+
+            # Vectorized table lookup - single numpy advanced indexing operation
+            # bearoff equity values are win probabilities in [0, 1]
+            bearoff_equity = self._bearoff_table_np[cur_indices, opp_indices]
+
+            # Update rewards for bearoff positions (vectorized)
+            # Convert equity to signed point rewards for 6-way value head:
+            # In bearoff, only single games are possible (no gammons/backgammons),
+            # so we assign +1 for likely wins (equity >= 0.5) and -1 for likely losses.
+            # For intermediate positions, the model learns to predict the distribution.
+            new_rewards = rewards_np.copy()
+            bearoff_indices = np.where(is_bearoff)[0]
+            cur_players_bearoff = cur_player_np[is_bearoff].astype(np.int32)
+            opp_players_bearoff = 1 - cur_players_bearoff
+
+            # Convert equity to expected single-game point value
+            # Win (equity >= 0.5): current player gets +1, opponent gets -1
+            # Loss (equity < 0.5): current player gets -1, opponent gets +1
+            cur_reward = np.where(bearoff_equity >= 0.5, 1.0, -1.0)
+            opp_reward = -cur_reward  # Zero-sum
+
+            # Vectorized reward assignment
+            new_rewards[bearoff_indices, cur_players_bearoff] = cur_reward
+            new_rewards[bearoff_indices, opp_players_bearoff] = opp_reward
+        else:
+            new_rewards = rewards_np
 
         # Convert back to JAX and create new batch
         new_rewards_jax = jnp.array(new_rewards)
         modified_batch = batch.replace(reward=new_rewards_jax)
 
         # Metrics - include mask for separate loss tracking
-        bearoff_count = int(np.sum(is_bearoff))
         is_bearoff_jax = jnp.array(is_bearoff)
         metrics = {
             'bearoff_count': jnp.array(bearoff_count),
@@ -565,9 +566,15 @@ class TrainingWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
+            """ResNet-style network with 6-way value head for backgammon outcomes.
+
+            Value head outputs logits for 6 outcomes:
+            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
+            value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
             def __call__(self, x, train: bool = False):
@@ -579,9 +586,9 @@ class TrainingWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                value = nn.Dense(1)(x)
-                value = jnp.squeeze(value, axis=-1)
-                return policy_logits, value
+                # 6-way value head: outputs logits, converted to probs by loss fn
+                value_logits = nn.Dense(self.value_head_out_size)(x)
+                return policy_logits, value_logits
 
         self._nn_model = ResNetTurboZero(
             self._env.num_actions,
@@ -756,8 +763,8 @@ class TrainingWorker(BaseWorker):
             # Initialize tree
             eval_state = self._warm_tree_evaluator.init(template_embedding=init_state)
 
-            # Get current params
-            params = self._train_state.params
+            # Get current params - wrap in {'params': ...} for Flax module apply
+            params = {'params': self._train_state.params}
 
             # Run MCTS iterations to build the tree
             # The evaluator's evaluate() method runs num_iterations internally
@@ -988,36 +995,37 @@ class TrainingWorker(BaseWorker):
             is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
             if bearoff_count > 0:
                 # Get predictions for the batch (no grad computation)
-                pred_policy, pred_value = self._train_state.apply_fn(
+                pred_policy_logits, pred_value_logits = self._train_state.apply_fn(
                     {'params': self._train_state.params},
                     x=jax_batch.observation_nn,
                     train=False,
                 )
-                pred_value = pred_value.squeeze()
 
                 # Mask invalid actions in policy for softmax
-                pred_policy = jnp.where(
+                pred_policy_logits = jnp.where(
                     jax_batch.policy_mask,
-                    pred_policy,
+                    pred_policy_logits,
                     jnp.finfo(jnp.float32).min
                 )
 
-                # Get target values
+                # Get target values and convert to 6-way probabilities
                 current_player = jax_batch.cur_player_id
-                target_value = jax_batch.reward[jnp.arange(jax_batch.reward.shape[0]), current_player]
+                target_reward = jax_batch.reward[jnp.arange(jax_batch.reward.shape[0]), current_player]
+                target_value_probs = terminal_value_probs_from_reward(target_reward)
 
-                # Compute per-sample value squared errors
-                value_squared_errors = (pred_value - target_value) ** 2
+                # Compute per-sample value cross-entropy
+                pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
+                value_ce = -(target_value_probs * pred_value_log_probs).sum(axis=-1)
 
                 # Compute per-sample policy cross-entropy
-                policy_ce = optax.softmax_cross_entropy(pred_policy, jax_batch.policy_weights)
+                policy_ce = optax.softmax_cross_entropy(pred_policy_logits, jax_batch.policy_weights)
 
                 bearoff_mask_float = is_bearoff_mask.astype(jnp.float32)
                 non_bearoff_count = total_count - bearoff_count
                 non_bearoff_mask_float = (1.0 - bearoff_mask_float)
 
-                # Bearoff value loss (MSE for bearoff positions only)
-                bearoff_value_loss = jnp.sum(value_squared_errors * bearoff_mask_float) / max(bearoff_count, 1)
+                # Bearoff value loss (cross-entropy for bearoff positions only)
+                bearoff_value_loss = jnp.sum(value_ce * bearoff_mask_float) / max(bearoff_count, 1)
                 metrics['bearoff_value_loss'] = float(bearoff_value_loss)
 
                 # Bearoff policy loss (cross-entropy for bearoff positions only)
@@ -1026,7 +1034,7 @@ class TrainingWorker(BaseWorker):
 
                 # Non-bearoff value loss
                 if non_bearoff_count > 0:
-                    non_bearoff_value_loss = jnp.sum(value_squared_errors * non_bearoff_mask_float) / non_bearoff_count
+                    non_bearoff_value_loss = jnp.sum(value_ce * non_bearoff_mask_float) / non_bearoff_count
                     metrics['non_bearoff_value_loss'] = float(non_bearoff_value_loss)
                     # Non-bearoff policy loss
                     non_bearoff_policy_loss = jnp.sum(policy_ce * non_bearoff_mask_float) / non_bearoff_count
@@ -1232,15 +1240,24 @@ class TrainingWorker(BaseWorker):
             target_steps = new_games * self.steps_per_game
 
             print(
-                f"Worker {self.worker_id}: Training batch triggered! "
+                f"Worker {self.worker_id}: Training epoch triggered! "
                 f"{new_games} new games -> {target_steps} training steps"
             )
 
-            # Run training batch
-            batch_metrics = self._run_training_batch(target_steps)
+            # Pause game collection during training epoch (avoid GPU contention)
+            self.state.set_collection_paused(True)
+            print(f"Worker {self.worker_id}: Paused game collection for training epoch")
 
-            # Push updated weights to Redis
-            self._push_weights_to_redis()
+            try:
+                # Run training epoch
+                batch_metrics = self._run_training_batch(target_steps)
+
+                # Push updated weights to Redis
+                self._push_weights_to_redis()
+            finally:
+                # Resume game collection after training epoch
+                self.state.set_collection_paused(False)
+                print(f"Worker {self.worker_id}: Resumed game collection")
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games
@@ -1269,7 +1286,7 @@ class TrainingWorker(BaseWorker):
                 'bearoff_policy_loss': batch_metrics.get('bearoff_policy_loss', 0),
                 # 4. Training context
                 'bearoff_train_pct': batch_metrics.get('bearoff_pct', 0),
-                'steps_per_sec': batch_metrics.get('steps_per_sec', 0),
+                'train_steps_per_sec': batch_metrics.get('steps_per_sec', 0),
                 'total_train_steps': self._total_steps,
                 'buffer_size': buffer_size,
                 'total_games': current_games,
@@ -1332,12 +1349,12 @@ class TrainingWorker(BaseWorker):
 
             # Build log message with optional bearoff stats
             log_msg = (
-                f"Worker {self.worker_id}: Batch complete! "
+                f"Worker {self.worker_id}: Epoch complete! "
                 f"step={self._total_steps}, "
                 f"loss={batch_metrics.get('loss', 0):.4f}, "
-                f"batch_steps={batch_metrics.get('batch_steps', 0)}, "
-                f"batch_time={batch_metrics.get('batch_duration', 0):.1f}s, "
-                f"batch_steps/s={batch_metrics.get('steps_per_sec', 0):.1f}, "
+                f"epoch_steps={batch_metrics.get('batch_steps', 0)}, "
+                f"epoch_time={batch_metrics.get('batch_duration', 0):.1f}s, "
+                f"train_steps/s={batch_metrics.get('steps_per_sec', 0):.1f}, "
                 f"overall_steps/s={overall_steps_per_sec:.1f}, "
                 f"version={self.current_model_version}"
             )

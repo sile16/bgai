@@ -53,11 +53,11 @@ class TwoPlayerBaselineBenchmark(BaseBenchmark):
         self.env_step_fn = self._create_step_fn()
         self.env_init_fn = self._create_init_fn()
         
-        # Create Neural Network for NN evaluator
+        # Create Neural Network for NN evaluator with 6-way value head
         mlp_config = MLPConfig(
             hidden_dims=[256, 256, 256],
             policy_head_out_size=self.bg_env.num_actions,
-            value_head_out_size=1
+            value_head_out_size=6  # 6-way outcome distribution for backgammon
         )
         self.network = MLP(mlp_config)
         
