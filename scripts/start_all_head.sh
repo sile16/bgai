@@ -97,6 +97,13 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25
 echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24GB GPU)"
 
 # =============================================================================
+# Disable XLA command buffers to prevent CUDA graph OOM errors
+# See: https://github.com/google/jax/issues/16292
+# =============================================================================
+export XLA_FLAGS="--xla_gpu_enable_command_buffer="
+echo "XLA command buffers disabled to prevent OOM"
+
+# =============================================================================
 # Python unbuffered output - ensure logs are written immediately
 # =============================================================================
 export PYTHONUNBUFFERED=1
@@ -110,14 +117,17 @@ mkdir -p "$MLFLOW_DIR"
 
 # Kill any existing MLFlow server
 pkill -f "mlflow server" 2>/dev/null || true
+pkill -f "uvicorn.*mlflow" 2>/dev/null || true
 sleep 1
 
 # Start MLFlow server (0.0.0.0 for web UI access, training worker uses localhost)
+# Allow trusted hosts to avoid DNS rebinding protection blocking local workers
 python -m mlflow server \
     --host 0.0.0.0 \
     --port 5000 \
     --backend-store-uri "sqlite:///$MLFLOW_DIR/mlflow.db" \
     --default-artifact-root "$MLFLOW_DIR/artifacts" \
+    --allowed-hosts "*" \
     > "$LOG_DIR/mlflow_$TIMESTAMP.log" 2>&1 &
 MLFLOW_PID=$!
 echo "       MLFlow PID: $MLFLOW_PID"

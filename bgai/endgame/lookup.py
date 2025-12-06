@@ -202,3 +202,173 @@ def convert_to_uint16(table: np.ndarray) -> np.ndarray:
 def convert_from_uint16(table: np.ndarray) -> np.ndarray:
     """Convert uint16 table back to float32."""
     return table.astype(np.float32) / 65535.0
+
+
+class BearoffTableOptimized:
+    """Memory-efficient bearoff table with upper triangle storage and vectorized lookups.
+
+    Stores only upper triangle (i <= j) using the formula:
+        idx = i * n - i*(i+1)/2 + j  for i <= j
+
+    For i > j, we use symmetry: V(i, j) = 1 - V(j, i)
+
+    This reduces storage from n*n to n*(n+1)/2, nearly halving memory usage.
+    """
+
+    def __init__(
+        self,
+        table_path: Optional[str] = None,
+        full_table: Optional[np.ndarray] = None,
+        upper_table: Optional[np.ndarray] = None,
+    ):
+        """Initialize from file or array.
+
+        Args:
+            table_path: Path to .npy file (either full or upper triangle format).
+            full_table: Full (n, n) table - will be converted to upper triangle.
+            upper_table: Pre-converted upper triangle (1D array).
+        """
+        self.n = TOTAL_ONE_SIDED_POSITIONS
+
+        if table_path is not None:
+            raw = np.load(table_path)
+            if raw.ndim == 2:
+                # Full table - convert to upper triangle
+                print(f"Converting full table to upper triangle format...")
+                self.table = self._extract_upper_triangle(raw)
+            else:
+                self.table = raw
+        elif full_table is not None:
+            self.table = self._extract_upper_triangle(full_table)
+        elif upper_table is not None:
+            self.table = upper_table
+        else:
+            raise ValueError("Must provide table_path, full_table, or upper_table")
+
+        # Verify size
+        expected_size = self.n * (self.n + 1) // 2
+        if self.table.shape[0] != expected_size:
+            raise ValueError(f"Upper triangle size mismatch: {self.table.shape[0]} vs {expected_size}")
+
+        # Ensure float32 for fast lookup
+        if self.table.dtype != np.float32:
+            self.table = self.table.astype(np.float32)
+
+        print(f"BearoffTableOptimized: n={self.n:,}, size={len(self.table):,}, "
+              f"memory={self.table.nbytes / 1e9:.2f} GB")
+
+    def _extract_upper_triangle(self, full_table: np.ndarray) -> np.ndarray:
+        """Extract upper triangle to 1D array."""
+        n = full_table.shape[0]
+        size = n * (n + 1) // 2
+        upper = np.zeros(size, dtype=np.float32)
+
+        idx = 0
+        for i in range(n):
+            # Copy row i from column i to n
+            row_len = n - i
+            upper[idx:idx + row_len] = full_table[i, i:]
+            idx += row_len
+
+        return upper
+
+    def _compute_index(self, i: int, j: int) -> int:
+        """Compute 1D index for position (i, j) where i <= j."""
+        # idx = i * n - i*(i+1)/2 + j
+        return i * self.n - (i * (i + 1)) // 2 + j
+
+    def lookup(self, x_idx: int, o_idx: int) -> float:
+        """Look up win probability for X given position indices.
+
+        Args:
+            x_idx: X's position index
+            o_idx: O's position index
+
+        Returns:
+            P(X wins | X to move)
+        """
+        if x_idx <= o_idx:
+            idx = self._compute_index(x_idx, o_idx)
+            return float(self.table[idx])
+        else:
+            # Symmetry: V(i, j) = 1 - V(j, i)
+            idx = self._compute_index(o_idx, x_idx)
+            return 1.0 - float(self.table[idx])
+
+    def lookup_batch(
+        self,
+        x_indices: np.ndarray,
+        o_indices: np.ndarray
+    ) -> np.ndarray:
+        """Vectorized lookup for batched position indices.
+
+        Args:
+            x_indices: Array of X position indices (batch_size,)
+            o_indices: Array of O position indices (batch_size,)
+
+        Returns:
+            Array of win probabilities (batch_size,)
+        """
+        x_indices = x_indices.astype(np.int64)
+        o_indices = o_indices.astype(np.int64)
+
+        # Determine which indices need to be swapped (symmetry)
+        swap_mask = x_indices > o_indices
+
+        # Compute i, j where i <= j
+        i = np.where(swap_mask, o_indices, x_indices)
+        j = np.where(swap_mask, x_indices, o_indices)
+
+        # Compute 1D indices: idx = i * n - i*(i+1)/2 + j
+        flat_indices = i * self.n - (i * (i + 1)) // 2 + j
+
+        # Lookup values
+        values = self.table[flat_indices]
+
+        # Apply symmetry correction where swapped
+        values = np.where(swap_mask, 1.0 - values, values)
+
+        return values
+
+    def save(self, path: str):
+        """Save upper triangle table to file."""
+        np.save(path, self.table)
+        print(f"Saved upper triangle table to {path}")
+
+    @classmethod
+    def from_full_table_file(cls, full_path: str, save_path: Optional[str] = None):
+        """Create from full table file, optionally saving upper triangle version.
+
+        Args:
+            full_path: Path to full (n, n) table file
+            save_path: Optional path to save upper triangle version
+
+        Returns:
+            BearoffTableOptimized instance
+        """
+        print(f"Loading full table from {full_path}...")
+        full_table = np.load(full_path)
+        instance = cls(full_table=full_table)
+
+        if save_path:
+            instance.save(save_path)
+
+        return instance
+
+
+def create_optimized_table(full_table_path: str, output_path: Optional[str] = None) -> str:
+    """Convert full bearoff table to optimized upper triangle format.
+
+    Args:
+        full_table_path: Path to full (n, n) .npy file
+        output_path: Output path (default: same location with _opt suffix)
+
+    Returns:
+        Path to saved optimized table
+    """
+    if output_path is None:
+        base = Path(full_table_path)
+        output_path = str(base.parent / f"{base.stem}_opt.npy")
+
+    table = BearoffTableOptimized.from_full_table_file(full_table_path, output_path)
+    return output_path

@@ -117,12 +117,54 @@ def weighted_az_loss_fn(
     target_value_top1 = jnp.argmax(target_value_probs, axis=-1)
     value_accuracy = jnp.mean(value_top1 == target_value_top1)
 
+    # Per-outcome value losses for monitoring (6-way breakdown)
+    # Compute per-outcome cross-entropy contribution: -target_prob * log(pred_prob)
+    # This shows which outcomes are hardest to predict
+    per_outcome_ce = -target_value_probs * pred_value_log_probs  # (batch, 6)
+    mean_per_outcome_ce = per_outcome_ce.mean(axis=0)  # (6,)
+
+    # Outcome names: win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss
+    value_loss_win = mean_per_outcome_ce[0]
+    value_loss_gammon_win = mean_per_outcome_ce[1]
+    value_loss_backgammon_win = mean_per_outcome_ce[2]
+    value_loss_loss = mean_per_outcome_ce[3]
+    value_loss_gammon_loss = mean_per_outcome_ce[4]
+    value_loss_backgammon_loss = mean_per_outcome_ce[5]
+
+    # Predicted outcome distribution (mean over batch)
+    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
+    mean_pred_probs = pred_value_probs.mean(axis=0)  # (6,)
+
+    # Target outcome distribution (mean over batch)
+    mean_target_probs = target_value_probs.mean(axis=0)  # (6,)
+
     aux_metrics = {
         'policy_loss': policy_loss,
         'value_loss': value_loss,
         'l2_reg': l2_reg,
         'policy_accuracy': policy_accuracy,
         'value_accuracy': value_accuracy,
+        # Per-outcome value losses
+        'value_loss_win': value_loss_win,
+        'value_loss_gammon_win': value_loss_gammon_win,
+        'value_loss_backgammon_win': value_loss_backgammon_win,
+        'value_loss_loss': value_loss_loss,
+        'value_loss_gammon_loss': value_loss_gammon_loss,
+        'value_loss_backgammon_loss': value_loss_backgammon_loss,
+        # Predicted outcome probabilities (for calibration monitoring)
+        'pred_prob_win': mean_pred_probs[0],
+        'pred_prob_gammon_win': mean_pred_probs[1],
+        'pred_prob_backgammon_win': mean_pred_probs[2],
+        'pred_prob_loss': mean_pred_probs[3],
+        'pred_prob_gammon_loss': mean_pred_probs[4],
+        'pred_prob_backgammon_loss': mean_pred_probs[5],
+        # Target outcome probabilities (ground truth distribution)
+        'target_prob_win': mean_target_probs[0],
+        'target_prob_gammon_win': mean_target_probs[1],
+        'target_prob_backgammon_win': mean_target_probs[2],
+        'target_prob_loss': mean_target_probs[3],
+        'target_prob_gammon_loss': mean_target_probs[4],
+        'target_prob_backgammon_loss': mean_target_probs[5],
     }
     return loss, (aux_metrics, updates)
 
@@ -619,6 +661,11 @@ class TrainingWorker(BaseWorker):
             params = variables['params']
             print(f"Worker {self.worker_id}: Initialized random weights")
 
+        # Restore total steps from Redis (persisted across restarts)
+        self._total_steps = self.state.get_training_steps()
+        if self._total_steps > 0:
+            print(f"Worker {self.worker_id}: Restored step counter to {self._total_steps}")
+
         # Create optimizer
         optimizer = optax.adam(self.learning_rate)
 
@@ -1107,6 +1154,8 @@ class TrainingWorker(BaseWorker):
             # Save checkpoint periodically
             if self._total_steps % self.checkpoint_interval == 0:
                 self._save_checkpoint()
+                # Persist step counter to Redis for recovery
+                self.state.set_training_steps(self._total_steps)
 
         batch_duration = time.time() - batch_start
 
@@ -1284,7 +1333,30 @@ class TrainingWorker(BaseWorker):
                 # 3. Bearoff-specific losses (endgame positions with known-perfect values)
                 'bearoff_value_loss': batch_metrics.get('bearoff_value_loss', 0),
                 'bearoff_policy_loss': batch_metrics.get('bearoff_policy_loss', 0),
-                # 4. Training context
+                # 4. Per-outcome value losses (6-way breakdown)
+                'value_loss_win': batch_metrics.get('value_loss_win', 0),
+                'value_loss_gammon_win': batch_metrics.get('value_loss_gammon_win', 0),
+                'value_loss_backgammon_win': batch_metrics.get('value_loss_backgammon_win', 0),
+                'value_loss_loss': batch_metrics.get('value_loss_loss', 0),
+                'value_loss_gammon_loss': batch_metrics.get('value_loss_gammon_loss', 0),
+                'value_loss_backgammon_loss': batch_metrics.get('value_loss_backgammon_loss', 0),
+                # 5. Predicted vs target outcome distributions (calibration)
+                'pred_prob_win': batch_metrics.get('pred_prob_win', 0),
+                'pred_prob_gammon_win': batch_metrics.get('pred_prob_gammon_win', 0),
+                'pred_prob_backgammon_win': batch_metrics.get('pred_prob_backgammon_win', 0),
+                'pred_prob_loss': batch_metrics.get('pred_prob_loss', 0),
+                'pred_prob_gammon_loss': batch_metrics.get('pred_prob_gammon_loss', 0),
+                'pred_prob_backgammon_loss': batch_metrics.get('pred_prob_backgammon_loss', 0),
+                'target_prob_win': batch_metrics.get('target_prob_win', 0),
+                'target_prob_gammon_win': batch_metrics.get('target_prob_gammon_win', 0),
+                'target_prob_backgammon_win': batch_metrics.get('target_prob_backgammon_win', 0),
+                'target_prob_loss': batch_metrics.get('target_prob_loss', 0),
+                'target_prob_gammon_loss': batch_metrics.get('target_prob_gammon_loss', 0),
+                'target_prob_backgammon_loss': batch_metrics.get('target_prob_backgammon_loss', 0),
+                # 6. Accuracy metrics
+                'value_accuracy': batch_metrics.get('value_accuracy', 0),
+                'policy_accuracy': batch_metrics.get('policy_accuracy', 0),
+                # 7. Training context
                 'bearoff_train_pct': batch_metrics.get('bearoff_pct', 0),
                 'train_steps_per_sec': batch_metrics.get('steps_per_sec', 0),
                 'total_train_steps': self._total_steps,
@@ -1306,6 +1378,34 @@ class TrainingWorker(BaseWorker):
             metrics.training_loss.labels(
                 worker_id=self.worker_id, loss_type='total'
             ).set(batch_metrics.get('loss', 0))
+            metrics.training_loss.labels(
+                worker_id=self.worker_id, loss_type='value'
+            ).set(batch_metrics.get('value_loss', 0))
+            metrics.training_loss.labels(
+                worker_id=self.worker_id, loss_type='policy'
+            ).set(batch_metrics.get('policy_loss', 0))
+
+            # Per-outcome value losses (6-way breakdown)
+            outcome_names = ['win', 'gammon_win', 'backgammon_win', 'loss', 'gammon_loss', 'backgammon_loss']
+            for outcome in outcome_names:
+                metrics.value_loss_per_outcome.labels(
+                    worker_id=self.worker_id, outcome=outcome
+                ).set(batch_metrics.get(f'value_loss_{outcome}', 0))
+                metrics.predicted_outcome_prob.labels(
+                    worker_id=self.worker_id, outcome=outcome
+                ).set(batch_metrics.get(f'pred_prob_{outcome}', 0))
+                metrics.target_outcome_prob.labels(
+                    worker_id=self.worker_id, outcome=outcome
+                ).set(batch_metrics.get(f'target_prob_{outcome}', 0))
+
+            # Accuracy metrics
+            metrics.value_accuracy.labels(
+                worker_id=self.worker_id
+            ).set(batch_metrics.get('value_accuracy', 0))
+            metrics.policy_accuracy.labels(
+                worker_id=self.worker_id
+            ).set(batch_metrics.get('policy_accuracy', 0))
+
             metrics.training_steps_per_second.labels(
                 worker_id=self.worker_id
             ).set(overall_steps_per_sec)
@@ -1372,6 +1472,8 @@ class TrainingWorker(BaseWorker):
         if self._total_steps > 0:
             self._push_weights_to_redis()
             self._save_checkpoint()
+            # Persist step counter to Redis for recovery
+            self.state.set_training_steps(self._total_steps)
 
         # Note: Don't call mlflow.end_run() here - the run is shared with eval workers
         # and should persist across worker restarts. The run will be ended manually

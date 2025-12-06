@@ -273,6 +273,99 @@ def position_to_index_jax(pos: jnp.ndarray) -> jnp.ndarray:
     return (offset + inner_idx).astype(jnp.int64)
 
 
+def position_to_index_batch_np(positions: np.ndarray) -> np.ndarray:
+    """Vectorized position to index for batched positions (numpy version).
+
+    Args:
+        positions: Array of shape (batch_size, 6) with checker counts.
+
+    Returns:
+        Array of shape (batch_size,) with indices.
+    """
+    batch_size = positions.shape[0]
+    positions = positions.astype(np.int32)
+
+    # Compute totals for each position
+    totals = np.sum(positions, axis=1)
+
+    # Get offsets from table
+    offsets = OFFSET_TABLE[totals]
+
+    # Compute inner indices vectorized
+    # For each point i, we need INNER_INDEX_COEFFICIENTS[i, remaining, value]
+    # remaining starts at total and decreases by cumulative sum
+    inner_indices = np.zeros(batch_size, dtype=np.int64)
+
+    # Cumulative sum to track remaining checkers
+    # remaining[b, i] = total[b] - sum(positions[b, :i])
+    cumsum = np.zeros(batch_size, dtype=np.int32)
+
+    for i in range(NUM_POINTS - 1):
+        remaining = totals - cumsum
+        values = positions[:, i]
+        # Vectorized lookup: INNER_INDEX_COEFFICIENTS[i, remaining, values]
+        inner_indices += INNER_INDEX_COEFFICIENTS[i, remaining, values]
+        cumsum += values
+
+    return offsets + inner_indices
+
+
+# =============================================================================
+# Ultra-fast lookup table (LUT) for position-to-index conversion
+# =============================================================================
+# This precomputes all 54,264 valid position -> index mappings
+# and stores them in a flat lookup table indexed by base-16 encoding.
+# Cost: 67MB memory, Benefit: ~6x faster than computing indices
+
+def _build_position_lut() -> np.ndarray:
+    """Build lookup table: base-16 encoded position -> bearoff index.
+
+    Encoding: p0 + p1*16 + p2*256 + p3*4096 + p4*65536 + p5*1048576
+    Invalid positions (sum > 15) have value -1.
+    """
+    lut = np.full(16**6, -1, dtype=np.int32)
+
+    # Generate all valid positions (sum <= 15)
+    for total in range(MAX_CHECKERS + 1):
+        for p0 in range(total + 1):
+            for p1 in range(total - p0 + 1):
+                for p2 in range(total - p0 - p1 + 1):
+                    for p3 in range(total - p0 - p1 - p2 + 1):
+                        for p4 in range(total - p0 - p1 - p2 - p3 + 1):
+                            p5 = total - p0 - p1 - p2 - p3 - p4
+                            flat_idx = p0 + p1*16 + p2*256 + p3*4096 + p4*65536 + p5*1048576
+                            bearoff_idx = position_to_index_fast(np.array([p0, p1, p2, p3, p4, p5]))
+                            lut[flat_idx] = bearoff_idx
+
+    return lut
+
+# Build the LUT at module load time (takes ~0.4s, 67MB)
+POSITION_LUT = _build_position_lut()
+
+
+def position_to_index_lut(positions: np.ndarray) -> np.ndarray:
+    """Ultra-fast position to index using precomputed lookup table.
+
+    ~6x faster than position_to_index_batch_np.
+
+    Args:
+        positions: Array of shape (batch_size, 6) with checker counts (0-15 each).
+                  Sum of each row must be <= 15.
+
+    Returns:
+        Array of shape (batch_size,) with bearoff indices.
+    """
+    positions = positions.astype(np.int32)
+    # Encode positions to flat indices using base-16
+    flat_idx = (positions[:, 0] +
+                positions[:, 1] * 16 +
+                positions[:, 2] * 256 +
+                positions[:, 3] * 4096 +
+                positions[:, 4] * 65536 +
+                positions[:, 5] * 1048576)
+    return POSITION_LUT[flat_idx]
+
+
 # Verification
 def verify_indexing():
     """Verify that indexing is bijective."""

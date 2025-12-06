@@ -9,6 +9,7 @@ pkill -f "prometheus" 2>/dev/null || true
 
 echo "Stopping MLFlow..."
 pkill -f "mlflow server" 2>/dev/null || true
+pkill -f "uvicorn.*mlflow" 2>/dev/null || true
 
 echo "Stopping distributed training workers..."
 pkill -f "distributed.cli.main" 2>/dev/null || true

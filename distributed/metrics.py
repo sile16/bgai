@@ -141,6 +141,44 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        # =================================================================
+        # Per-Outcome Value Loss Metrics (6-way value head)
+        # =================================================================
+        self.value_loss_per_outcome = Gauge(
+            'bgai_value_loss_per_outcome',
+            'Value loss contribution per outcome type',
+            ['worker_id', 'outcome'],
+            registry=self.registry,
+        )
+
+        self.predicted_outcome_prob = Gauge(
+            'bgai_predicted_outcome_prob',
+            'Mean predicted probability per outcome type',
+            ['worker_id', 'outcome'],
+            registry=self.registry,
+        )
+
+        self.target_outcome_prob = Gauge(
+            'bgai_target_outcome_prob',
+            'Mean target probability per outcome type (ground truth distribution)',
+            ['worker_id', 'outcome'],
+            registry=self.registry,
+        )
+
+        self.value_accuracy = Gauge(
+            'bgai_value_accuracy',
+            'Top-1 accuracy of value predictions (predicted outcome matches target)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.policy_accuracy = Gauge(
+            'bgai_policy_accuracy',
+            'Top-1 accuracy of policy predictions',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
         self.training_steps_per_second = Gauge(
             'bgai_training_steps_per_second',
             'Current training rate (steps/second)',

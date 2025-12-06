@@ -41,6 +41,8 @@ KEY_WORKERS_LIST = f"{PREFIX}:workers:list"
 KEY_METRICS_TARGETS = f"{PREFIX}:metrics:targets"
 KEY_WARM_TREE = f"{PREFIX}:model:warm_tree"
 KEY_WARM_TREE_VERSION = f"{PREFIX}:model:warm_tree_version"
+KEY_COLLECTION_PAUSED = f"{PREFIX}:collection:paused"
+KEY_TRAINING_STEPS = f"{PREFIX}:training:total_steps"
 
 # TTL values (seconds)
 WORKER_TTL = 60  # Workers expire after 60s without heartbeat
@@ -298,6 +300,43 @@ class RedisStateManager:
             # Default to active when unset so fresh clusters train
             return True
         return status.decode() == RunStatus.RUNNING.value
+
+    def set_collection_paused(self, paused: bool) -> None:
+        """Set collection pause state (used during training epochs)."""
+        self.redis.set(KEY_COLLECTION_PAUSED, "1" if paused else "0")
+
+    def is_collection_paused(self) -> bool:
+        """Check if game collection is paused (during training epoch)."""
+        val = self.redis.get(KEY_COLLECTION_PAUSED)
+        return val is not None and val.decode() == "1"
+
+    def get_training_steps(self) -> int:
+        """Get total training steps across all sessions.
+
+        Returns:
+            Total training steps completed.
+        """
+        steps = self.redis.get(KEY_TRAINING_STEPS)
+        return int(steps) if steps else 0
+
+    def set_training_steps(self, steps: int) -> None:
+        """Set total training steps.
+
+        Args:
+            steps: Total training steps completed.
+        """
+        self.redis.set(KEY_TRAINING_STEPS, str(steps))
+
+    def increment_training_steps(self, delta: int = 1) -> int:
+        """Atomically increment training steps counter.
+
+        Args:
+            delta: Number of steps to add (default 1).
+
+        Returns:
+            New total steps count.
+        """
+        return self.redis.incrby(KEY_TRAINING_STEPS, delta)
 
     # =========================================================================
     # Worker Registry
