@@ -76,10 +76,9 @@ detect_platform() {
     elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         PLATFORM="cuda"
         DEVICE_TYPE="cuda"
-        # Use cudaMallocAsync allocator for dynamic memory management
-        # Enables jax.devices()[0].memory_stats() for per-worker memory tracking
-        export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
-        echo "JAX memory allocator: cuda_async (dynamic allocation)"
+        # Set memory fraction to allow multiple workers to share GPU
+        export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
+        echo "JAX memory fraction: 0.45 (shared GPU)"
     else
         PLATFORM="cpu"
         DEVICE_TYPE="cpu"
