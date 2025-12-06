@@ -355,8 +355,16 @@ class EvalWorker(BaseWorker):
 
         self._random_evaluator = RandomEvaluator(self._env)
 
-    def _setup_mlflow(self) -> None:
-        """Set up MLflow tracking if configured."""
+    def _setup_mlflow(self, max_retries: int = 5, retry_delay: float = 3.0) -> None:
+        """Set up MLflow tracking if configured.
+
+        Retries attachment to handle race condition where eval worker starts
+        before training worker has created/updated the MLflow run.
+
+        Args:
+            max_retries: Maximum number of retry attempts.
+            retry_delay: Seconds to wait between retries.
+        """
         if not self.mlflow_tracking_uri:
             print(f"Worker {self.worker_id}: MLflow not configured, skipping")
             return
@@ -367,20 +375,43 @@ class EvalWorker(BaseWorker):
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
             mlflow.set_experiment(self.mlflow_experiment_name)
 
-            # Get run ID from Redis (shared with training worker)
-            run_id = self.state.get_run_id()
+            # Retry loop to handle race condition with training worker
+            for attempt in range(max_retries):
+                # Get run ID from Redis (shared with training worker)
+                run_id = self.state.get_run_id()
 
-            if run_id:
-                # Resume existing run (same run as training worker)
-                try:
-                    self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
-                    print(f"Worker {self.worker_id}: Attached to MLflow run {run_id} (system metrics enabled)")
-                except Exception as resume_error:
-                    print(f"Worker {self.worker_id}: Could not attach to run {run_id}: {resume_error}")
+                if run_id:
+                    # Try to attach to existing run
+                    try:
+                        self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
+                        print(f"Worker {self.worker_id}: Attached to MLflow run {run_id} (system metrics enabled)")
+                        return  # Success
+                    except Exception as resume_error:
+                        if 'RESOURCE_DOES_NOT_EXIST' in str(resume_error):
+                            # Run ID in Redis doesn't exist in MLflow yet
+                            # Training worker may be creating a new run
+                            if attempt < max_retries - 1:
+                                print(
+                                    f"Worker {self.worker_id}: Run {run_id} not found, "
+                                    f"waiting for training worker... (attempt {attempt + 1}/{max_retries})"
+                                )
+                                time.sleep(retry_delay)
+                                continue
+                        print(f"Worker {self.worker_id}: Could not attach to run {run_id}: {resume_error}")
+                        self._mlflow_run = None
+                        return
+                else:
+                    # No run ID yet, training worker may not have started
+                    if attempt < max_retries - 1:
+                        print(
+                            f"Worker {self.worker_id}: No MLflow run ID in Redis, "
+                            f"waiting for training worker... (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    print(f"Worker {self.worker_id}: No MLflow run ID found in Redis after {max_retries} attempts")
                     self._mlflow_run = None
-            else:
-                print(f"Worker {self.worker_id}: No MLflow run ID found in Redis")
-                self._mlflow_run = None
+                    return
 
         except Exception as e:
             print(f"Worker {self.worker_id}: MLflow setup error: {e}")
