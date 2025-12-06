@@ -70,7 +70,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_loss",
+          "expr": "max(bgai_training_loss)",
           "legendFormat": "Loss",
           "refId": "A"
         }
@@ -101,7 +101,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_steps_total",
+          "expr": "max(bgai_training_steps_total)",
           "legendFormat": "Steps",
           "refId": "A"
         }
@@ -133,7 +133,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_steps_per_second",
+          "expr": "max(bgai_training_steps_per_second)",
           "legendFormat": "Steps/s",
           "refId": "A"
         }
@@ -164,7 +164,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_batches_total",
+          "expr": "max(bgai_training_batches_total)",
           "legendFormat": "Batches",
           "refId": "A"
         }
@@ -195,7 +195,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_games_since_last_train",
+          "expr": "max(bgai_games_since_last_train)",
           "legendFormat": "Games",
           "refId": "A"
         }
@@ -241,7 +241,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_loss",
+          "expr": "max(bgai_training_loss)",
           "legendFormat": "Training Loss",
           "refId": "A"
         }
@@ -287,12 +287,12 @@
       },
       "targets": [
         {
-          "expr": "rate(bgai_training_steps_total[1m])",
+          "expr": "sum(rate(bgai_training_steps_total[1m]))",
           "legendFormat": "Training Steps/s",
           "refId": "A"
         },
         {
-          "expr": "rate(bgai_collection_steps_total[1m])",
+          "expr": "sum(rate(bgai_collection_steps_total[1m]))",
           "legendFormat": "Collection Steps/s",
           "refId": "B"
         }
@@ -302,6 +302,394 @@
     },
     {
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 108,
+      "title": "Value Head Metrics (6-Way Outcome)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Loss",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 70,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "bgai_value_loss_per_outcome{outcome=\"win\"}",
+          "legendFormat": "Win",
+          "refId": "A"
+        },
+        {
+          "expr": "bgai_value_loss_per_outcome{outcome=\"gammon_win\"}",
+          "legendFormat": "Gammon Win",
+          "refId": "B"
+        },
+        {
+          "expr": "bgai_value_loss_per_outcome{outcome=\"backgammon_win\"}",
+          "legendFormat": "Backgammon Win",
+          "refId": "C"
+        },
+        {
+          "expr": "bgai_value_loss_per_outcome{outcome=\"loss\"}",
+          "legendFormat": "Loss",
+          "refId": "D"
+        },
+        {
+          "expr": "bgai_value_loss_per_outcome{outcome=\"gammon_loss\"}",
+          "legendFormat": "Gammon Loss",
+          "refId": "E"
+        },
+        {
+          "expr": "bgai_value_loss_per_outcome{outcome=\"backgammon_loss\"}",
+          "legendFormat": "Backgammon Loss",
+          "refId": "F"
+        }
+      ],
+      "title": "Per-Outcome Value Loss",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Probability",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 71,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "bgai_predicted_outcome_prob{outcome=\"win\"}",
+          "legendFormat": "Pred Win",
+          "refId": "A"
+        },
+        {
+          "expr": "bgai_target_outcome_prob{outcome=\"win\"}",
+          "legendFormat": "Target Win",
+          "refId": "B"
+        },
+        {
+          "expr": "bgai_predicted_outcome_prob{outcome=\"loss\"}",
+          "legendFormat": "Pred Loss",
+          "refId": "C"
+        },
+        {
+          "expr": "bgai_target_outcome_prob{outcome=\"loss\"}",
+          "legendFormat": "Target Loss",
+          "refId": "D"
+        }
+      ],
+      "title": "Win/Loss Probability Calibration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Probability",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "id": 72,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "bgai_predicted_outcome_prob{outcome=\"gammon_win\"}",
+          "legendFormat": "Pred Gammon Win",
+          "refId": "A"
+        },
+        {
+          "expr": "bgai_target_outcome_prob{outcome=\"gammon_win\"}",
+          "legendFormat": "Target Gammon Win",
+          "refId": "B"
+        },
+        {
+          "expr": "bgai_predicted_outcome_prob{outcome=\"gammon_loss\"}",
+          "legendFormat": "Pred Gammon Loss",
+          "refId": "C"
+        },
+        {
+          "expr": "bgai_target_outcome_prob{outcome=\"gammon_loss\"}",
+          "legendFormat": "Target Gammon Loss",
+          "refId": "D"
+        }
+      ],
+      "title": "Gammon Probability Calibration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Accuracy",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "id": 73,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "bgai_value_accuracy",
+          "legendFormat": "Value Accuracy",
+          "refId": "A"
+        },
+        {
+          "expr": "bgai_policy_accuracy",
+          "legendFormat": "Policy Accuracy",
+          "refId": "B"
+        }
+      ],
+      "title": "Prediction Accuracy",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 2,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 30 },
+      "id": 74,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_value_accuracy",
+          "legendFormat": "Value Accuracy",
+          "refId": "A"
+        }
+      ],
+      "title": "Value Accuracy",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 2,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 30 },
+      "id": 75,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_policy_accuracy",
+          "legendFormat": "Policy Accuracy",
+          "refId": "A"
+        }
+      ],
+      "title": "Policy Accuracy",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "decimals": 4,
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 30 },
+      "id": 76,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_training_loss{loss_type=\"value\"}",
+          "legendFormat": "Value Loss",
+          "refId": "A"
+        }
+      ],
+      "title": "Value Loss",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "decimals": 4,
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 30 },
+      "id": 77,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_training_loss{loss_type=\"policy\"}",
+          "legendFormat": "Policy Loss",
+          "refId": "A"
+        }
+      ],
+      "title": "Policy Loss",
+      "type": "stat"
+    },
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
       "id": 101,
       "title": "Game Collection",
       "type": "row"
@@ -615,7 +1003,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_size",
+          "expr": "max(bgai_buffer_size)",
           "legendFormat": "Experiences",
           "refId": "A"
         }
@@ -646,7 +1034,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_games",
+          "expr": "max(bgai_buffer_games)",
           "legendFormat": "Games",
           "refId": "A"
         }
@@ -677,7 +1065,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_episodes",
+          "expr": "max(bgai_buffer_episodes)",
           "legendFormat": "Episodes",
           "refId": "A"
         }
@@ -708,7 +1096,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_episodes_with_surprise",
+          "expr": "max(bgai_episodes_with_surprise)",
           "legendFormat": "Episodes",
           "refId": "A"
         }
@@ -754,12 +1142,12 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_size",
+          "expr": "max(bgai_buffer_size)",
           "legendFormat": "Experiences",
           "refId": "A"
         },
         {
-          "expr": "bgai_buffer_games",
+          "expr": "max(bgai_buffer_games)",
           "legendFormat": "Games",
           "refId": "B"
         }
@@ -805,12 +1193,12 @@
       },
       "targets": [
         {
-          "expr": "bgai_surprise_score_max",
+          "expr": "max(bgai_surprise_score_max)",
           "legendFormat": "Max Surprise",
           "refId": "A"
         },
         {
-          "expr": "bgai_surprise_score_mean",
+          "expr": "max(bgai_surprise_score_mean)",
           "legendFormat": "Mean Surprise",
           "refId": "B"
         }
@@ -848,7 +1236,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_surprise_score_max",
+          "expr": "max(bgai_surprise_score_max)",
           "legendFormat": "Max",
           "refId": "A"
         }
@@ -880,7 +1268,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_surprise_score_mean",
+          "expr": "max(bgai_surprise_score_mean)",
           "legendFormat": "Mean",
           "refId": "A"
         }
@@ -981,11 +1369,11 @@
       "targets": [
         {
           "expr": "bgai_cpu_percent",
-          "legendFormat": "{{worker_id}}",
+          "legendFormat": "{{host}}",
           "refId": "A"
         }
       ],
-      "title": "CPU Usage by Worker",
+      "title": "CPU Usage by Host",
       "type": "timeseries"
     },
     {
@@ -1029,11 +1417,11 @@
       "targets": [
         {
           "expr": "bgai_memory_percent",
-          "legendFormat": "{{worker_id}}",
+          "legendFormat": "{{host}}",
           "refId": "A"
         }
       ],
-      "title": "System RAM Usage by Worker",
+      "title": "System RAM Usage by Host",
       "type": "timeseries"
     },
     {
@@ -1077,11 +1465,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_utilization_percent",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Utilization by Worker",
+      "title": "GPU Utilization by Host",
       "type": "timeseries"
     },
     {
@@ -1125,11 +1513,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_memory_percent",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Memory Usage by Worker",
+      "title": "GPU Memory Usage by Host",
       "type": "timeseries"
     },
     {
@@ -1171,11 +1559,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_temperature_celsius",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Temperature by Worker",
+      "title": "GPU Temperature by Host",
       "type": "timeseries"
     },
     {
@@ -1217,12 +1605,397 @@
       "targets": [
         {
           "expr": "bgai_gpu_power_watts",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Power Draw by Worker",
+      "title": "GPU Power Draw by Host",
       "type": "timeseries"
+    },
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 73 },
+      "id": 105,
+      "title": "TPU Resources",
+      "type": "row",
+      "collapsed": true,
+      "panels": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "TPU %",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "lineInterpolation": "smooth",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "max": 100,
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }] },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 74 },
+          "id": 50,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "expr": "bgai_tpu_duty_cycle_percent",
+              "legendFormat": "{{host}} (TPU {{tpu_index}})",
+              "refId": "A"
+            }
+          ],
+          "title": "TPU Duty Cycle by Host",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "HBM %",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "none",
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "lineInterpolation": "smooth",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": { "type": "linear" },
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": { "group": "A", "mode": "none" },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "max": 100,
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }] },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 74 },
+          "id": 51,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "expr": "bgai_tpu_hbm_memory_percent",
+              "legendFormat": "{{host}} (TPU {{tpu_index}})",
+              "refId": "A"
+            }
+          ],
+          "title": "TPU HBM Memory by Host",
+          "type": "timeseries"
+        }
+      ]
+    },
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 82 },
+      "id": 106,
+      "title": "Worker Status",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "red", "index": 0, "text": "Stopped" }, "1": { "color": "green", "index": 1, "text": "Running" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 83 },
+      "id": 60,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": false, "displayName": "worker_id" }]
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "expr": "bgai_worker_status",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Workers",
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true }, "indexByName": {}, "renameByName": { "Value": "Status", "worker_id": "Worker ID", "worker_type": "Type" } } }
+      ],
+      "type": "table"
+    },
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
+      "id": 107,
+      "title": "Evaluation Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Win Rate",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.3 }, { "color": "green", "value": 0.5 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 92 },
+      "id": 61,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "bgai_eval_win_rate{eval_type=\"random\"}",
+          "legendFormat": "vs Random (v{{model_version}})",
+          "refId": "A"
+        },
+        {
+          "expr": "bgai_eval_win_rate{eval_type=\"gnubg\"}",
+          "legendFormat": "vs GNUBG (v{{model_version}})",
+          "refId": "B"
+        },
+        {
+          "expr": "bgai_eval_win_rate{eval_type=\"self_play\"}",
+          "legendFormat": "Self-Play (v{{model_version}})",
+          "refId": "C"
+        }
+      ],
+      "title": "Evaluation Win Rate Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Games",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 92 },
+      "id": 62,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum(bgai_eval_games_total) by (eval_type)",
+          "legendFormat": "{{eval_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Eval Games by Type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.3 }, { "color": "green", "value": 0.5 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 100 },
+      "id": 63,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_eval_win_rate{eval_type=\"random\"}",
+          "legendFormat": "vs Random",
+          "refId": "A"
+        }
+      ],
+      "title": "Win Rate vs Random",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.2 }, { "color": "green", "value": 0.4 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 100 },
+      "id": 64,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_eval_win_rate{eval_type=\"gnubg\"}",
+          "legendFormat": "vs GNUBG",
+          "refId": "A"
+        }
+      ],
+      "title": "Win Rate vs GNUBG",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 100 },
+      "id": 65,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_eval_win_rate{eval_type=\"self_play\"}",
+          "legendFormat": "Self-Play",
+          "refId": "A"
+        }
+      ],
+      "title": "Self-Play Win Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 100 },
+      "id": 66,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "bgai_eval_avg_game_length",
+          "legendFormat": "Avg Length",
+          "refId": "A"
+        }
+      ],
+      "title": "Avg Game Length",
+      "type": "stat"
     }
   ],
   "refresh": "10s",

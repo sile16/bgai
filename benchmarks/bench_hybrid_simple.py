@@ -46,9 +46,9 @@ class TinyNet(nn.Module):
         h = nn.Dense(64)(x)
         h = nn.relu(h)
         policy = nn.Dense(self.num_actions)(h)
-        value = nn.Dense(1)(h)
-        value = jnp.squeeze(value, axis=-1)
-        return policy, value
+        # 6-way value head for backgammon outcome distribution
+        value_logits = nn.Dense(6)(h)
+        return policy, value_logits
 
 
 def create_hybrid_eval_fn(model, params, gpu_device, cpu_device):

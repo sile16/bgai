@@ -53,8 +53,13 @@ def configure_gpu_fraction(num_gpus: float) -> None:
     Args:
         num_gpus: Fraction of GPU to use (0.0-1.0).
                   Use 0.5 to share GPU between two processes.
+                  Use 0 to force CPU-only mode.
     """
-    if num_gpus < 1.0:
+    if num_gpus == 0:
+        # Force CPU-only mode - don't use GPU at all
+        os.environ['JAX_PLATFORMS'] = 'cpu'
+        print("Forcing CPU-only mode (JAX_PLATFORMS=cpu)")
+    elif num_gpus < 1.0:
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(num_gpus)
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
         print(f"GPU memory fraction set to {num_gpus}")
@@ -168,7 +173,8 @@ def start_training_worker(args):
 
     # Get device-specific config with optional batch size override
     batch_override = args.batch_size if args.batch_size != 128 else None
-    config = get_training_worker_config(yaml_config, device_type, batch_override)
+    head_ip = getattr(args, 'head_ip', None)
+    config = get_training_worker_config(yaml_config, device_type, batch_override, head_ip=head_ip)
 
     # CLI overrides
     if args.redis_host != 'localhost':
@@ -181,14 +187,14 @@ def start_training_worker(args):
         config['learning_rate'] = args.learning_rate
     if args.l2_reg != 1e-4:
         config['l2_reg_lambda'] = args.l2_reg
-    if args.games_per_batch != 10:
-        config['games_per_training_batch'] = args.games_per_batch
+    if args.games_per_epoch != 10:
+        config['games_per_epoch'] = args.games_per_epoch
     if args.steps_per_game != 10:
         config['steps_per_game'] = args.steps_per_game
     if args.surprise_weight != 0.5:
         config['surprise_weight'] = args.surprise_weight
-    if args.checkpoint_interval != 1000:
-        config['checkpoint_interval'] = args.checkpoint_interval
+    if args.checkpoint_epoch_interval != 5:
+        config['checkpoint_epoch_interval'] = args.checkpoint_epoch_interval
     if args.min_buffer_size != 1000:
         config['min_buffer_size'] = args.min_buffer_size
     if args.checkpoint_dir:
@@ -235,7 +241,8 @@ def start_eval_worker(args):
 
     # Get device-specific config with optional batch size override
     batch_override = args.batch_size if args.batch_size != 16 else None
-    config = get_eval_worker_config(yaml_config, device_type, batch_override)
+    head_ip = getattr(args, 'head_ip', None)
+    config = get_eval_worker_config(yaml_config, device_type, batch_override, head_ip=head_ip)
 
     # CLI overrides
     if args.redis_host != 'localhost':
@@ -549,6 +556,12 @@ def main():
         default=1.0,
         help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
     )
+    game_parser.add_argument(
+        '--head-ip',
+        type=str,
+        default=None,
+        help='Head node IP for MLflow/services (auto-detected if not provided)'
+    )
     game_parser.set_defaults(func=start_game_worker)
 
     # =========================================================================
@@ -589,10 +602,10 @@ def main():
         help='L2 regularization weight (default: 1e-4)'
     )
     train_parser.add_argument(
-        '--games-per-batch',
+        '--games-per-epoch',
         type=int,
         default=10,
-        help='New games required to trigger a training batch (default: 10)'
+        help='New games required to trigger a training epoch (default: 10)'
     )
     train_parser.add_argument(
         '--steps-per-game',
@@ -607,10 +620,10 @@ def main():
         help='Weight for surprise-based sampling (0=uniform, 1=fully weighted, default: 0.5)'
     )
     train_parser.add_argument(
-        '--checkpoint-interval',
+        '--checkpoint-epoch-interval',
         type=int,
-        default=1000,
-        help='Steps between checkpoints (default: 1000)'
+        default=5,
+        help='Epochs between checkpoints (default: 5)'
     )
     train_parser.add_argument(
         '--min-buffer-size',
@@ -671,6 +684,12 @@ def main():
         type=float,
         default=1.0,
         help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
+    )
+    train_parser.add_argument(
+        '--head-ip',
+        type=str,
+        default=None,
+        help='Head node IP for MLflow/services (auto-detected if not provided)'
     )
     train_parser.set_defaults(func=start_training_worker)
 
@@ -764,6 +783,12 @@ def main():
         type=float,
         default=1.0,
         help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
+    )
+    eval_parser.add_argument(
+        '--head-ip',
+        type=str,
+        default=None,
+        help='Head node IP for MLflow/services (auto-detected if not provided)'
     )
     eval_parser.set_defaults(func=start_eval_worker)
 

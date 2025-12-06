@@ -159,7 +159,7 @@ class ModelComparisonBenchmark(BaseBenchmark):
                 num_blocks: int = 5  # More blocks for 10-layer network
 
                 @nn.compact
-                def __call__(self, x, train: bool = False):
+                def __call__(self, x, _train: bool = False):
                     # Initial projection
                     x = nn.Dense(self.num_hidden)(x)
                     x = nn.LayerNorm()(x)
@@ -172,10 +172,9 @@ class ModelComparisonBenchmark(BaseBenchmark):
                     # Policy head
                     policy_logits = nn.Dense(self.num_actions)(x)
 
-                    # Value head
-                    value = nn.Dense(1)(x)
-                    value = jnp.squeeze(value, axis=-1)
-                    return policy_logits, value
+                    # 6-way value head for backgammon outcome distribution
+                    value_logits = nn.Dense(6)(x)
+                    return policy_logits, value_logits
 
             # Create network instance and store it
             self.network = ResNetTurboZero(self.bg_env.num_actions, num_hidden=128, num_blocks=5)

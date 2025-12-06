@@ -18,7 +18,7 @@ import flax.linen as nn
 import optax
 
 # TurboZero imports
-from core.training.train import Trainer, CollectionState
+from core.training.train import Trainer
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.evaluation_fns import make_nn_eval_fn
@@ -118,11 +118,11 @@ class TrainingLoopBenchmark(BaseBenchmark):
         return init_fn
     
     def _create_network(self):
-        """Create a simple MLP network for benchmarking."""
+        """Create a simple MLP network for benchmarking with 6-way value head."""
         mlp_config = MLPConfig(
             hidden_dims=[256, 256, 256],
             policy_head_out_size=self.bg_env.num_actions,
-            value_head_out_size=1
+            value_head_out_size=6  # 6-way outcome distribution for backgammon
         )
         return MLP(mlp_config)
     

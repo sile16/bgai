@@ -37,7 +37,7 @@ from tqdm import tqdm
 from core.types import StepMetadata
 
 # Import MCTS Evaluator - Updated to use the correct classes
-from core.evaluators.mcts import MCTS, MCTSConfig, MCTSTree, MCTSActionSelector
+from core.evaluators.mcts import MCTS, MCTSConfig, MCTSTree
 from core.evaluators.mcts.action_selection import PUCTSelector
 
 # Import common benchmark functionality
@@ -47,7 +47,6 @@ from benchmarks.benchmark_common import (
     DEFAULT_MEMORY_LIMIT_GB,
     DEFAULT_BENCHMARK_DURATION,
     PROFILE_DIR,
-    GRAPHS_DIR,
     format_human_readable,
     get_system_info,
     print_system_info,
@@ -57,11 +56,8 @@ from benchmarks.benchmark_common import (
     save_profile,
     load_profile,
     generate_benchmark_plots,
-    print_benchmark_summary,
     validate_against_profile,
-    select_batch_sizes_for_profile,
     print_summary_table,
-    get_cpu_gpu_usage,
     BaseBenchmark,
 )
 

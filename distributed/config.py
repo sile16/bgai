@@ -17,11 +17,15 @@ import yaml
 @dataclass
 class MCTSConfig:
     """MCTS evaluator configuration."""
-    simulations: int = 100
+    collect_simulations: int = 100  # MCTS iterations for game collection
+    eval_simulations: int = 50      # MCTS iterations for evaluation
     max_nodes: int = 400
-    temperature: float = 1.0
-    discount: float = -1.0  # -1 for two-player zero-sum games
+    warm_tree_simulations: int = 0  # MCTS sims for warm tree (0 = disabled)
     persist_tree: bool = True
+    temperature_start: float = 0.8
+    temperature_end: float = 0.2
+    temperature_epochs: int = 50    # Epochs to decay from start to end
+    discount: float = -1.0  # -1 for two-player zero-sum games
 
 
 @dataclass
@@ -30,8 +34,14 @@ class TrainingConfig:
     batch_size: int = 128
     learning_rate: float = 3e-4
     l2_reg_lambda: float = 1e-4
-    checkpoint_interval: int = 1000
+    games_per_epoch: int = 10           # New games before training epoch
+    surprise_weight: float = 0.5        # Blend of uniform vs surprise-weighted sampling
+    checkpoint_epoch_interval: int = 5  # Epochs between checkpoints
     max_checkpoints: int = 5
+    bearoff_enabled: bool = False
+    bearoff_value_weight: float = 2.0
+    lookup_enabled: bool = False
+    lookup_learning_weight: float = 1.5
 
 
 @dataclass
@@ -39,8 +49,8 @@ class GameConfig:
     """Game/self-play configuration."""
     batch_size: int = 16  # Parallel games per worker
     max_episode_steps: int = 500
-    temperature_start: float = 1.0
-    temperature_end: float = 0.2
+    short_game: bool = True         # Start from mid-game position
+    simple_doubles: bool = False    # Limit randomness with simple doubles
 
 
 @dataclass
@@ -317,12 +327,14 @@ def validate_config(config: DistributedConfig) -> list:
     issues = []
 
     # MCTS validation
-    if config.mcts.simulations < 1:
-        issues.append("mcts.simulations must be >= 1")
-    if config.mcts.max_nodes < config.mcts.simulations:
-        issues.append("mcts.max_nodes should be >= mcts.simulations")
-    if not 0 <= config.mcts.temperature <= 10:
-        issues.append("mcts.temperature should be in [0, 10]")
+    if config.mcts.collect_simulations < 1:
+        issues.append("mcts.collect_simulations must be >= 1")
+    if config.mcts.max_nodes < config.mcts.collect_simulations:
+        issues.append("mcts.max_nodes should be >= mcts.collect_simulations")
+    if not 0 <= config.mcts.temperature_start <= 10:
+        issues.append("mcts.temperature_start should be in [0, 10]")
+    if not 0 <= config.mcts.temperature_end <= 10:
+        issues.append("mcts.temperature_end should be in [0, 10]")
 
     # Training validation
     if config.training.batch_size < 1:
@@ -380,10 +392,12 @@ def merge_cli_args(config: DistributedConfig, cli_args: Dict[str, Any]) -> Distr
     cli_mapping = {
         'redis_host': ('redis', 'host'),
         'redis_port': ('redis', 'port'),
-        'mcts_simulations': ('mcts', 'simulations'),
+        'mcts_simulations': ('mcts', 'collect_simulations'),
         'mcts_max_nodes': ('mcts', 'max_nodes'),
         'train_batch_size': ('training', 'batch_size'),
         'learning_rate': ('training', 'learning_rate'),
+        'games_per_epoch': ('training', 'games_per_epoch'),
+        'checkpoint_epoch_interval': ('training', 'checkpoint_epoch_interval'),
         'game_batch_size': ('game', 'batch_size'),
         'checkpoint_dir': ('checkpoint_dir', None),
         'worker_type': ('worker', 'worker_type'),

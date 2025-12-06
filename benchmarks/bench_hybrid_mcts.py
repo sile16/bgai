@@ -14,7 +14,7 @@ import os
 import sys
 import time
 from functools import partial
-from typing import Tuple, Optional, Callable
+from typing import Tuple, Optional
 
 # Set platform BEFORE importing JAX - need both CPU and Metal
 os.environ['JAX_PLATFORMS'] = 'cpu,METAL'
@@ -67,11 +67,10 @@ class SimpleResNet(nn.Module):
         # Policy head
         policy = nn.Dense(self.num_actions)(h)
 
-        # Value head
-        value = nn.Dense(1)(h)
-        value = jnp.squeeze(value, axis=-1)
+        # 6-way value head for backgammon outcome distribution
+        value_logits = nn.Dense(6)(h)
 
-        return policy, value
+        return policy, value_logits
 
 
 def create_nn_eval_fn(model, params, state_to_input_fn, gpu_device=None, cpu_device=None):

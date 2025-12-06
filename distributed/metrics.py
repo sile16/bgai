@@ -52,6 +52,13 @@ try:
 except ImportError:
     HAS_PYNVML = False
 
+# TPU monitoring via libtpu SDK (available when jax[tpu] is installed)
+try:
+    from libtpu.sdk import tpumonitoring
+    HAS_TPU_MONITORING = True
+except ImportError:
+    HAS_TPU_MONITORING = False
+
 
 class BGAIMetrics:
     """Container for all BGAI training metrics."""
@@ -131,6 +138,44 @@ class BGAIMetrics:
             'bgai_training_loss',
             'Current training loss',
             ['worker_id', 'loss_type'],
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # Per-Outcome Value Loss Metrics (6-way value head)
+        # =================================================================
+        self.value_loss_per_outcome = Gauge(
+            'bgai_value_loss_per_outcome',
+            'Value loss contribution per outcome type',
+            ['worker_id', 'outcome'],
+            registry=self.registry,
+        )
+
+        self.predicted_outcome_prob = Gauge(
+            'bgai_predicted_outcome_prob',
+            'Mean predicted probability per outcome type',
+            ['worker_id', 'outcome'],
+            registry=self.registry,
+        )
+
+        self.target_outcome_prob = Gauge(
+            'bgai_target_outcome_prob',
+            'Mean target probability per outcome type (ground truth distribution)',
+            ['worker_id', 'outcome'],
+            registry=self.registry,
+        )
+
+        self.value_accuracy = Gauge(
+            'bgai_value_accuracy',
+            'Top-1 accuracy of value predictions (predicted outcome matches target)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.policy_accuracy = Gauge(
+            'bgai_policy_accuracy',
+            'Top-1 accuracy of policy predictions',
+            ['worker_id'],
             registry=self.registry,
         )
 
@@ -224,6 +269,13 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.mcts_temperature = Gauge(
+            'bgai_mcts_temperature',
+            'Current MCTS exploration temperature (decays over game progress)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
         self.weight_updates_total = Counter(
             'bgai_weight_updates_total',
             'Total weight updates pushed',
@@ -304,80 +356,152 @@ class BGAIMetrics:
         # =================================================================
         # System Metrics (CPU, RAM, GPU, GPU RAM)
         # =================================================================
+        # System metrics use 'host' label so multiple workers on same host
+        # update the same time series (avoiding duplication)
         self.cpu_percent = Gauge(
             'bgai_cpu_percent',
             'CPU utilization percentage (0-100)',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.cpu_count = Gauge(
             'bgai_cpu_count',
             'Number of CPU cores',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.memory_used_bytes = Gauge(
             'bgai_memory_used_bytes',
             'System RAM used in bytes',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.memory_total_bytes = Gauge(
             'bgai_memory_total_bytes',
             'Total system RAM in bytes',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.memory_percent = Gauge(
             'bgai_memory_percent',
             'System RAM utilization percentage (0-100)',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.gpu_utilization_percent = Gauge(
             'bgai_gpu_utilization_percent',
             'GPU compute utilization percentage (0-100)',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_memory_used_bytes = Gauge(
             'bgai_gpu_memory_used_bytes',
             'GPU memory used in bytes',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_memory_total_bytes = Gauge(
             'bgai_gpu_memory_total_bytes',
             'Total GPU memory in bytes',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_memory_percent = Gauge(
             'bgai_gpu_memory_percent',
             'GPU memory utilization percentage (0-100)',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_temperature = Gauge(
             'bgai_gpu_temperature_celsius',
             'GPU temperature in Celsius',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_power_watts = Gauge(
             'bgai_gpu_power_watts',
             'GPU power draw in watts',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # JAX Memory Metrics (per-worker, requires cuda_async allocator)
+        # These track actual JAX memory usage, not just GPU allocation
+        # =================================================================
+        self.jax_memory_bytes_in_use = Gauge(
+            'bgai_jax_memory_bytes_in_use',
+            'JAX memory currently in use (bytes)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.jax_memory_peak_bytes = Gauge(
+            'bgai_jax_memory_peak_bytes',
+            'JAX peak memory usage (bytes)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.jax_memory_bytes_limit = Gauge(
+            'bgai_jax_memory_bytes_limit',
+            'JAX memory limit (bytes)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.jax_memory_num_allocs = Gauge(
+            'bgai_jax_memory_num_allocs',
+            'Number of JAX memory allocations',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        # =================================================================
+        # TPU Metrics (via libtpu SDK)
+        # =================================================================
+        self.tpu_duty_cycle_percent = Gauge(
+            'bgai_tpu_duty_cycle_percent',
+            'TPU TensorCore duty cycle percentage (0-100)',
+            ['host', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_tensor_core_utilization = Gauge(
+            'bgai_tpu_tensor_core_utilization',
+            'TPU Tensor Core utilization percentage (0-100)',
+            ['host', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_hbm_memory_used_bytes = Gauge(
+            'bgai_tpu_hbm_memory_used_bytes',
+            'TPU High Bandwidth Memory used in bytes',
+            ['host', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_hbm_memory_total_bytes = Gauge(
+            'bgai_tpu_hbm_memory_total_bytes',
+            'TPU High Bandwidth Memory total in bytes',
+            ['host', 'tpu_index'],
+            registry=self.registry,
+        )
+
+        self.tpu_hbm_memory_percent = Gauge(
+            'bgai_tpu_hbm_memory_percent',
+            'TPU High Bandwidth Memory utilization percentage (0-100)',
+            ['host', 'tpu_index'],
             registry=self.registry,
         )
 
@@ -410,6 +534,7 @@ class BGAIMetrics:
 _metrics: Optional[BGAIMetrics] = None
 _metrics_lock = threading.Lock()
 _server_started = False
+_server_port: Optional[int] = None
 
 
 def get_metrics() -> BGAIMetrics:
@@ -425,25 +550,27 @@ def get_metrics() -> BGAIMetrics:
         return _metrics
 
 
-def start_metrics_server(port: int = 9100) -> bool:
+def start_metrics_server(port: int = 9100) -> Optional[int]:
     """Start the Prometheus metrics HTTP server.
 
     Args:
         port: Port to serve metrics on.
 
     Returns:
-        True if server started, False if already running.
+        The actual port the server is running on, or None if failed to start.
+        Returns the existing port if server was already running.
     """
-    global _server_started
+    global _server_started, _server_port
     with _metrics_lock:
         if _server_started:
-            return False
+            return _server_port
 
         try:
             start_http_server(port)
             _server_started = True
+            _server_port = port
             print(f"Prometheus metrics server started on port {port}")
-            return True
+            return port
         except Exception as e:
             print(f"Failed to start metrics server on port {port}: {e}")
             # Try alternative ports
@@ -451,19 +578,21 @@ def start_metrics_server(port: int = 9100) -> bool:
                 try:
                     start_http_server(alt_port)
                     _server_started = True
+                    _server_port = alt_port
                     print(f"Prometheus metrics server started on port {alt_port}")
-                    return True
+                    return alt_port
                 except Exception:
                     continue
-            return False
+            return None
 
 
 def reset_metrics():
     """Reset the global metrics instance (for testing)."""
-    global _metrics, _server_started
+    global _metrics, _server_started, _server_port
     with _metrics_lock:
         _metrics = None
         _server_started = False
+        _server_port = None
 
 
 # =============================================================================
@@ -727,12 +856,15 @@ class SystemMetricsCollector(threading.Thread):
         """Initialize the system metrics collector.
 
         Args:
-            worker_id: Unique worker identifier for metric labels.
+            worker_id: Unique worker identifier (used for logging, not metrics).
             update_interval: Seconds between metric collections.
             gpu_indices: List of GPU indices to monitor (None = all available).
         """
         super().__init__(daemon=True)
         self.worker_id = worker_id
+        # Use hostname for system metrics to avoid duplication when multiple
+        # workers run on the same host
+        self.hostname = socket.gethostname()
         self.update_interval = update_interval
         self.gpu_indices = gpu_indices
         self._stop_event = threading.Event()
@@ -786,14 +918,14 @@ class SystemMetricsCollector(threading.Thread):
             cpu_percent = psutil.cpu_percent(interval=None)
             cpu_count = psutil.cpu_count()
 
-            metrics.cpu_percent.labels(worker_id=self.worker_id).set(cpu_percent)
-            metrics.cpu_count.labels(worker_id=self.worker_id).set(cpu_count)
+            metrics.cpu_percent.labels(host=self.hostname).set(cpu_percent)
+            metrics.cpu_count.labels(host=self.hostname).set(cpu_count)
 
             # Memory metrics
             mem = psutil.virtual_memory()
-            metrics.memory_used_bytes.labels(worker_id=self.worker_id).set(mem.used)
-            metrics.memory_total_bytes.labels(worker_id=self.worker_id).set(mem.total)
-            metrics.memory_percent.labels(worker_id=self.worker_id).set(mem.percent)
+            metrics.memory_used_bytes.labels(host=self.hostname).set(mem.used)
+            metrics.memory_total_bytes.labels(host=self.hostname).set(mem.total)
+            metrics.memory_percent.labels(host=self.hostname).set(mem.percent)
 
         except Exception as e:
             print(f"Error collecting CPU metrics: {e}")
@@ -808,7 +940,7 @@ class SystemMetricsCollector(threading.Thread):
                 # GPU utilization
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 metrics.gpu_utilization_percent.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(util.gpu)
@@ -816,17 +948,17 @@ class SystemMetricsCollector(threading.Thread):
                 # GPU memory
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 metrics.gpu_memory_used_bytes.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(mem_info.used)
                 metrics.gpu_memory_total_bytes.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(mem_info.total)
                 metrics.gpu_memory_percent.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(100.0 * mem_info.used / mem_info.total if mem_info.total > 0 else 0)
@@ -835,7 +967,7 @@ class SystemMetricsCollector(threading.Thread):
                 try:
                     temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
                     metrics.gpu_temperature.labels(
-                        worker_id=self.worker_id,
+                        host=self.hostname,
                         gpu_index=str(idx),
                         gpu_name=name,
                     ).set(temp)
@@ -846,7 +978,7 @@ class SystemMetricsCollector(threading.Thread):
                 try:
                     power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW to W
                     metrics.gpu_power_watts.labels(
-                        worker_id=self.worker_id,
+                        host=self.hostname,
                         gpu_index=str(idx),
                         gpu_name=name,
                     ).set(power)
@@ -855,6 +987,111 @@ class SystemMetricsCollector(threading.Thread):
 
         except Exception as e:
             print(f"Error collecting GPU metrics: {e}")
+
+    def _collect_tpu_metrics(self, metrics: BGAIMetrics):
+        """Collect TPU metrics via libtpu SDK.
+
+        Uses the libtpu.sdk.tpumonitoring module to collect TPU metrics
+        including duty cycle, tensor core utilization, and HBM memory usage.
+        """
+        if not HAS_TPU_MONITORING:
+            return
+
+        try:
+            # Get available metrics from libtpu
+            # The SDK provides metrics like duty_cycle_pct, tensor_core_util_pct,
+            # hbm_capacity_total, hbm_capacity_usage, etc.
+            supported = tpumonitoring.list_supported_metrics()
+
+            # Collect metrics for each TPU chip
+            # The actual metric names may vary by TPU generation
+            for tpu_idx in range(8):  # Max 8 TPU cores per host typically
+                try:
+                    # Duty cycle percentage
+                    if 'duty_cycle_pct' in supported:
+                        duty_cycle = tpumonitoring.get_metric('duty_cycle_pct', chip=tpu_idx)
+                        if duty_cycle is not None:
+                            metrics.tpu_duty_cycle_percent.labels(
+                                host=self.hostname,
+                                tpu_index=str(tpu_idx),
+                            ).set(duty_cycle)
+
+                    # Tensor core utilization
+                    if 'tensor_core_util_pct' in supported:
+                        tc_util = tpumonitoring.get_metric('tensor_core_util_pct', chip=tpu_idx)
+                        if tc_util is not None:
+                            metrics.tpu_tensor_core_utilization.labels(
+                                host=self.hostname,
+                                tpu_index=str(tpu_idx),
+                            ).set(tc_util)
+
+                    # HBM memory
+                    if 'hbm_capacity_total' in supported and 'hbm_capacity_usage' in supported:
+                        hbm_total = tpumonitoring.get_metric('hbm_capacity_total', chip=tpu_idx)
+                        hbm_used = tpumonitoring.get_metric('hbm_capacity_usage', chip=tpu_idx)
+                        if hbm_total is not None and hbm_used is not None:
+                            metrics.tpu_hbm_memory_total_bytes.labels(
+                                host=self.hostname,
+                                tpu_index=str(tpu_idx),
+                            ).set(hbm_total)
+                            metrics.tpu_hbm_memory_used_bytes.labels(
+                                host=self.hostname,
+                                tpu_index=str(tpu_idx),
+                            ).set(hbm_used)
+                            if hbm_total > 0:
+                                metrics.tpu_hbm_memory_percent.labels(
+                                    host=self.hostname,
+                                    tpu_index=str(tpu_idx),
+                                ).set(100.0 * hbm_used / hbm_total)
+
+                except Exception:
+                    # No more TPU chips or metric not available for this chip
+                    break
+
+        except Exception as e:
+            # Only log once to avoid spam
+            if not hasattr(self, '_tpu_error_logged'):
+                print(f"Error collecting TPU metrics: {e}")
+                self._tpu_error_logged = True
+
+    def _collect_jax_memory_metrics(self, metrics: BGAIMetrics):
+        """Collect JAX memory metrics via device.memory_stats().
+
+        Requires XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async to get meaningful stats.
+        With the default BFC allocator, bytes_in_use will always be 0.
+        """
+        try:
+            import jax
+            devices = jax.devices()
+            if not devices:
+                return
+
+            # Get memory stats from primary device
+            device = devices[0]
+            stats = device.memory_stats()
+
+            if stats:
+                metrics.jax_memory_bytes_in_use.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('bytes_in_use', 0))
+
+                metrics.jax_memory_peak_bytes.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('peak_bytes_in_use', 0))
+
+                metrics.jax_memory_bytes_limit.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('bytes_limit', 0))
+
+                metrics.jax_memory_num_allocs.labels(
+                    worker_id=self.worker_id
+                ).set(stats.get('num_allocs', 0))
+
+        except Exception as e:
+            # Only log once to avoid spam
+            if not hasattr(self, '_jax_error_logged'):
+                print(f"Error collecting JAX memory metrics: {e}")
+                self._jax_error_logged = True
 
     def run(self):
         """Main collection loop."""
@@ -865,12 +1102,18 @@ class SystemMetricsCollector(threading.Thread):
         if HAS_PSUTIL:
             psutil.cpu_percent(interval=None)
 
+        # Log TPU availability
+        if HAS_TPU_MONITORING:
+            print(f"TPU monitoring available for worker {self.worker_id}")
+
         metrics = get_metrics()
 
         while not self._stop_event.is_set():
             try:
                 self._collect_cpu_metrics(metrics)
                 self._collect_gpu_metrics(metrics)
+                self._collect_jax_memory_metrics(metrics)
+                self._collect_tpu_metrics(metrics)
             except Exception as e:
                 print(f"Error in system metrics collection: {e}")
 

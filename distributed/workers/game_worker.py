@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.evaluation_fns import make_nn_eval_fn
+from core.evaluators.mcts.equity import terminal_value_probs_from_reward, probs_to_equity
 from core.common import step_env_and_evaluator
 from core.types import StepMetadata
 
@@ -71,7 +72,21 @@ class GameWorker(BaseWorker):
         self.num_simulations = self.config.get('num_simulations', 100)
         self.max_nodes = self.config.get('max_nodes', 400)
         self.max_episode_steps = self.config.get('max_episode_steps', 500)
+
+        # Temperature schedule: start high (exploration) -> end low (exploitation)
+        # If temperature_start/end are defined, use epoch-based decay over training
+        self.temperature_start = self.config.get('temperature_start')
+        self.temperature_end = self.config.get('temperature_end')
+        self.temperature_epochs = self.config.get('temperature_epochs', 50)
         self.temperature = self.config.get('temperature', 1.0)
+        self._use_temperature_schedule = (
+            self.temperature_start is not None and
+            self.temperature_end is not None
+        )
+        # Current temperature (updated based on model version / epoch)
+        self._current_temperature = (
+            self.temperature_start if self._use_temperature_schedule else self.temperature
+        )
 
         # Initialize Redis buffer (uses same connection info)
         redis_host = self.config.get('redis_host', 'localhost')
@@ -173,12 +188,19 @@ class GameWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
+            """ResNet-style network with 6-way value head for backgammon outcomes.
+
+            Value head outputs logits for 6 outcomes:
+            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
+            value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
-            def __call__(self, x, train: bool = False):
+            def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
+                del train  # unused but required by turbozero interface
                 x = nn.Dense(self.num_hidden)(x)
                 x = nn.LayerNorm()(x)
                 x = nn.relu(x)
@@ -187,11 +209,14 @@ class GameWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                value = nn.Dense(1)(x)
-                value = jnp.squeeze(value, axis=-1)
-                return policy_logits, value
+                # 6-way value head: outputs logits, converted to probs by evaluator
+                value_logits = nn.Dense(self.value_head_out_size)(x)
+                return policy_logits, value_logits
 
-        self._nn_model = ResNetTurboZero(self._env.num_actions, num_hidden=256, num_blocks=6)
+        # Use network config from YAML, with fallback to defaults
+        num_hidden = self.config.get('network_hidden_dim', 256)
+        num_blocks = self.config.get('network_num_blocks', 6)
+        self._nn_model = ResNetTurboZero(self._env.num_actions, num_hidden=num_hidden, num_blocks=num_blocks)
 
     def _setup_evaluator(self) -> None:
         """Set up the MCTS evaluator."""
@@ -228,7 +253,7 @@ class GameWorker(BaseWorker):
             key = jax.random.PRNGKey(42)
             sample_state, _ = self._env_init_fn(key)
             sample_obs = self._state_to_nn_input_fn(sample_state)
-            variables = self._nn_model.init(key, sample_obs[None, ...], train=False)
+            variables = self._nn_model.init(key, sample_obs[None, ...])
             self._nn_params = {'params': variables['params']}
             print(f"Worker {self.worker_id}: Initialized random weights")
 
@@ -261,6 +286,7 @@ class GameWorker(BaseWorker):
             'episode_experiences': [[] for _ in range(self.batch_size)],
             'episode_value_preds': [[] for _ in range(self.batch_size)],
             'episode_ids': [None] * self.batch_size,
+            'episode_steps': [0] * self.batch_size,  # Track steps per episode for temperature schedule
         }
 
     def _replicate_warm_tree(self, warm_tree):
@@ -277,6 +303,28 @@ class GameWorker(BaseWorker):
             return jnp.stack([x] * self.batch_size, axis=0)
 
         return jax.tree_util.tree_map(stack_leaves, warm_tree)
+
+    def _calculate_temperature(self) -> float:
+        """Calculate temperature based on training epochs (model version).
+
+        Uses linear decay from temperature_start to temperature_end over
+        temperature_epochs. This encourages exploration early in training
+        and exploitation (stronger play) as the model improves.
+
+        Returns:
+            Temperature value for MCTS action selection.
+        """
+        if not self._use_temperature_schedule:
+            return self.temperature
+
+        # Linear interpolation: start -> end over training epochs
+        # Use model version as proxy for epoch count
+        progress = min(1.0, self.current_model_version / max(1, self.temperature_epochs))
+        temperature = (
+            self.temperature_start * (1 - progress) +
+            self.temperature_end * progress
+        )
+        return float(temperature)
 
     def _check_and_update_model(self) -> None:
         """Check for and apply model updates from Redis."""
@@ -336,6 +384,11 @@ class GameWorker(BaseWorker):
         metadatas = state['metadatas']
         eval_states = state['eval_states']
 
+        # Update temperature based on training epochs (model version)
+        if self._use_temperature_schedule:
+            self._current_temperature = self._calculate_temperature()
+            self._evaluator.temperature = self._current_temperature
+
         # Step all environments
         step_keys = jax.random.split(key, self.batch_size)
 
@@ -363,11 +416,16 @@ class GameWorker(BaseWorker):
                     'cur_player_id': metadatas.cur_player_id[i],
                 }
                 state['episode_experiences'][i].append(exp)
+                state['episode_steps'][i] += 1  # Track episode progress for temperature
 
                 eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
                 value_pred = float(self._evaluator.get_value(eval_state_i))
                 cur_player = int(metadatas.cur_player_id[i])
-                value_pred_p0 = value_pred if cur_player == 0 else -value_pred
+                # get_value returns equity in [0, 1] from current player's perspective
+                # Convert to player 0's perspective for consistent surprise scoring
+                # For player 0: use value directly (P(p0 wins))
+                # For player 1: use 1 - value (opponent's win prob = our loss prob)
+                value_pred_p0 = value_pred if cur_player == 0 else 1.0 - value_pred
                 state['episode_value_preds'][i].append(value_pred_p0)
 
             terminated = terminateds[i]
@@ -386,6 +444,7 @@ class GameWorker(BaseWorker):
                 state['episode_experiences'][i] = []
                 state['episode_value_preds'][i] = []
                 state['episode_ids'][i] = None
+                state['episode_steps'][i] = 0  # Reset step counter for new episode
 
         self._collection_state['env_states'] = new_env_states
         self._collection_state['metadatas'] = new_metadatas
@@ -407,11 +466,17 @@ class GameWorker(BaseWorker):
 
         rewards_bytes = serialize_rewards(final_rewards)
 
+        # Compute surprise score: difference between predicted equity and actual outcome
+        # Value predictions are now equity values in [0, 1] from probs_to_equity
+        # final_rewards[0] is the point reward for player 0 (1, 2, or 3 for wins)
         surprise_score = 0.0
         if value_predictions:
             mean_value_pred = sum(value_predictions) / len(value_predictions)
-            actual_outcome = float(final_rewards[0])
-            surprise_score = abs(mean_value_pred - actual_outcome)
+            # Convert final reward to equity for comparison
+            actual_reward = float(final_rewards[0])
+            actual_probs = terminal_value_probs_from_reward(jnp.array(actual_reward))
+            actual_equity = float(probs_to_equity(actual_probs, match_score=None))
+            surprise_score = abs(mean_value_pred - actual_equity)
 
         metrics = get_metrics()
         metrics.surprise_score.labels(worker_id=self.worker_id).observe(surprise_score)
@@ -455,12 +520,21 @@ class GameWorker(BaseWorker):
         print(f"Worker {self.worker_id}: JIT compiling batched step function...")
         self._setup_batched_step()
 
+        # Log temperature schedule info
+        if self._use_temperature_schedule:
+            print(f"Worker {self.worker_id}: Temperature schedule: {self.temperature_start:.2f} -> {self.temperature_end:.2f} over {self.temperature_epochs} epochs")
+        else:
+            print(f"Worker {self.worker_id}: Static temperature: {self.temperature:.2f}")
+
         # Start Prometheus metrics server
-        metrics_port = self.config.get('metrics_port', 9100)
-        start_metrics_server(metrics_port)
+        metrics_port_config = self.config.get('metrics_port', 9100)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint for dynamic discovery
+        # Register metrics endpoint for dynamic discovery (use actual bound port)
         try:
             register_metrics_endpoint(
                 self.buffer.redis,
@@ -494,6 +568,11 @@ class GameWorker(BaseWorker):
         while self.running:
             if num_iterations >= 0 and iteration >= num_iterations:
                 break
+
+            # Check if collection is paused (during training epochs)
+            if self.state.is_collection_paused():
+                time.sleep(0.5)  # Wait while paused
+                continue
 
             # Check for model updates periodically (every 10 seconds)
             if time.time() - last_model_check > 10:
@@ -530,6 +609,11 @@ class GameWorker(BaseWorker):
                     worker_id=self.worker_id, worker_type='game'
                 ).set(self.current_model_version)
 
+                # Log current MCTS temperature
+                metrics.mcts_temperature.labels(
+                    worker_id=self.worker_id
+                ).set(self._current_temperature)
+
                 # Refresh metrics registration
                 try:
                     register_metrics_endpoint(
@@ -542,11 +626,12 @@ class GameWorker(BaseWorker):
                 except Exception:
                     pass
 
+                temp_str = f", temp={self._current_temperature:.2f}" if self._use_temperature_schedule else ""
                 print(
                     f"Worker {self.worker_id}: "
                     f"iter={iteration}, games={total_games}, "
                     f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}, "
-                    f"model_v{self.current_model_version}"
+                    f"model_v{self.current_model_version}{temp_str}"
                 )
 
         # Mark worker as stopped
@@ -572,7 +657,10 @@ class GameWorker(BaseWorker):
             'batch_size': self.batch_size,
             'num_simulations': self.num_simulations,
             'max_nodes': self.max_nodes,
-            'temperature': self.temperature,
+            'temperature': self._current_temperature,
+            'temperature_schedule': self._use_temperature_schedule,
+            'temperature_start': self.temperature_start,
+            'temperature_end': self.temperature_end,
             'buffer_size': self.buffer.get_size() if self.buffer else 0,
         })
         return base_stats

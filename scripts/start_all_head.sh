@@ -91,10 +91,18 @@ echo "PYTHONPATH set to: $PYTHONPATH"
 # =============================================================================
 # JAX memory configuration - prevent first process from grabbing all GPU RAM
 # Based on benchmarks: game worker ~2GB, training worker ~2GB
-# Set to 25% each (6GB) for headroom (24GB total GPU)
+# Set to 45% each (11GB) for headroom (24GB total GPU)
+# Note: cuda_async allocator can cause issues with multiple workers, so use MEM_FRACTION
 # =============================================================================
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25
-echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (6GB per worker on 24GB GPU)"
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
+echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (11GB per worker on 24GB GPU)"
+
+# =============================================================================
+# Disable XLA command buffers to prevent CUDA graph OOM errors
+# See: https://github.com/google/jax/issues/16292
+# =============================================================================
+export XLA_FLAGS="--xla_gpu_enable_command_buffer="
+echo "XLA command buffers disabled to prevent OOM"
 
 # =============================================================================
 # Python unbuffered output - ensure logs are written immediately
@@ -110,14 +118,17 @@ mkdir -p "$MLFLOW_DIR"
 
 # Kill any existing MLFlow server
 pkill -f "mlflow server" 2>/dev/null || true
+pkill -f "uvicorn.*mlflow" 2>/dev/null || true
 sleep 1
 
 # Start MLFlow server (0.0.0.0 for web UI access, training worker uses localhost)
+# Allow trusted hosts to avoid DNS rebinding protection blocking local workers
 python -m mlflow server \
     --host 0.0.0.0 \
     --port 5000 \
     --backend-store-uri "sqlite:///$MLFLOW_DIR/mlflow.db" \
     --default-artifact-root "$MLFLOW_DIR/artifacts" \
+    --allowed-hosts "*" \
     > "$LOG_DIR/mlflow_$TIMESTAMP.log" 2>&1 &
 MLFLOW_PID=$!
 echo "       MLFlow PID: $MLFLOW_PID"
@@ -177,9 +188,10 @@ fi
 
 # =============================================================================
 # Start Prometheus discovery updater (watches Redis for worker registrations)
+# No GPU needed - disable CUDA to prevent memory allocation
 # =============================================================================
 echo "       Starting Prometheus discovery updater..."
-python -c "
+CUDA_VISIBLE_DEVICES="" python -c "
 from distributed.metrics import start_discovery_updater
 import time
 updater = start_discovery_updater(
@@ -198,9 +210,10 @@ sleep 2
 
 # =============================================================================
 # Start Coordinator (uses config file for all settings)
+# No GPU needed - disable CUDA to prevent memory allocation
 # =============================================================================
 echo "[4/7] Starting coordinator..."
-python -m distributed.cli.main coordinator \
+CUDA_VISIBLE_DEVICES="" python -m distributed.cli.main coordinator \
     --config-file "$CONFIG_FILE" \
     --dashboard \
     > "$LOG_DIR/coordinator_$TIMESTAMP.log" 2>&1 &

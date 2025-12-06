@@ -31,8 +31,143 @@ from flax.training.train_state import TrainState
 from core.memory.replay_memory import BaseExperience
 from bgai.endgame.packed_table import BearoffLookup, pack_upper, solve_size_to_n
 from core.training.loss_fns import az_default_loss_fn
+from core.evaluators.mcts.equity import terminal_value_probs_from_reward, probs_to_equity
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
+
+
+def weighted_az_loss_fn(
+    params: chex.ArrayTree,
+    train_state: TrainState,
+    experience: BaseExperience,
+    sample_weights: jnp.ndarray,
+    l2_reg_lambda: float = 0.0001,
+) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
+    """AlphaZero loss function with per-sample weighting and 6-way value head.
+
+    This allows us to weight bearoff samples more heavily since they have
+    known-perfect target values. Value loss is cross-entropy over 6 outcomes:
+    [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+
+    Args:
+        params: Neural network parameters
+        train_state: Flax TrainState
+        experience: Batch of experiences
+        sample_weights: Per-sample weights (e.g., higher for bearoff positions)
+        l2_reg_lambda: L2 regularization weight
+
+    Returns:
+        (loss, (aux_metrics, updates))
+    """
+    # Get batch_stats if using batch_norm
+    variables = {'params': params, 'batch_stats': train_state.batch_stats} \
+        if hasattr(train_state, 'batch_stats') else {'params': params}
+    mutables = ['batch_stats'] if hasattr(train_state, 'batch_stats') else []
+
+    # Get predictions - value head now outputs 6-way logits
+    (pred_policy_logits, pred_value_logits), updates = train_state.apply_fn(
+        variables,
+        x=experience.observation_nn,
+        mutable=mutables
+    )
+
+    # Set invalid actions in policy to -inf
+    pred_policy_logits = jnp.where(
+        experience.policy_mask,
+        pred_policy_logits,
+        jnp.finfo(jnp.float32).min
+    )
+
+    # Compute per-sample policy loss (cross entropy)
+    policy_loss_per_sample = optax.softmax_cross_entropy(pred_policy_logits, experience.policy_weights)
+    # Apply weights and average
+    policy_loss = jnp.sum(policy_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
+
+    # Select appropriate reward from experience.reward for current player
+    current_player = experience.cur_player_id
+    batch_indices = jnp.arange(experience.reward.shape[0])
+    target_reward = experience.reward[batch_indices, current_player]
+
+    # Convert scalar reward to 6-way target probability distribution
+    target_value_probs = terminal_value_probs_from_reward(target_reward)
+
+    # Compute per-sample value loss (cross-entropy over 6 outcomes)
+    pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
+    value_loss_per_sample = -(target_value_probs * pred_value_log_probs).sum(axis=-1)
+    # Apply weights and average
+    value_loss = jnp.sum(value_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
+
+    # Compute L2 regularization (not weighted by samples)
+    l2_reg = l2_reg_lambda * jax.tree_util.tree_reduce(
+        lambda x, y: x + y,
+        jax.tree.map(lambda x: (x ** 2).sum(), params)
+    )
+
+    # Total loss
+    loss = policy_loss + value_loss + l2_reg
+
+    # Compute metrics (unweighted for interpretability)
+    pred_policy_probs = jax.nn.softmax(pred_policy_logits, axis=-1)
+    pred_top1 = jnp.argmax(pred_policy_probs, axis=-1)
+    target_top1 = jnp.argmax(experience.policy_weights, axis=-1)
+    policy_accuracy = jnp.mean(pred_top1 == target_top1)
+
+    # Value accuracy: top-1 match between predicted and target outcome
+    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
+    value_top1 = jnp.argmax(pred_value_probs, axis=-1)
+    target_value_top1 = jnp.argmax(target_value_probs, axis=-1)
+    value_accuracy = jnp.mean(value_top1 == target_value_top1)
+
+    # Per-outcome value losses for monitoring (6-way breakdown)
+    # Compute per-outcome cross-entropy contribution: -target_prob * log(pred_prob)
+    # This shows which outcomes are hardest to predict
+    per_outcome_ce = -target_value_probs * pred_value_log_probs  # (batch, 6)
+    mean_per_outcome_ce = per_outcome_ce.mean(axis=0)  # (6,)
+
+    # Outcome names: win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss
+    value_loss_win = mean_per_outcome_ce[0]
+    value_loss_gammon_win = mean_per_outcome_ce[1]
+    value_loss_backgammon_win = mean_per_outcome_ce[2]
+    value_loss_loss = mean_per_outcome_ce[3]
+    value_loss_gammon_loss = mean_per_outcome_ce[4]
+    value_loss_backgammon_loss = mean_per_outcome_ce[5]
+
+    # Predicted outcome distribution (mean over batch)
+    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
+    mean_pred_probs = pred_value_probs.mean(axis=0)  # (6,)
+
+    # Target outcome distribution (mean over batch)
+    mean_target_probs = target_value_probs.mean(axis=0)  # (6,)
+
+    aux_metrics = {
+        'policy_loss': policy_loss,
+        'value_loss': value_loss,
+        'l2_reg': l2_reg,
+        'policy_accuracy': policy_accuracy,
+        'value_accuracy': value_accuracy,
+        # Per-outcome value losses
+        'value_loss_win': value_loss_win,
+        'value_loss_gammon_win': value_loss_gammon_win,
+        'value_loss_backgammon_win': value_loss_backgammon_win,
+        'value_loss_loss': value_loss_loss,
+        'value_loss_gammon_loss': value_loss_gammon_loss,
+        'value_loss_backgammon_loss': value_loss_backgammon_loss,
+        # Predicted outcome probabilities (for calibration monitoring)
+        'pred_prob_win': mean_pred_probs[0],
+        'pred_prob_gammon_win': mean_pred_probs[1],
+        'pred_prob_backgammon_win': mean_pred_probs[2],
+        'pred_prob_loss': mean_pred_probs[3],
+        'pred_prob_gammon_loss': mean_pred_probs[4],
+        'pred_prob_backgammon_loss': mean_pred_probs[5],
+        # Target outcome probabilities (ground truth distribution)
+        'target_prob_win': mean_target_probs[0],
+        'target_prob_gammon_win': mean_target_probs[1],
+        'target_prob_backgammon_win': mean_target_probs[2],
+        'target_prob_loss': mean_target_probs[3],
+        'target_prob_gammon_loss': mean_target_probs[4],
+        'target_prob_backgammon_loss': mean_target_probs[5],
+    }
+    return loss, (aux_metrics, updates)
 
 from .base_worker import BaseWorker, WorkerStats
 from ..serialization import (
@@ -59,6 +194,8 @@ class TrainingStats:
     non_bearoff_experiences: int = 0
     cumulative_bearoff_value_loss: float = 0.0
     cumulative_non_bearoff_value_loss: float = 0.0
+    bearoff_value_loss_count: int = 0
+    non_bearoff_value_loss_count: int = 0
     last_batch_duration: float = 0.0
     last_batch_steps: int = 0
     cumulative_loss: float = 0.0
@@ -67,6 +204,14 @@ class TrainingStats:
     @property
     def avg_loss(self) -> float:
         return self.cumulative_loss / max(self.loss_count, 1)
+
+    @property
+    def avg_bearoff_value_loss(self) -> float:
+        return self.cumulative_bearoff_value_loss / max(self.bearoff_value_loss_count, 1)
+
+    @property
+    def avg_non_bearoff_value_loss(self) -> float:
+        return self.cumulative_non_bearoff_value_loss / max(self.non_bearoff_value_loss_count, 1)
 
 
 class TrainingWorker(BaseWorker):
@@ -94,17 +239,21 @@ class TrainingWorker(BaseWorker):
                 - train_batch_size: Batch size for training (default: 128)
                 - learning_rate: Optimizer learning rate (default: 3e-4)
                 - l2_reg_lambda: L2 regularization weight (default: 1e-4)
-                - games_per_training_batch: New games to trigger training (default: 10)
-                - steps_per_game: Training steps per collected game (default: 10)
-                - checkpoint_interval: Steps between checkpoints (default: 1000)
+                - games_per_epoch: New games to trigger training epoch (default: 10)
+                - checkpoint_epoch_interval: Epochs between checkpoints (default: 5)
+                - max_checkpoints: Maximum checkpoints to keep (default: 5)
                 - min_buffer_size: Minimum buffer size before training (default: 1000)
                 - redis_host: Redis server host (default: 'localhost')
                 - redis_port: Redis server port (default: 6379)
                 - checkpoint_dir: Directory for saving checkpoints (default: 'checkpoints')
                 - mlflow_tracking_uri: MLflow tracking server URI (optional)
                 - mlflow_experiment_name: MLflow experiment name (optional)
-                - bearoff_table_path: Path to bearoff table .npy file (optional)
-                - use_bearoff_values: Whether to use perfect values for bearoff positions (default: True)
+                - bearoff_enabled: Whether bearoff DB is enabled (default: False)
+                - bearoff_value_weight: Learning weight for bearoff positions (default: 2.0)
+                - lookup_enabled: Whether lookup positions are enabled (default: False)
+                - lookup_learning_weight: Learning weight for lookup positions (default: 1.5)
+                - network_hidden_dim: Network hidden dimension (default: 256)
+                - network_num_blocks: Number of residual blocks (default: 6)
             worker_id: Optional unique worker ID. Auto-generated if not provided.
         """
         super().__init__(config, worker_id)
@@ -113,22 +262,39 @@ class TrainingWorker(BaseWorker):
         self.train_batch_size = self.config.get('train_batch_size', 128)
         self.learning_rate = self.config.get('learning_rate', 3e-4)
         self.l2_reg_lambda = self.config.get('l2_reg_lambda', 1e-4)
-        self.checkpoint_interval = self.config.get('checkpoint_interval', 1000)
+        # checkpoint_epoch_interval (new) with fallback to checkpoint_interval (old)
+        self.checkpoint_epoch_interval = self.config.get(
+            'checkpoint_epoch_interval',
+            self.config.get('checkpoint_interval', 5)
+        )
+        self.max_checkpoints = self.config.get('max_checkpoints', 5)
         self.min_buffer_size = self.config.get('min_buffer_size', 1000)
         self.checkpoint_dir = self.config.get('checkpoint_dir', 'checkpoints')
 
         # Collection-gated training configuration
-        # Training triggers after this many new games collected
-        self.games_per_training_batch = self.config.get('games_per_training_batch', 10)
+        # Training triggers after this many new games collected (epoch = games_per_epoch games)
+        # games_per_epoch (new) with fallback to games_per_training_batch (old)
+        self.games_per_epoch = self.config.get(
+            'games_per_epoch',
+            self.config.get('games_per_training_batch', 10)
+        )
         # Number of training steps to run per collected game
-        self.steps_per_game = self.config.get('steps_per_game', 10)
+        # Default high to train on most experiences (avg game ~60 moves / batch_size)
+        # Set to 0 to auto-calculate based on buffer size
+        self.steps_per_game = self.config.get('steps_per_game', 50)
 
         # Surprise-weighted sampling configuration
         # 0 = uniform sampling, 1 = fully surprise-weighted
         self.surprise_weight = self.config.get('surprise_weight', 0.5)
 
         # Bearoff/endgame table configuration
-        self.use_bearoff_values = self.config.get('use_bearoff_values', True)
+        self.bearoff_enabled = self.config.get('bearoff_enabled', False)
+        # Weight multiplier for bearoff value loss (since bearoff values are known-perfect)
+        # Higher values emphasize learning accurate values for endgame positions
+        self.bearoff_value_weight = self.config.get('bearoff_value_weight', 2.0)
+        # Lookup position configuration
+        self.lookup_enabled = self.config.get('lookup_enabled', False)
+        self.lookup_learning_weight = self.config.get('lookup_learning_weight', 1.5)
         self._bearoff_table = None
         # Keep table on CPU (too large for GPU). Stored as [win, gammon_win, loss, gammon_loss].
         self._bearoff_table_np = None
@@ -140,7 +306,7 @@ class TrainingWorker(BaseWorker):
             if default_path.exists():
                 bearoff_table_path = str(default_path)
 
-        if bearoff_table_path and self.use_bearoff_values:
+        if bearoff_table_path and self.bearoff_enabled:
             try:
                 # Load table but DON'T convert to JAX array (too large for GPU)
                 # We'll use numpy lookups instead. Supports legacy (n, n) win-prob
@@ -317,14 +483,25 @@ class TrainingWorker(BaseWorker):
         Uses numpy for bearoff detection and table lookup (table is too large for GPU),
         then converts results back to JAX arrays.
 
+        OPTIMIZED: Fully vectorized - no Python for-loops over batch.
+
         Args:
             batch: Batch of experiences
 
         Returns:
             Tuple of (modified_batch, bearoff_metrics)
+            bearoff_metrics includes:
+                - bearoff_count: number of bearoff positions
+                - total_count: total batch size
+                - is_bearoff_mask: JAX array boolean mask (True for bearoff positions)
         """
-        if self._bearoff_table_np is None or not self.use_bearoff_values:
-            return batch, {'bearoff_count': jnp.array(0), 'total_count': jnp.array(batch.reward.shape[0])}
+        if self._bearoff_table_np is None or not self.bearoff_enabled:
+            batch_size = batch.reward.shape[0]
+            return batch, {
+                'bearoff_count': jnp.array(0),
+                'total_count': jnp.array(batch_size),
+                'is_bearoff_mask': jnp.zeros(batch_size, dtype=jnp.bool_),
+            }
 
         batch_size = batch.observation_nn.shape[0]
 
@@ -334,29 +511,41 @@ class TrainingWorker(BaseWorker):
         rewards_np = np.array(batch.reward)
         from bgai.endgame.indexing import position_to_index_fast
 
-        # Process each experience
-        is_bearoff_list = []
-        perfect_values_list = []
+        # Decode observations to boards (batch_size, 28)
+        boards = np.round(obs_np[:, :28] * 15).astype(np.int8)
+
+        # Process each experience for target probs (uses BearoffLookup)
         target_probs_list = []
 
+        # =========================================================================
+        # Vectorized bearoff detection
+        # =========================================================================
+        # Board layout (pgx): [0-23]=points 0-23, [24]=cur_bar, [25]=opp_bar, [26]=cur_borne, [27]=opp_borne
+        # Current player pieces are positive, opponent pieces are negative
+        # Current player home = points 18-23, opponent home = points 0-5
+        # For bearoff: both bars empty, cur player only in home (18-23), opp only in home (0-5)
+
+        # Check bars empty (vectorized)
+        bar_empty = (boards[:, 24] == 0) & (boards[:, 25] == 0)
+
+        # Current player (positive) outside home if pieces on points 0-17
+        cur_outside = np.any(boards[:, 0:18] > 0, axis=1)
+
+        # Opponent (negative) outside home if pieces on points 6-23
+        opp_outside = np.any(boards[:, 6:24] < 0, axis=1)
+
+        # Bearoff position mask
+        is_bearoff = bar_empty & ~cur_outside & ~opp_outside
+
+        # =========================================================================
+        # Bearoff value lookup using BearoffLookup
+        # =========================================================================
+        bearoff_count = int(np.sum(is_bearoff))
+
+        # Collect target probs for bearoff positions
         for i in range(batch_size):
-            # Decode observation to board
-            board = np.round(obs_np[i, :28] * 15).astype(np.int8)
-
-            # Check if bearoff position (numpy version)
-            # Board layout: [0]=current bar, [1-24]=points 1-24, [25]=opponent bar
-            # For bearoff: both bars empty, X only in home (points 1-6), O only in home (points 19-24)
-            bar_empty = (board[0] == 0) and (board[25] == 0)
-            # X (positive) outside home if pieces on points 7-24 (indices 7:25)
-            x_outside = np.any(board[7:25] > 0)
-            # O (negative) outside home if pieces on points 1-18 (indices 1:19)
-            o_outside = np.any(board[1:19] < 0)
-            is_bo = bar_empty and not x_outside and not o_outside
-
-            is_bearoff_list.append(is_bo)
-
-            if is_bo:
-                # Get perfect value
+            if is_bearoff[i]:
+                board = boards[i]
                 cur_player = int(cur_player_np[i])
 
                 # Index positions for lookup
@@ -365,15 +554,9 @@ class TrainingWorker(BaseWorker):
                 x_idx = position_to_index_fast(x_pos)
                 o_idx = position_to_index_fast(o_pos)
 
-                perfect_val = self._get_bearoff_value_np(board, cur_player)
-                perfect_values_list.append(perfect_val)
                 target_probs_list.append(self._get_bearoff_target_probs(x_idx, o_idx, cur_player))
             else:
-                perfect_values_list.append(0.0)
                 target_probs_list.append(None)
-
-        is_bearoff = np.array(is_bearoff_list)
-        perfect_values = np.array(perfect_values_list)
 
         # Update rewards for bearoff positions
         new_rewards = rewards_np.copy()
@@ -381,19 +564,23 @@ class TrainingWorker(BaseWorker):
             if is_bearoff[i]:
                 cur_p = int(cur_player_np[i])
                 opp_p = 1 - cur_p
+                board = boards[i]
+                # Get equity from bearoff table
+                perfect_val = self._get_bearoff_value_np(board, cur_p)
                 # Equity from current player's perspective; zero-sum for opponent
-                new_rewards[i, cur_p] = perfect_values[i]
-                new_rewards[i, opp_p] = -perfect_values[i]
+                new_rewards[i, cur_p] = perfect_val
+                new_rewards[i, opp_p] = -perfect_val
 
         # Convert back to JAX and create new batch
         new_rewards_jax = jnp.array(new_rewards)
         modified_batch = batch.replace(reward=new_rewards_jax)
 
-        # Metrics
-        bearoff_count = int(np.sum(is_bearoff))
+        # Metrics - include mask for separate loss tracking
+        is_bearoff_jax = jnp.array(is_bearoff)
         metrics = {
             'bearoff_count': jnp.array(bearoff_count),
             'total_count': jnp.array(batch_size),
+            'is_bearoff_mask': is_bearoff_jax,
         }
         valid_targets = [tp for tp in target_probs_list if tp is not None]
         if valid_targets:
@@ -421,36 +608,81 @@ class TrainingWorker(BaseWorker):
             if run_id:
                 # Try to resume existing run
                 try:
-                    self._mlflow_run = mlflow.start_run(run_id=run_id)
-                    print(f"Worker {self.worker_id}: Resumed MLflow run {run_id}")
+                    self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
+                    print(f"Worker {self.worker_id}: Resumed MLflow run {run_id} (system metrics enabled)")
                 except Exception as resume_error:
                     # Run doesn't exist (e.g., MLFlow DB was reset), create new one
                     print(f"Worker {self.worker_id}: MLflow run {run_id} not found, creating new run")
-                    self._mlflow_run = mlflow.start_run()
+                    self._mlflow_run = mlflow.start_run(log_system_metrics=True)
                     new_run_id = self._mlflow_run.info.run_id
                     self.state.set_run_id(new_run_id)
-                    print(f"Worker {self.worker_id}: Started new MLflow run {new_run_id}")
+                    print(f"Worker {self.worker_id}: Started new MLflow run {new_run_id} (system metrics enabled)")
                     run_id = new_run_id
                     is_new_run = True
             else:
                 # Start new run
-                self._mlflow_run = mlflow.start_run()
+                self._mlflow_run = mlflow.start_run(log_system_metrics=True)
                 run_id = self._mlflow_run.info.run_id
                 self.state.set_run_id(run_id)
-                print(f"Worker {self.worker_id}: Started MLflow run {run_id}")
+                print(f"Worker {self.worker_id}: Started MLflow run {run_id} (system metrics enabled)")
                 is_new_run = True
 
-            # Log configuration parameters for new runs
+            # Log ALL configuration parameters for new runs
+            # MLflow allows comparing params between runs in the UI
             if is_new_run:
+                # Training params
                 mlflow.log_params({
                     'train_batch_size': self.train_batch_size,
                     'learning_rate': self.learning_rate,
                     'l2_reg_lambda': self.l2_reg_lambda,
-                    'games_per_training_batch': self.games_per_training_batch,
-                    'steps_per_game': self.steps_per_game,
+                    'games_per_epoch': self.games_per_epoch,
                     'surprise_weight': self.surprise_weight,
                     'min_buffer_size': self.min_buffer_size,
-                    'checkpoint_interval': self.checkpoint_interval,
+                    'checkpoint_epoch_interval': self.checkpoint_epoch_interval,
+                    'max_checkpoints': self.max_checkpoints,
+                    # Bearoff/endgame params
+                    'bearoff_enabled': self.bearoff_enabled,
+                    'bearoff_value_weight': self.bearoff_value_weight,
+                    'lookup_enabled': self.lookup_enabled,
+                    'lookup_learning_weight': self.lookup_learning_weight,
+                    # Warm tree params (now from mcts section)
+                    'warm_tree_simulations': self.warm_tree_simulations,
+                    'warm_tree_max_nodes': self.warm_tree_max_nodes,
+                })
+                # Log MCTS and game params from config (may not be set on training worker)
+                mcts_config = self.config.get('mcts', {})
+                game_config = self.config.get('game', {})
+                network_config = self.config.get('network', {})
+                redis_config = self.config.get('redis', {})
+                gnubg_config = self.config.get('gnubg', {})
+                mlflow.log_params({
+                    # MCTS params (used by game workers)
+                    'mcts_collect_simulations': mcts_config.get('collect_simulations', mcts_config.get('simulations', 100)),
+                    'mcts_eval_simulations': mcts_config.get('eval_simulations', 50),
+                    'mcts_max_nodes': mcts_config.get('max_nodes', 400),
+                    'mcts_persist_tree': mcts_config.get('persist_tree', True),
+                    # Temperature schedule (now in mcts section)
+                    'mcts_temperature_start': mcts_config.get('temperature_start', 0.8),
+                    'mcts_temperature_end': mcts_config.get('temperature_end', 0.2),
+                    # Game params
+                    'max_episode_steps': game_config.get('max_episode_steps', 500),
+                    'short_game': game_config.get('short_game', True),
+                    'simple_doubles': game_config.get('simple_doubles', False),
+                    # Network architecture
+                    'network_hidden_dim': network_config.get('hidden_dim', 256),
+                    'network_num_blocks': network_config.get('num_blocks', 6),
+                })
+                # Redis buffer settings (affects data retention)
+                mlflow.log_params({
+                    'buffer_capacity': redis_config.get('buffer_capacity', 100000),
+                    'episode_capacity': redis_config.get('episode_capacity', 5000),
+                })
+                # GNUBG evaluation settings (for eval workers)
+                mlflow.log_params({
+                    'gnubg_ply': gnubg_config.get('ply', 2),
+                    'gnubg_shortcuts': gnubg_config.get('shortcuts', 0),
+                    'gnubg_osdb': gnubg_config.get('osdb', 1),
+                    'gnubg_move_filters': str(gnubg_config.get('move_filters', [8, 4, 2, 2])),
                 })
 
         except Exception as e:
@@ -496,12 +728,19 @@ class TrainingWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
+            """ResNet-style network with 6-way value head for backgammon outcomes.
+
+            Value head outputs logits for 6 outcomes:
+            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
+            value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
-            def __call__(self, x, train: bool = False):
+            def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
+                del train  # unused but required by turbozero interface
                 x = nn.Dense(self.num_hidden)(x)
                 x = nn.LayerNorm()(x)
                 x = nn.relu(x)
@@ -510,14 +749,17 @@ class TrainingWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                value = nn.Dense(1)(x)
-                value = jnp.squeeze(value, axis=-1)
-                return policy_logits, value
+                # 6-way value head: outputs logits, converted to probs by loss fn
+                value_logits = nn.Dense(self.value_head_out_size)(x)
+                return policy_logits, value_logits
 
+        # Use network config from YAML, with fallback to defaults
+        num_hidden = self.config.get('network_hidden_dim', 256)
+        num_blocks = self.config.get('network_num_blocks', 6)
         self._nn_model = ResNetTurboZero(
             self._env.num_actions,
-            num_hidden=256,
-            num_blocks=6
+            num_hidden=num_hidden,
+            num_blocks=num_blocks
         )
 
     def _initialize_train_state(self) -> None:
@@ -539,9 +781,14 @@ class TrainingWorker(BaseWorker):
             print(f"Worker {self.worker_id}: Loaded model version {version}")
         else:
             # Initialize random weights
-            variables = self._nn_model.init(key, sample_obs[None, ...], train=False)
+            variables = self._nn_model.init(key, sample_obs[None, ...])
             params = variables['params']
             print(f"Worker {self.worker_id}: Initialized random weights")
+
+        # Restore total steps from Redis (persisted across restarts)
+        self._total_steps = self.state.get_training_steps()
+        if self._total_steps > 0:
+            print(f"Worker {self.worker_id}: Restored step counter to {self._total_steps}")
 
         # Create optimizer
         optimizer = optax.adam(self.learning_rate)
@@ -687,8 +934,8 @@ class TrainingWorker(BaseWorker):
             # Initialize tree
             eval_state = self._warm_tree_evaluator.init(template_embedding=init_state)
 
-            # Get current params
-            params = self._train_state.params
+            # Get current params - wrap in {'params': ...} for Flax module apply
+            params = {'params': self._train_state.params}
 
             # Run MCTS iterations to build the tree
             # The evaluator's evaluate() method runs num_iterations internally
@@ -769,7 +1016,7 @@ class TrainingWorker(BaseWorker):
         train_state: TrainState,
         batch: BaseExperience,
     ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
-        """Perform a single training step.
+        """Perform a single training step (uniform weights).
 
         Args:
             train_state: Current training state.
@@ -787,6 +1034,51 @@ class TrainingWorker(BaseWorker):
 
         # Apply gradients
         new_state = train_state.apply_gradients(grads=grads)
+
+        # Update batch_stats if present (for BatchNorm layers)
+        if updates and 'batch_stats' in updates and hasattr(new_state, 'batch_stats'):
+            new_state = new_state.replace(batch_stats=updates['batch_stats'])
+
+        # Add loss to metrics
+        metrics = {**metrics, 'loss': loss}
+
+        return new_state, metrics
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _train_step_weighted(
+        self,
+        train_state: TrainState,
+        batch: BaseExperience,
+        sample_weights: jnp.ndarray,
+    ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
+        """Perform a single training step with per-sample weights.
+
+        This enables weighting bearoff positions more heavily since they
+        have known-perfect target values.
+
+        Args:
+            train_state: Current training state.
+            batch: Batch of experiences.
+            sample_weights: Per-sample weights (e.g., bearoff_value_weight for bearoff positions).
+
+        Returns:
+            Tuple of (updated_train_state, metrics_dict).
+        """
+        loss_fn = partial(weighted_az_loss_fn, l2_reg_lambda=self.l2_reg_lambda)
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (metrics, updates)), grads = grad_fn(
+            train_state.params,
+            train_state,
+            batch,
+            sample_weights
+        )
+
+        # Apply gradients
+        new_state = train_state.apply_gradients(grads=grads)
+
+        # Update batch_stats if present (for BatchNorm layers)
+        if updates and 'batch_stats' in updates and hasattr(new_state, 'batch_stats'):
+            new_state = new_state.replace(batch_stats=updates['batch_stats'])
 
         # Add loss to metrics
         metrics = {**metrics, 'loss': loss}
@@ -839,24 +1131,39 @@ class TrainingWorker(BaseWorker):
 
         # Apply perfect bearoff values where applicable
         bearoff_metrics = None
-        if self._bearoff_table is not None and self.use_bearoff_values:
+        sample_weights = None
+        if self._bearoff_table is not None and self.bearoff_enabled:
             try:
                 jax_batch, bearoff_metrics = self._apply_bearoff_values_to_batch(jax_batch)
+                # Create sample weights: bearoff_value_weight for bearoff, 1.0 for others
+                is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
+                sample_weights = jnp.where(
+                    is_bearoff_mask,
+                    self.bearoff_value_weight,
+                    1.0
+                )
             except Exception as e:
                 print(f"Worker {self.worker_id}: Error applying bearoff values: {e}")
                 import traceback
                 traceback.print_exc()
 
-        # Perform training step
-        self._train_state, metrics = self._train_step(
-            self._train_state,
-            jax_batch,
-        )
+        # Perform training step - use weighted version if we have weights
+        if sample_weights is not None and self.bearoff_value_weight != 1.0:
+            self._train_state, metrics = self._train_step_weighted(
+                self._train_state,
+                jax_batch,
+                sample_weights,
+            )
+        else:
+            self._train_state, metrics = self._train_step(
+                self._train_state,
+                jax_batch,
+            )
 
         # Convert metrics to Python floats
         metrics = {k: float(v) for k, v in metrics.items()}
 
-        # Add bearoff metrics
+        # Add bearoff metrics and compute separate value losses
         if bearoff_metrics is not None:
             bearoff_count = int(bearoff_metrics['bearoff_count'])
             total_count = int(bearoff_metrics['total_count'])
@@ -865,9 +1172,74 @@ class TrainingWorker(BaseWorker):
             if 'bearoff_avg_gammon_win' in bearoff_metrics:
                 metrics['bearoff_avg_gammon_win'] = float(bearoff_metrics['bearoff_avg_gammon_win'])
 
-            # Update training stats
+            # Compute separate losses for bearoff vs non-bearoff positions
+            is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
+            if bearoff_count > 0:
+                # Get predictions for the batch (no grad computation)
+                pred_policy_logits, pred_value_logits = self._train_state.apply_fn(
+                    {'params': self._train_state.params},
+                    x=jax_batch.observation_nn,
+                )
+
+                # Mask invalid actions in policy for softmax
+                pred_policy_logits = jnp.where(
+                    jax_batch.policy_mask,
+                    pred_policy_logits,
+                    jnp.finfo(jnp.float32).min
+                )
+
+                # Get target values and convert to 6-way probabilities
+                current_player = jax_batch.cur_player_id
+                target_reward = jax_batch.reward[jnp.arange(jax_batch.reward.shape[0]), current_player]
+                target_value_probs = terminal_value_probs_from_reward(target_reward)
+
+                # Compute per-sample value cross-entropy
+                pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
+                value_ce = -(target_value_probs * pred_value_log_probs).sum(axis=-1)
+
+                # Compute per-sample policy cross-entropy
+                policy_ce = optax.softmax_cross_entropy(pred_policy_logits, jax_batch.policy_weights)
+
+                bearoff_mask_float = is_bearoff_mask.astype(jnp.float32)
+                non_bearoff_count = total_count - bearoff_count
+                non_bearoff_mask_float = (1.0 - bearoff_mask_float)
+
+                # Bearoff value loss (cross-entropy for bearoff positions only)
+                bearoff_value_loss = jnp.sum(value_ce * bearoff_mask_float) / max(bearoff_count, 1)
+                metrics['bearoff_value_loss'] = float(bearoff_value_loss)
+
+                # Bearoff policy loss (cross-entropy for bearoff positions only)
+                bearoff_policy_loss = jnp.sum(policy_ce * bearoff_mask_float) / max(bearoff_count, 1)
+                metrics['bearoff_policy_loss'] = float(bearoff_policy_loss)
+
+                # Non-bearoff value loss
+                if non_bearoff_count > 0:
+                    non_bearoff_value_loss = jnp.sum(value_ce * non_bearoff_mask_float) / non_bearoff_count
+                    metrics['non_bearoff_value_loss'] = float(non_bearoff_value_loss)
+                    # Non-bearoff policy loss
+                    non_bearoff_policy_loss = jnp.sum(policy_ce * non_bearoff_mask_float) / non_bearoff_count
+                    metrics['non_bearoff_policy_loss'] = float(non_bearoff_policy_loss)
+                else:
+                    metrics['non_bearoff_value_loss'] = 0.0
+                    metrics['non_bearoff_policy_loss'] = 0.0
+
+                # Update cumulative stats
+                self._training_stats.cumulative_bearoff_value_loss += float(bearoff_value_loss) * bearoff_count
+                self._training_stats.bearoff_value_loss_count += bearoff_count
+            else:
+                # No bearoff positions - all are non-bearoff
+                metrics['bearoff_value_loss'] = 0.0
+                metrics['bearoff_policy_loss'] = 0.0
+                metrics['non_bearoff_value_loss'] = metrics.get('value_loss', 0.0)
+                metrics['non_bearoff_policy_loss'] = metrics.get('policy_loss', 0.0)
+
+            # Update experience counts
             self._training_stats.bearoff_experiences += bearoff_count
-            self._training_stats.non_bearoff_experiences += (total_count - bearoff_count)
+            non_bearoff_count = total_count - bearoff_count
+            self._training_stats.non_bearoff_experiences += non_bearoff_count
+            if non_bearoff_count > 0:
+                self._training_stats.cumulative_non_bearoff_value_loss += metrics.get('value_loss', 0.0) * non_bearoff_count
+                self._training_stats.non_bearoff_value_loss_count += non_bearoff_count
 
         self._total_steps += 1
         self.stats.training_steps += 1
@@ -912,9 +1284,9 @@ class TrainingWorker(BaseWorker):
             self._training_stats.cumulative_loss += metrics.get('loss', 0)
             self._training_stats.loss_count += 1
 
-            # Save checkpoint periodically
-            if self._total_steps % self.checkpoint_interval == 0:
-                self._save_checkpoint()
+            # Persist step counter to Redis periodically for recovery
+            if self._total_steps % 100 == 0:
+                self.state.set_training_steps(self._total_steps)
 
         batch_duration = time.time() - batch_start
 
@@ -922,6 +1294,11 @@ class TrainingWorker(BaseWorker):
         self._training_stats.last_batch_duration = batch_duration
         self._training_stats.last_batch_steps = steps_done
         self._training_stats.total_batches_trained += 1
+
+        # Save checkpoint every N epochs (training batches)
+        if self._training_stats.total_batches_trained % self.checkpoint_epoch_interval == 0:
+            self._save_checkpoint()
+            self.state.set_training_steps(self._total_steps)
 
         # Compute averaged metrics
         if batch_metrics:
@@ -959,11 +1336,14 @@ class TrainingWorker(BaseWorker):
         self._setup_mlflow()
 
         # Start Prometheus metrics server
-        metrics_port = self.config.get('metrics_port', 9200)
-        start_metrics_server(metrics_port)
+        metrics_port_config = self.config.get('metrics_port', 9200)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint for dynamic discovery
+        # Register metrics endpoint for dynamic discovery (use actual bound port)
         try:
             register_metrics_endpoint(
                 self.buffer.redis,
@@ -988,7 +1368,7 @@ class TrainingWorker(BaseWorker):
 
         print(f"Worker {self.worker_id}: Collection-gated training mode")
         print(f"Worker {self.worker_id}: Will train {self.steps_per_game} steps "
-              f"for every {self.games_per_training_batch} games collected")
+              f"for every {self.games_per_epoch} games collected")
 
         start_time = time.time()
         last_log_time = start_time
@@ -1021,7 +1401,7 @@ class TrainingWorker(BaseWorker):
             current_games = self._get_current_games_count()
             new_games = current_games - self._training_stats.games_at_last_train
 
-            if new_games < self.games_per_training_batch:
+            if new_games < self.games_per_epoch:
                 # Not enough new games, wait
                 time.sleep(1.0)
 
@@ -1035,7 +1415,7 @@ class TrainingWorker(BaseWorker):
                 if current_time - last_log_time >= 30.0:
                     print(
                         f"Worker {self.worker_id}: Waiting for games "
-                        f"({new_games}/{self.games_per_training_batch} new games), "
+                        f"({new_games}/{self.games_per_epoch} new games), "
                         f"total_games={current_games}, "
                         f"buffer={buffer_size}, "
                         f"version={self.current_model_version}"
@@ -1048,11 +1428,11 @@ class TrainingWorker(BaseWorker):
             target_steps = new_games * self.steps_per_game
 
             print(
-                f"Worker {self.worker_id}: Training batch triggered! "
+                f"Worker {self.worker_id}: Training epoch triggered! "
                 f"{new_games} new games -> {target_steps} training steps"
             )
 
-            # Run training batch
+            # Run training epoch (game collection continues in parallel)
             batch_metrics = self._run_training_batch(target_steps)
 
             # Push updated weights to Redis
@@ -1066,30 +1446,55 @@ class TrainingWorker(BaseWorker):
             elapsed = time.time() - start_time
             overall_steps_per_sec = self._total_steps / max(elapsed, 0.001)
 
-            # Log to MLflow
+            # Log to MLflow - ordered by importance for ML dashboard
+            # Priority: overall loss > value/policy > bearoff losses
+
+            # Compute overall loss (sum of value + policy, unweighted for interpretability)
+            value_loss = batch_metrics.get('non_bearoff_value_loss', batch_metrics.get('value_loss', 0))
+            policy_loss = batch_metrics.get('non_bearoff_policy_loss', batch_metrics.get('policy_loss', 0))
+            overall_loss = value_loss + policy_loss
+
             mlflow_metrics = {
-                'loss': batch_metrics.get('loss', 0),
-                'policy_loss': batch_metrics.get('policy_loss', 0),
-                'value_loss': batch_metrics.get('value_loss', 0),
-                'batch_steps': batch_metrics.get('batch_steps', 0),
-                'batch_duration': batch_metrics.get('batch_duration', 0),
-                'steps_per_sec': batch_metrics.get('steps_per_sec', 0),
-                'overall_steps_per_sec': overall_steps_per_sec,
+                # 1. Overall loss - single number to track training progress
+                'loss': overall_loss,
+                # 2. Core losses (non-bearoff = main game positions)
+                'value_loss': value_loss,
+                'policy_loss': policy_loss,
+                # 3. Bearoff-specific losses (endgame positions with known-perfect values)
+                'bearoff_value_loss': batch_metrics.get('bearoff_value_loss', 0),
+                'bearoff_policy_loss': batch_metrics.get('bearoff_policy_loss', 0),
+                # 4. Per-outcome value losses (6-way breakdown)
+                'value_loss_win': batch_metrics.get('value_loss_win', 0),
+                'value_loss_gammon_win': batch_metrics.get('value_loss_gammon_win', 0),
+                'value_loss_backgammon_win': batch_metrics.get('value_loss_backgammon_win', 0),
+                'value_loss_loss': batch_metrics.get('value_loss_loss', 0),
+                'value_loss_gammon_loss': batch_metrics.get('value_loss_gammon_loss', 0),
+                'value_loss_backgammon_loss': batch_metrics.get('value_loss_backgammon_loss', 0),
+                # 5. Predicted vs target outcome distributions (calibration)
+                'pred_prob_win': batch_metrics.get('pred_prob_win', 0),
+                'pred_prob_gammon_win': batch_metrics.get('pred_prob_gammon_win', 0),
+                'pred_prob_backgammon_win': batch_metrics.get('pred_prob_backgammon_win', 0),
+                'pred_prob_loss': batch_metrics.get('pred_prob_loss', 0),
+                'pred_prob_gammon_loss': batch_metrics.get('pred_prob_gammon_loss', 0),
+                'pred_prob_backgammon_loss': batch_metrics.get('pred_prob_backgammon_loss', 0),
+                'target_prob_win': batch_metrics.get('target_prob_win', 0),
+                'target_prob_gammon_win': batch_metrics.get('target_prob_gammon_win', 0),
+                'target_prob_backgammon_win': batch_metrics.get('target_prob_backgammon_win', 0),
+                'target_prob_loss': batch_metrics.get('target_prob_loss', 0),
+                'target_prob_gammon_loss': batch_metrics.get('target_prob_gammon_loss', 0),
+                'target_prob_backgammon_loss': batch_metrics.get('target_prob_backgammon_loss', 0),
+                # 6. Accuracy metrics
+                'value_accuracy': batch_metrics.get('value_accuracy', 0),
+                'policy_accuracy': batch_metrics.get('policy_accuracy', 0),
+                # 7. Training context
+                'bearoff_train_pct': batch_metrics.get('bearoff_pct', 0),
+                'train_steps_per_sec': batch_metrics.get('steps_per_sec', 0),
+                'total_train_steps': self._total_steps,
                 'buffer_size': buffer_size,
                 'total_games': current_games,
+                'games_this_batch': new_games,
                 'model_version': self.current_model_version,
             }
-
-            # Add bearoff metrics if available
-            if 'bearoff_pct' in batch_metrics:
-                mlflow_metrics['bearoff_pct'] = batch_metrics.get('bearoff_pct', 0)
-                mlflow_metrics['bearoff_count'] = batch_metrics.get('bearoff_count', 0)
-                # Compute overall bearoff percentage
-                total_bearoff = self._training_stats.bearoff_experiences
-                total_non_bearoff = self._training_stats.non_bearoff_experiences
-                total_exp = total_bearoff + total_non_bearoff
-                if total_exp > 0:
-                    mlflow_metrics['bearoff_pct_overall'] = 100.0 * total_bearoff / total_exp
 
             self._log_mlflow_metrics(mlflow_metrics, step=self._total_steps)
 
@@ -1103,6 +1508,34 @@ class TrainingWorker(BaseWorker):
             metrics.training_loss.labels(
                 worker_id=self.worker_id, loss_type='total'
             ).set(batch_metrics.get('loss', 0))
+            metrics.training_loss.labels(
+                worker_id=self.worker_id, loss_type='value'
+            ).set(batch_metrics.get('value_loss', 0))
+            metrics.training_loss.labels(
+                worker_id=self.worker_id, loss_type='policy'
+            ).set(batch_metrics.get('policy_loss', 0))
+
+            # Per-outcome value losses (6-way breakdown)
+            outcome_names = ['win', 'gammon_win', 'backgammon_win', 'loss', 'gammon_loss', 'backgammon_loss']
+            for outcome in outcome_names:
+                metrics.value_loss_per_outcome.labels(
+                    worker_id=self.worker_id, outcome=outcome
+                ).set(batch_metrics.get(f'value_loss_{outcome}', 0))
+                metrics.predicted_outcome_prob.labels(
+                    worker_id=self.worker_id, outcome=outcome
+                ).set(batch_metrics.get(f'pred_prob_{outcome}', 0))
+                metrics.target_outcome_prob.labels(
+                    worker_id=self.worker_id, outcome=outcome
+                ).set(batch_metrics.get(f'target_prob_{outcome}', 0))
+
+            # Accuracy metrics
+            metrics.value_accuracy.labels(
+                worker_id=self.worker_id
+            ).set(batch_metrics.get('value_accuracy', 0))
+            metrics.policy_accuracy.labels(
+                worker_id=self.worker_id
+            ).set(batch_metrics.get('policy_accuracy', 0))
+
             metrics.training_steps_per_second.labels(
                 worker_id=self.worker_id
             ).set(overall_steps_per_sec)
@@ -1146,17 +1579,21 @@ class TrainingWorker(BaseWorker):
 
             # Build log message with optional bearoff stats
             log_msg = (
-                f"Worker {self.worker_id}: Batch complete! "
+                f"Worker {self.worker_id}: Epoch complete! "
                 f"step={self._total_steps}, "
                 f"loss={batch_metrics.get('loss', 0):.4f}, "
-                f"batch_steps={batch_metrics.get('batch_steps', 0)}, "
-                f"batch_time={batch_metrics.get('batch_duration', 0):.1f}s, "
-                f"batch_steps/s={batch_metrics.get('steps_per_sec', 0):.1f}, "
+                f"epoch_steps={batch_metrics.get('batch_steps', 0)}, "
+                f"epoch_time={batch_metrics.get('batch_duration', 0):.1f}s, "
+                f"train_steps/s={batch_metrics.get('steps_per_sec', 0):.1f}, "
                 f"overall_steps/s={overall_steps_per_sec:.1f}, "
                 f"version={self.current_model_version}"
             )
             if 'bearoff_pct' in batch_metrics:
-                log_msg += f", bearoff={batch_metrics.get('bearoff_pct', 0):.1f}%"
+                bearoff_pct = batch_metrics.get('bearoff_pct', 0)
+                log_msg += f", bearoff={bearoff_pct:.1f}%"
+                # Show separate value losses when we have bearoff positions
+                if bearoff_pct > 0:
+                    log_msg += f" (bo_vloss={batch_metrics.get('bearoff_value_loss', 0):.4f}, other_vloss={batch_metrics.get('non_bearoff_value_loss', 0):.4f})"
             print(log_msg)
 
             last_log_time = time.time()
@@ -1165,6 +1602,8 @@ class TrainingWorker(BaseWorker):
         if self._total_steps > 0:
             self._push_weights_to_redis()
             self._save_checkpoint()
+            # Persist step counter to Redis for recovery
+            self.state.set_training_steps(self._total_steps)
 
         # Note: Don't call mlflow.end_run() here - the run is shared with eval workers
         # and should persist across worker restarts. The run will be ended manually
@@ -1213,7 +1652,7 @@ class TrainingWorker(BaseWorker):
             'buffer_size': buffer_size,
             'total_games': current_games,
             # Collection-gated training stats
-            'games_per_training_batch': self.games_per_training_batch,
+            'games_per_training_batch': self.games_per_epoch,
             'steps_per_game': self.steps_per_game,
             'total_training_batches': self._training_stats.total_batches_trained,
             'games_at_last_train': self._training_stats.games_at_last_train,

@@ -240,12 +240,19 @@ class EvalWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
+            """ResNet-style network with 6-way value head for backgammon outcomes.
+
+            Value head outputs logits for 6 outcomes:
+            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
+            value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
-            def __call__(self, x, train: bool = False):
+            def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
+                del train  # unused but required by turbozero interface
                 x = nn.Dense(self.num_hidden)(x)
                 x = nn.LayerNorm()(x)
                 x = nn.relu(x)
@@ -254,14 +261,17 @@ class EvalWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                value = nn.Dense(1)(x)
-                value = jnp.squeeze(value, axis=-1)
-                return policy_logits, value
+                # 6-way value head: outputs logits, converted to probs by evaluator
+                value_logits = nn.Dense(self.value_head_out_size)(x)
+                return policy_logits, value_logits
 
+        # Use network config from YAML, with fallback to defaults
+        num_hidden = self.config.get('network_hidden_dim', 256)
+        num_blocks = self.config.get('network_num_blocks', 6)
         self._nn_model = ResNetTurboZero(
             self._env.num_actions,
-            num_hidden=256,
-            num_blocks=6
+            num_hidden=num_hidden,
+            num_blocks=num_blocks
         )
 
     def _setup_mcts_evaluator(self) -> None:
@@ -355,8 +365,16 @@ class EvalWorker(BaseWorker):
 
         self._random_evaluator = RandomEvaluator(self._env)
 
-    def _setup_mlflow(self) -> None:
-        """Set up MLflow tracking if configured."""
+    def _setup_mlflow(self, max_retries: int = 5, retry_delay: float = 3.0) -> None:
+        """Set up MLflow tracking if configured.
+
+        Retries attachment to handle race condition where eval worker starts
+        before training worker has created/updated the MLflow run.
+
+        Args:
+            max_retries: Maximum number of retry attempts.
+            retry_delay: Seconds to wait between retries.
+        """
         if not self.mlflow_tracking_uri:
             print(f"Worker {self.worker_id}: MLflow not configured, skipping")
             return
@@ -367,20 +385,43 @@ class EvalWorker(BaseWorker):
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
             mlflow.set_experiment(self.mlflow_experiment_name)
 
-            # Get run ID from Redis (shared with training worker)
-            run_id = self.state.get_run_id()
+            # Retry loop to handle race condition with training worker
+            for attempt in range(max_retries):
+                # Get run ID from Redis (shared with training worker)
+                run_id = self.state.get_run_id()
 
-            if run_id:
-                # Resume existing run (same run as training worker)
-                try:
-                    self._mlflow_run = mlflow.start_run(run_id=run_id)
-                    print(f"Worker {self.worker_id}: Attached to MLflow run {run_id}")
-                except Exception as resume_error:
-                    print(f"Worker {self.worker_id}: Could not attach to run {run_id}: {resume_error}")
+                if run_id:
+                    # Try to attach to existing run
+                    try:
+                        self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
+                        print(f"Worker {self.worker_id}: Attached to MLflow run {run_id} (system metrics enabled)")
+                        return  # Success
+                    except Exception as resume_error:
+                        if 'RESOURCE_DOES_NOT_EXIST' in str(resume_error):
+                            # Run ID in Redis doesn't exist in MLflow yet
+                            # Training worker may be creating a new run
+                            if attempt < max_retries - 1:
+                                print(
+                                    f"Worker {self.worker_id}: Run {run_id} not found, "
+                                    f"waiting for training worker... (attempt {attempt + 1}/{max_retries})"
+                                )
+                                time.sleep(retry_delay)
+                                continue
+                        print(f"Worker {self.worker_id}: Could not attach to run {run_id}: {resume_error}")
+                        self._mlflow_run = None
+                        return
+                else:
+                    # No run ID yet, training worker may not have started
+                    if attempt < max_retries - 1:
+                        print(
+                            f"Worker {self.worker_id}: No MLflow run ID in Redis, "
+                            f"waiting for training worker... (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    print(f"Worker {self.worker_id}: No MLflow run ID found in Redis after {max_retries} attempts")
                     self._mlflow_run = None
-            else:
-                print(f"Worker {self.worker_id}: No MLflow run ID found in Redis")
-                self._mlflow_run = None
+                    return
 
         except Exception as e:
             print(f"Worker {self.worker_id}: MLflow setup error: {e}")
@@ -464,7 +505,7 @@ class EvalWorker(BaseWorker):
             key = jax.random.PRNGKey(42)
             sample_state, _ = self._env_init_fn(key)
             sample_obs = self._state_to_nn_input_fn(sample_state)
-            variables = self._nn_model.init(key, sample_obs[None, ...], train=False)
+            variables = self._nn_model.init(key, sample_obs[None, ...])
             self._nn_params = {'params': variables['params']}
             print(f"Worker {self.worker_id}: Initialized random weights")
 
@@ -875,11 +916,14 @@ class EvalWorker(BaseWorker):
             self._log_mlflow_gnubg_params()
 
         # Start Prometheus metrics server
-        metrics_port = self.config.get('metrics_port', 9300)
-        start_metrics_server(metrics_port)
+        metrics_port_config = self.config.get('metrics_port', 9300)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint
+        # Register metrics endpoint (use actual bound port)
         register_metrics_endpoint(
             self.buffer.redis,
             worker_id=self.worker_id,
