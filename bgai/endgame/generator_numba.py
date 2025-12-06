@@ -159,7 +159,6 @@ def value_iteration_step_numba(
     x_done: np.ndarray,
     n: int,
     n_dice: int,
-    max_moves: int,
 ) -> None:
     """Single value iteration step using numba with proper minimax.
 
@@ -294,7 +293,7 @@ def generate_bearoff_table_numba(
         # Compute new table values (in parallel)
         value_iteration_step_numba(
             table, new_table, trans, trans_counts, DICE_PROBS,
-            x_done, n, N_DICE, MAX_MOVES_PER_DICE
+            x_done, n, N_DICE
         )
 
         # Compute max_diff outside parallel loop

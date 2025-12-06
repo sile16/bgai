@@ -11,10 +11,9 @@ No Ray dependency - uses Redis for all coordination.
 
 import time
 import threading
-import signal
-import sys
 from typing import Dict, Optional, Any, List
 
+from ..utils import install_shutdown_handler
 from .redis_state import (
     RedisStateManager,
     WorkerInfo,
@@ -282,8 +281,7 @@ class Coordinator:
         self.start_time = time.time()
 
         # Setup signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        install_shutdown_handler(self.stop)
 
         print("Coordinator started")
 
@@ -330,12 +328,6 @@ class Coordinator:
             except Exception as e:
                 print(f"Error in status loop: {e}")
                 time.sleep(1)
-
-    def _handle_signal(self, signum: int, frame) -> None:
-        """Handle shutdown signals."""
-        self.stop()
-        sys.exit(0)
-
 
 # =============================================================================
 # Standalone Functions (for compatibility)

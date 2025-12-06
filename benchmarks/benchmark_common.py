@@ -18,7 +18,6 @@ import jax.numpy as jnp
 import chex
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
 from datetime import datetime
 
 # Constants

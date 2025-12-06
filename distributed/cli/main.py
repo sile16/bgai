@@ -187,14 +187,14 @@ def start_training_worker(args):
         config['learning_rate'] = args.learning_rate
     if args.l2_reg != 1e-4:
         config['l2_reg_lambda'] = args.l2_reg
-    if args.games_per_batch != 10:
-        config['games_per_training_batch'] = args.games_per_batch
+    if args.games_per_epoch != 10:
+        config['games_per_epoch'] = args.games_per_epoch
     if args.steps_per_game != 10:
         config['steps_per_game'] = args.steps_per_game
     if args.surprise_weight != 0.5:
         config['surprise_weight'] = args.surprise_weight
-    if args.checkpoint_interval != 1000:
-        config['checkpoint_interval'] = args.checkpoint_interval
+    if args.checkpoint_epoch_interval != 5:
+        config['checkpoint_epoch_interval'] = args.checkpoint_epoch_interval
     if args.min_buffer_size != 1000:
         config['min_buffer_size'] = args.min_buffer_size
     if args.checkpoint_dir:
@@ -602,10 +602,10 @@ def main():
         help='L2 regularization weight (default: 1e-4)'
     )
     train_parser.add_argument(
-        '--games-per-batch',
+        '--games-per-epoch',
         type=int,
         default=10,
-        help='New games required to trigger a training batch (default: 10)'
+        help='New games required to trigger a training epoch (default: 10)'
     )
     train_parser.add_argument(
         '--steps-per-game',
@@ -620,10 +620,10 @@ def main():
         help='Weight for surprise-based sampling (0=uniform, 1=fully weighted, default: 0.5)'
     )
     train_parser.add_argument(
-        '--checkpoint-interval',
+        '--checkpoint-epoch-interval',
         type=int,
-        default=1000,
-        help='Steps between checkpoints (default: 1000)'
+        default=5,
+        help='Epochs between checkpoints (default: 5)'
     )
     train_parser.add_argument(
         '--min-buffer-size',

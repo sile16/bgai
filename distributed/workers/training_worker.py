@@ -66,7 +66,6 @@ def weighted_az_loss_fn(
     (pred_policy_logits, pred_value_logits), updates = train_state.apply_fn(
         variables,
         x=experience.observation_nn,
-        train=True,
         mutable=mutables
     )
 
@@ -238,17 +237,21 @@ class TrainingWorker(BaseWorker):
                 - train_batch_size: Batch size for training (default: 128)
                 - learning_rate: Optimizer learning rate (default: 3e-4)
                 - l2_reg_lambda: L2 regularization weight (default: 1e-4)
-                - games_per_training_batch: New games to trigger training (default: 10)
-                - steps_per_game: Training steps per collected game (default: 10)
-                - checkpoint_interval: Steps between checkpoints (default: 1000)
+                - games_per_epoch: New games to trigger training epoch (default: 10)
+                - checkpoint_epoch_interval: Epochs between checkpoints (default: 5)
+                - max_checkpoints: Maximum checkpoints to keep (default: 5)
                 - min_buffer_size: Minimum buffer size before training (default: 1000)
                 - redis_host: Redis server host (default: 'localhost')
                 - redis_port: Redis server port (default: 6379)
                 - checkpoint_dir: Directory for saving checkpoints (default: 'checkpoints')
                 - mlflow_tracking_uri: MLflow tracking server URI (optional)
                 - mlflow_experiment_name: MLflow experiment name (optional)
-                - bearoff_table_path: Path to bearoff table .npy file (optional)
-                - use_bearoff_values: Whether to use perfect values for bearoff positions (default: True)
+                - bearoff_enabled: Whether bearoff DB is enabled (default: False)
+                - bearoff_value_weight: Learning weight for bearoff positions (default: 2.0)
+                - lookup_enabled: Whether lookup positions are enabled (default: False)
+                - lookup_learning_weight: Learning weight for lookup positions (default: 1.5)
+                - network_hidden_dim: Network hidden dimension (default: 256)
+                - network_num_blocks: Number of residual blocks (default: 6)
             worker_id: Optional unique worker ID. Auto-generated if not provided.
         """
         super().__init__(config, worker_id)
@@ -257,13 +260,22 @@ class TrainingWorker(BaseWorker):
         self.train_batch_size = self.config.get('train_batch_size', 128)
         self.learning_rate = self.config.get('learning_rate', 3e-4)
         self.l2_reg_lambda = self.config.get('l2_reg_lambda', 1e-4)
-        self.checkpoint_interval = self.config.get('checkpoint_interval', 1000)
+        # checkpoint_epoch_interval (new) with fallback to checkpoint_interval (old)
+        self.checkpoint_epoch_interval = self.config.get(
+            'checkpoint_epoch_interval',
+            self.config.get('checkpoint_interval', 5)
+        )
+        self.max_checkpoints = self.config.get('max_checkpoints', 5)
         self.min_buffer_size = self.config.get('min_buffer_size', 1000)
         self.checkpoint_dir = self.config.get('checkpoint_dir', 'checkpoints')
 
         # Collection-gated training configuration
-        # Training triggers after this many new games collected
-        self.games_per_training_batch = self.config.get('games_per_training_batch', 10)
+        # Training triggers after this many new games collected (epoch = games_per_epoch games)
+        # games_per_epoch (new) with fallback to games_per_training_batch (old)
+        self.games_per_epoch = self.config.get(
+            'games_per_epoch',
+            self.config.get('games_per_training_batch', 10)
+        )
         # Number of training steps to run per collected game
         # Default high to train on most experiences (avg game ~60 moves / batch_size)
         # Set to 0 to auto-calculate based on buffer size
@@ -274,10 +286,13 @@ class TrainingWorker(BaseWorker):
         self.surprise_weight = self.config.get('surprise_weight', 0.5)
 
         # Bearoff/endgame table configuration
-        self.use_bearoff_values = self.config.get('use_bearoff_values', True)
+        self.bearoff_enabled = self.config.get('bearoff_enabled', False)
         # Weight multiplier for bearoff value loss (since bearoff values are known-perfect)
         # Higher values emphasize learning accurate values for endgame positions
         self.bearoff_value_weight = self.config.get('bearoff_value_weight', 2.0)
+        # Lookup position configuration
+        self.lookup_enabled = self.config.get('lookup_enabled', False)
+        self.lookup_learning_weight = self.config.get('lookup_learning_weight', 1.5)
         self._bearoff_table = None
         self._bearoff_table_np = None  # Full table kept on CPU (too large for GPU)
         bearoff_table_path = self.config.get('bearoff_table_path')
@@ -287,7 +302,7 @@ class TrainingWorker(BaseWorker):
             if default_path.exists():
                 bearoff_table_path = str(default_path)
 
-        if bearoff_table_path and self.use_bearoff_values:
+        if bearoff_table_path and self.bearoff_enabled:
             try:
                 # Load full table - can't use symmetry because V(i,j) + V(j,i) != 1
                 # (the player to move has an advantage)
@@ -370,7 +385,7 @@ class TrainingWorker(BaseWorker):
                 - total_count: total batch size
                 - is_bearoff_mask: JAX array boolean mask (True for bearoff positions)
         """
-        if self._bearoff_table_np is None or not self.use_bearoff_values:
+        if self._bearoff_table_np is None or not self.bearoff_enabled:
             batch_size = batch.reward.shape[0]
             return batch, {
                 'bearoff_count': jnp.array(0),
@@ -517,14 +532,16 @@ class TrainingWorker(BaseWorker):
                     'train_batch_size': self.train_batch_size,
                     'learning_rate': self.learning_rate,
                     'l2_reg_lambda': self.l2_reg_lambda,
-                    'games_per_training_batch': self.games_per_training_batch,
+                    'games_per_epoch': self.games_per_epoch,
                     'surprise_weight': self.surprise_weight,
                     'min_buffer_size': self.min_buffer_size,
-                    'checkpoint_interval': self.checkpoint_interval,
+                    'checkpoint_epoch_interval': self.checkpoint_epoch_interval,
+                    'max_checkpoints': self.max_checkpoints,
                     # Bearoff/endgame params
-                    'use_bearoff_values': self.use_bearoff_values,
+                    'bearoff_enabled': self.bearoff_enabled,
                     'bearoff_value_weight': self.bearoff_value_weight,
-                    'lookup_learning_weight': self.config.get('lookup_learning_weight', 1.5),
+                    'lookup_enabled': self.lookup_enabled,
+                    'lookup_learning_weight': self.lookup_learning_weight,
                     # Warm tree params (now from mcts section)
                     'warm_tree_simulations': self.warm_tree_simulations,
                     'warm_tree_max_nodes': self.warm_tree_max_nodes,
@@ -619,7 +636,8 @@ class TrainingWorker(BaseWorker):
             value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
-            def __call__(self, x, train: bool = False):
+            def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
+                del train  # unused but required by turbozero interface
                 x = nn.Dense(self.num_hidden)(x)
                 x = nn.LayerNorm()(x)
                 x = nn.relu(x)
@@ -632,10 +650,13 @@ class TrainingWorker(BaseWorker):
                 value_logits = nn.Dense(self.value_head_out_size)(x)
                 return policy_logits, value_logits
 
+        # Use network config from YAML, with fallback to defaults
+        num_hidden = self.config.get('network_hidden_dim', 256)
+        num_blocks = self.config.get('network_num_blocks', 6)
         self._nn_model = ResNetTurboZero(
             self._env.num_actions,
-            num_hidden=256,
-            num_blocks=6
+            num_hidden=num_hidden,
+            num_blocks=num_blocks
         )
 
     def _initialize_train_state(self) -> None:
@@ -657,7 +678,7 @@ class TrainingWorker(BaseWorker):
             print(f"Worker {self.worker_id}: Loaded model version {version}")
         else:
             # Initialize random weights
-            variables = self._nn_model.init(key, sample_obs[None, ...], train=False)
+            variables = self._nn_model.init(key, sample_obs[None, ...])
             params = variables['params']
             print(f"Worker {self.worker_id}: Initialized random weights")
 
@@ -1008,7 +1029,7 @@ class TrainingWorker(BaseWorker):
         # Apply perfect bearoff values where applicable
         bearoff_metrics = None
         sample_weights = None
-        if self._bearoff_table is not None and self.use_bearoff_values:
+        if self._bearoff_table is not None and self.bearoff_enabled:
             try:
                 jax_batch, bearoff_metrics = self._apply_bearoff_values_to_batch(jax_batch)
                 # Create sample weights: bearoff_value_weight for bearoff, 1.0 for others
@@ -1053,7 +1074,6 @@ class TrainingWorker(BaseWorker):
                 pred_policy_logits, pred_value_logits = self._train_state.apply_fn(
                     {'params': self._train_state.params},
                     x=jax_batch.observation_nn,
-                    train=False,
                 )
 
                 # Mask invalid actions in policy for softmax
@@ -1159,10 +1179,8 @@ class TrainingWorker(BaseWorker):
             self._training_stats.cumulative_loss += metrics.get('loss', 0)
             self._training_stats.loss_count += 1
 
-            # Save checkpoint periodically
-            if self._total_steps % self.checkpoint_interval == 0:
-                self._save_checkpoint()
-                # Persist step counter to Redis for recovery
+            # Persist step counter to Redis periodically for recovery
+            if self._total_steps % 100 == 0:
                 self.state.set_training_steps(self._total_steps)
 
         batch_duration = time.time() - batch_start
@@ -1171,6 +1189,11 @@ class TrainingWorker(BaseWorker):
         self._training_stats.last_batch_duration = batch_duration
         self._training_stats.last_batch_steps = steps_done
         self._training_stats.total_batches_trained += 1
+
+        # Save checkpoint every N epochs (training batches)
+        if self._training_stats.total_batches_trained % self.checkpoint_epoch_interval == 0:
+            self._save_checkpoint()
+            self.state.set_training_steps(self._total_steps)
 
         # Compute averaged metrics
         if batch_metrics:
@@ -1240,7 +1263,7 @@ class TrainingWorker(BaseWorker):
 
         print(f"Worker {self.worker_id}: Collection-gated training mode")
         print(f"Worker {self.worker_id}: Will train {self.steps_per_game} steps "
-              f"for every {self.games_per_training_batch} games collected")
+              f"for every {self.games_per_epoch} games collected")
 
         start_time = time.time()
         last_log_time = start_time
@@ -1273,7 +1296,7 @@ class TrainingWorker(BaseWorker):
             current_games = self._get_current_games_count()
             new_games = current_games - self._training_stats.games_at_last_train
 
-            if new_games < self.games_per_training_batch:
+            if new_games < self.games_per_epoch:
                 # Not enough new games, wait
                 time.sleep(1.0)
 
@@ -1287,7 +1310,7 @@ class TrainingWorker(BaseWorker):
                 if current_time - last_log_time >= 30.0:
                     print(
                         f"Worker {self.worker_id}: Waiting for games "
-                        f"({new_games}/{self.games_per_training_batch} new games), "
+                        f"({new_games}/{self.games_per_epoch} new games), "
                         f"total_games={current_games}, "
                         f"buffer={buffer_size}, "
                         f"version={self.current_model_version}"
@@ -1533,7 +1556,7 @@ class TrainingWorker(BaseWorker):
             'buffer_size': buffer_size,
             'total_games': current_games,
             # Collection-gated training stats
-            'games_per_training_batch': self.games_per_training_batch,
+            'games_per_training_batch': self.games_per_epoch,
             'steps_per_game': self.steps_per_game,
             'total_training_batches': self._training_stats.total_batches_trained,
             'games_at_last_train': self._training_stats.games_at_last_train,

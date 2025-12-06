@@ -233,6 +233,9 @@ def get_game_worker_config(
     temp_start = mcts.get('temperature_start')
     temp_end = mcts.get('temperature_end')
 
+    # Network config for model architecture
+    network = config.get('network', {})
+
     return {
         'batch_size': batch_size,
         # collect_simulations is used for game generation (was just 'simulations')
@@ -242,6 +245,7 @@ def get_game_worker_config(
         'temperature': 1.0,  # Default if no schedule
         'temperature_start': temp_start,
         'temperature_end': temp_end,
+        'temperature_epochs': mcts.get('temperature_epochs', 50),
         # Game settings
         'max_episode_steps': game.get('max_episode_steps', 500),
         'short_game': game.get('short_game', True),
@@ -250,6 +254,10 @@ def get_game_worker_config(
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
+        # Network architecture
+        'network_hidden_dim': network.get('hidden_dim', 256),
+        'network_num_blocks': network.get('num_blocks', 6),
+        'network_num_actions': network.get('num_actions', 156),
     }
 
 
@@ -286,15 +294,14 @@ def get_training_worker_config(
 
     # Build MLFlow tracking URI - use head_ip if provided, else auto-detect
     mlflow_uri = mlflow.get('tracking_uri')
-    if mlflow_uri:
-        # Determine the target host for MLflow
-        if head_ip:
-            # Use explicitly provided head IP
-            target_host = head_ip
-        else:
-            # Auto-detect by finding reachable head node (same as Redis detection)
-            target_host = detect_redis_host(config)
 
+    # Determine the target host for MLflow
+    if head_ip:
+        target_host = head_ip
+    else:
+        target_host = detect_redis_host(config)
+
+    if mlflow_uri:
         # Replace localhost, head IPs, etc. with target host
         head = config.get('head', {})
         config_head_ip = head.get('host', '')
@@ -306,35 +313,55 @@ def get_training_worker_config(
             mlflow_uri = mlflow_uri.replace(config_head_ip, target_host)
         elif config_head_local and config_head_local in mlflow_uri:
             mlflow_uri = mlflow_uri.replace(config_head_local, target_host)
+    else:
+        # Build URI from head.host and mlflow.port
+        mlflow_port = mlflow.get('port', 5000)
+        mlflow_uri = f"http://{target_host}:{mlflow_port}"
 
     mcts = config.get('mcts', {})
+
+    # Network config for model architecture
+    network = config.get('network', {})
 
     return {
         'train_batch_size': batch_size,
         'learning_rate': training.get('learning_rate', 3e-4),
         'l2_reg_lambda': training.get('l2_reg_lambda', 1e-4),
-        'checkpoint_interval': training.get('checkpoint_interval', 1000),
+        # checkpoint_epoch_interval (new) with fallback to checkpoint_interval (old)
+        'checkpoint_epoch_interval': training.get('checkpoint_epoch_interval', training.get('checkpoint_interval', 5)),
+        'max_checkpoints': training.get('max_checkpoints', 5),
         'min_buffer_size': 1000,  # Could add to config
         'checkpoint_dir': config.get('checkpoint_dir', './checkpoints'),
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
-        'games_per_training_batch': training.get('games_per_batch', 10),
+        # games_per_epoch (new) with fallback to games_per_batch (old)
+        'games_per_epoch': training.get('games_per_epoch', training.get('games_per_batch', 10)),
         # steps_per_game removed - now trains on all available steps
         'surprise_weight': training.get('surprise_weight', 0.5),
-        # Bearoff/endgame weights
+        # Bearoff/endgame settings
+        'bearoff_enabled': training.get('bearoff_enabled', False),
         'bearoff_value_weight': training.get('bearoff_value_weight', 2.0),
+        'lookup_enabled': training.get('lookup_enabled', False),
         'lookup_learning_weight': training.get('lookup_learning_weight', 1.5),
         # Warm tree configuration (now in mcts section)
         'warm_tree_simulations': mcts.get('warm_tree_simulations', 0),
         'warm_tree_max_nodes': mcts.get('warm_tree_max_nodes', 10000),
+        # Temperature schedule
+        'temperature_start': mcts.get('temperature_start', 0.8),
+        'temperature_end': mcts.get('temperature_end', 0.2),
+        'temperature_epochs': mcts.get('temperature_epochs', 50),
         # MLFlow tracking
         'mlflow_tracking_uri': mlflow_uri,
         'mlflow_experiment_name': mlflow.get('experiment_name', 'bgai-training'),
+        # Network architecture
+        'network_hidden_dim': network.get('hidden_dim', 256),
+        'network_num_blocks': network.get('num_blocks', 6),
+        'network_num_actions': network.get('num_actions', 156),
         # Pass full config sections for MLflow param logging
         'mcts': mcts,
         'game': config.get('game', {}),
-        'network': config.get('network', {}),
+        'network': network,
         'redis': redis,
         'gnubg': config.get('gnubg', {}),
     }
@@ -373,15 +400,14 @@ def get_eval_worker_config(
 
     # Build MLFlow tracking URI - use head_ip if provided, else auto-detect
     mlflow_uri = mlflow.get('tracking_uri')
-    if mlflow_uri:
-        # Determine the target host for MLflow
-        if head_ip:
-            # Use explicitly provided head IP
-            target_host = head_ip
-        else:
-            # Auto-detect by finding reachable head node (same as Redis detection)
-            target_host = detect_redis_host(config)
 
+    # Determine the target host for MLflow
+    if head_ip:
+        target_host = head_ip
+    else:
+        target_host = detect_redis_host(config)
+
+    if mlflow_uri:
         # Replace localhost, head IPs, etc. with target host
         head = config.get('head', {})
         config_head_ip = head.get('host', '')
@@ -393,6 +419,13 @@ def get_eval_worker_config(
             mlflow_uri = mlflow_uri.replace(config_head_ip, target_host)
         elif config_head_local and config_head_local in mlflow_uri:
             mlflow_uri = mlflow_uri.replace(config_head_local, target_host)
+    else:
+        # Build URI from head.host and mlflow.port
+        mlflow_port = mlflow.get('port', 5000)
+        mlflow_uri = f"http://{target_host}:{mlflow_port}"
+
+    # Network config for model architecture
+    network = config.get('network', {})
 
     return {
         'batch_size': batch_size,
@@ -405,6 +438,10 @@ def get_eval_worker_config(
         # MLFlow tracking (shared with training worker)
         'mlflow_tracking_uri': mlflow_uri,
         'mlflow_experiment_name': mlflow.get('experiment_name', 'bgai-training'),
+        # Network architecture
+        'network_hidden_dim': network.get('hidden_dim', 256),
+        'network_num_blocks': network.get('num_blocks', 6),
+        'network_num_actions': network.get('num_actions', 156),
     }
 
 

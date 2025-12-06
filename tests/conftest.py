@@ -6,7 +6,7 @@ No Ray dependency - tests use Redis for coordination.
 import pytest
 import jax
 import jax.numpy as jnp
-from typing import Generator, Optional
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 from distributed.device import detect_device, DeviceInfo

@@ -12,13 +12,12 @@ No Ray dependency - uses Redis for all coordination.
 
 import time
 import threading
-import signal
-import sys
 import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
+from ..utils import install_shutdown_handler
 from ..coordinator.redis_state import (
     RedisStateManager,
     WorkerInfo,
@@ -311,8 +310,7 @@ class BaseWorker(ABC):
             Dict with results/statistics from the run.
         """
         # Setup signal handlers
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        install_shutdown_handler(self.stop)
 
         # Register with Redis
         if not self.register():
@@ -348,11 +346,6 @@ class BaseWorker(ABC):
         self._stop_heartbeat()
         stop_system_metrics_collector()
         self.deregister()
-
-    def _handle_signal(self, signum: int, frame) -> None:
-        """Handle shutdown signals."""
-        self.stop()
-        sys.exit(0)
 
     # =========================================================================
     # Utility Methods

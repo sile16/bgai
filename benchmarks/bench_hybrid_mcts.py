@@ -14,7 +14,7 @@ import os
 import sys
 import time
 from functools import partial
-from typing import Tuple, Optional, Callable
+from typing import Tuple, Optional
 
 # Set platform BEFORE importing JAX - need both CPU and Metal
 os.environ['JAX_PLATFORMS'] = 'cpu,METAL'

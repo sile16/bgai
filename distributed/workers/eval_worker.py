@@ -251,7 +251,8 @@ class EvalWorker(BaseWorker):
             value_head_out_size: int = 6  # 6-way outcome distribution
 
             @nn.compact
-            def __call__(self, x, train: bool = False):
+            def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
+                del train  # unused but required by turbozero interface
                 x = nn.Dense(self.num_hidden)(x)
                 x = nn.LayerNorm()(x)
                 x = nn.relu(x)
@@ -264,10 +265,13 @@ class EvalWorker(BaseWorker):
                 value_logits = nn.Dense(self.value_head_out_size)(x)
                 return policy_logits, value_logits
 
+        # Use network config from YAML, with fallback to defaults
+        num_hidden = self.config.get('network_hidden_dim', 256)
+        num_blocks = self.config.get('network_num_blocks', 6)
         self._nn_model = ResNetTurboZero(
             self._env.num_actions,
-            num_hidden=256,
-            num_blocks=6
+            num_hidden=num_hidden,
+            num_blocks=num_blocks
         )
 
     def _setup_mcts_evaluator(self) -> None:
@@ -501,7 +505,7 @@ class EvalWorker(BaseWorker):
             key = jax.random.PRNGKey(42)
             sample_state, _ = self._env_init_fn(key)
             sample_obs = self._state_to_nn_input_fn(sample_state)
-            variables = self._nn_model.init(key, sample_obs[None, ...], train=False)
+            variables = self._nn_model.init(key, sample_obs[None, ...])
             self._nn_params = {'params': variables['params']}
             print(f"Worker {self.worker_id}: Initialized random weights")
 

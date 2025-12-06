@@ -33,7 +33,6 @@ import jax.numpy as jnp
 StateT = TypeVar('StateT')
 
 TRUE = jnp.bool_(True)
-FALSE = jnp.bool_(False)
 
 
 def is_metal_backend() -> bool:

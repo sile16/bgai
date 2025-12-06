@@ -356,80 +356,82 @@ class BGAIMetrics:
         # =================================================================
         # System Metrics (CPU, RAM, GPU, GPU RAM)
         # =================================================================
+        # System metrics use 'host' label so multiple workers on same host
+        # update the same time series (avoiding duplication)
         self.cpu_percent = Gauge(
             'bgai_cpu_percent',
             'CPU utilization percentage (0-100)',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.cpu_count = Gauge(
             'bgai_cpu_count',
             'Number of CPU cores',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.memory_used_bytes = Gauge(
             'bgai_memory_used_bytes',
             'System RAM used in bytes',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.memory_total_bytes = Gauge(
             'bgai_memory_total_bytes',
             'Total system RAM in bytes',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.memory_percent = Gauge(
             'bgai_memory_percent',
             'System RAM utilization percentage (0-100)',
-            ['worker_id'],
+            ['host'],
             registry=self.registry,
         )
 
         self.gpu_utilization_percent = Gauge(
             'bgai_gpu_utilization_percent',
             'GPU compute utilization percentage (0-100)',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_memory_used_bytes = Gauge(
             'bgai_gpu_memory_used_bytes',
             'GPU memory used in bytes',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_memory_total_bytes = Gauge(
             'bgai_gpu_memory_total_bytes',
             'Total GPU memory in bytes',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_memory_percent = Gauge(
             'bgai_gpu_memory_percent',
             'GPU memory utilization percentage (0-100)',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_temperature = Gauge(
             'bgai_gpu_temperature_celsius',
             'GPU temperature in Celsius',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
         self.gpu_power_watts = Gauge(
             'bgai_gpu_power_watts',
             'GPU power draw in watts',
-            ['worker_id', 'gpu_index', 'gpu_name'],
+            ['host', 'gpu_index', 'gpu_name'],
             registry=self.registry,
         )
 
@@ -439,35 +441,35 @@ class BGAIMetrics:
         self.tpu_duty_cycle_percent = Gauge(
             'bgai_tpu_duty_cycle_percent',
             'TPU TensorCore duty cycle percentage (0-100)',
-            ['worker_id', 'tpu_index'],
+            ['host', 'tpu_index'],
             registry=self.registry,
         )
 
         self.tpu_tensor_core_utilization = Gauge(
             'bgai_tpu_tensor_core_utilization',
             'TPU Tensor Core utilization percentage (0-100)',
-            ['worker_id', 'tpu_index'],
+            ['host', 'tpu_index'],
             registry=self.registry,
         )
 
         self.tpu_hbm_memory_used_bytes = Gauge(
             'bgai_tpu_hbm_memory_used_bytes',
             'TPU High Bandwidth Memory used in bytes',
-            ['worker_id', 'tpu_index'],
+            ['host', 'tpu_index'],
             registry=self.registry,
         )
 
         self.tpu_hbm_memory_total_bytes = Gauge(
             'bgai_tpu_hbm_memory_total_bytes',
             'TPU High Bandwidth Memory total in bytes',
-            ['worker_id', 'tpu_index'],
+            ['host', 'tpu_index'],
             registry=self.registry,
         )
 
         self.tpu_hbm_memory_percent = Gauge(
             'bgai_tpu_hbm_memory_percent',
             'TPU High Bandwidth Memory utilization percentage (0-100)',
-            ['worker_id', 'tpu_index'],
+            ['host', 'tpu_index'],
             registry=self.registry,
         )
 
@@ -822,12 +824,15 @@ class SystemMetricsCollector(threading.Thread):
         """Initialize the system metrics collector.
 
         Args:
-            worker_id: Unique worker identifier for metric labels.
+            worker_id: Unique worker identifier (used for logging, not metrics).
             update_interval: Seconds between metric collections.
             gpu_indices: List of GPU indices to monitor (None = all available).
         """
         super().__init__(daemon=True)
         self.worker_id = worker_id
+        # Use hostname for system metrics to avoid duplication when multiple
+        # workers run on the same host
+        self.hostname = socket.gethostname()
         self.update_interval = update_interval
         self.gpu_indices = gpu_indices
         self._stop_event = threading.Event()
@@ -881,14 +886,14 @@ class SystemMetricsCollector(threading.Thread):
             cpu_percent = psutil.cpu_percent(interval=None)
             cpu_count = psutil.cpu_count()
 
-            metrics.cpu_percent.labels(worker_id=self.worker_id).set(cpu_percent)
-            metrics.cpu_count.labels(worker_id=self.worker_id).set(cpu_count)
+            metrics.cpu_percent.labels(host=self.hostname).set(cpu_percent)
+            metrics.cpu_count.labels(host=self.hostname).set(cpu_count)
 
             # Memory metrics
             mem = psutil.virtual_memory()
-            metrics.memory_used_bytes.labels(worker_id=self.worker_id).set(mem.used)
-            metrics.memory_total_bytes.labels(worker_id=self.worker_id).set(mem.total)
-            metrics.memory_percent.labels(worker_id=self.worker_id).set(mem.percent)
+            metrics.memory_used_bytes.labels(host=self.hostname).set(mem.used)
+            metrics.memory_total_bytes.labels(host=self.hostname).set(mem.total)
+            metrics.memory_percent.labels(host=self.hostname).set(mem.percent)
 
         except Exception as e:
             print(f"Error collecting CPU metrics: {e}")
@@ -903,7 +908,7 @@ class SystemMetricsCollector(threading.Thread):
                 # GPU utilization
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 metrics.gpu_utilization_percent.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(util.gpu)
@@ -911,17 +916,17 @@ class SystemMetricsCollector(threading.Thread):
                 # GPU memory
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 metrics.gpu_memory_used_bytes.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(mem_info.used)
                 metrics.gpu_memory_total_bytes.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(mem_info.total)
                 metrics.gpu_memory_percent.labels(
-                    worker_id=self.worker_id,
+                    host=self.hostname,
                     gpu_index=str(idx),
                     gpu_name=name,
                 ).set(100.0 * mem_info.used / mem_info.total if mem_info.total > 0 else 0)
@@ -930,7 +935,7 @@ class SystemMetricsCollector(threading.Thread):
                 try:
                     temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
                     metrics.gpu_temperature.labels(
-                        worker_id=self.worker_id,
+                        host=self.hostname,
                         gpu_index=str(idx),
                         gpu_name=name,
                     ).set(temp)
@@ -941,7 +946,7 @@ class SystemMetricsCollector(threading.Thread):
                 try:
                     power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW to W
                     metrics.gpu_power_watts.labels(
-                        worker_id=self.worker_id,
+                        host=self.hostname,
                         gpu_index=str(idx),
                         gpu_name=name,
                     ).set(power)
@@ -975,7 +980,7 @@ class SystemMetricsCollector(threading.Thread):
                         duty_cycle = tpumonitoring.get_metric('duty_cycle_pct', chip=tpu_idx)
                         if duty_cycle is not None:
                             metrics.tpu_duty_cycle_percent.labels(
-                                worker_id=self.worker_id,
+                                host=self.hostname,
                                 tpu_index=str(tpu_idx),
                             ).set(duty_cycle)
 
@@ -984,7 +989,7 @@ class SystemMetricsCollector(threading.Thread):
                         tc_util = tpumonitoring.get_metric('tensor_core_util_pct', chip=tpu_idx)
                         if tc_util is not None:
                             metrics.tpu_tensor_core_utilization.labels(
-                                worker_id=self.worker_id,
+                                host=self.hostname,
                                 tpu_index=str(tpu_idx),
                             ).set(tc_util)
 
@@ -994,16 +999,16 @@ class SystemMetricsCollector(threading.Thread):
                         hbm_used = tpumonitoring.get_metric('hbm_capacity_usage', chip=tpu_idx)
                         if hbm_total is not None and hbm_used is not None:
                             metrics.tpu_hbm_memory_total_bytes.labels(
-                                worker_id=self.worker_id,
+                                host=self.hostname,
                                 tpu_index=str(tpu_idx),
                             ).set(hbm_total)
                             metrics.tpu_hbm_memory_used_bytes.labels(
-                                worker_id=self.worker_id,
+                                host=self.hostname,
                                 tpu_index=str(tpu_idx),
                             ).set(hbm_used)
                             if hbm_total > 0:
                                 metrics.tpu_hbm_memory_percent.labels(
-                                    worker_id=self.worker_id,
+                                    host=self.hostname,
                                     tpu_index=str(tpu_idx),
                                 ).set(100.0 * hbm_used / hbm_total)
 

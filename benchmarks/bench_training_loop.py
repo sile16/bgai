@@ -18,7 +18,7 @@ import flax.linen as nn
 import optax
 
 # TurboZero imports
-from core.training.train import Trainer, CollectionState
+from core.training.train import Trainer
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.evaluation_fns import make_nn_eval_fn

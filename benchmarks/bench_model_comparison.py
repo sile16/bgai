@@ -159,7 +159,7 @@ class ModelComparisonBenchmark(BaseBenchmark):
                 num_blocks: int = 5  # More blocks for 10-layer network
 
                 @nn.compact
-                def __call__(self, x, train: bool = False):
+                def __call__(self, x, _train: bool = False):
                     # Initial projection
                     x = nn.Dense(self.num_hidden)(x)
                     x = nn.LayerNorm()(x)

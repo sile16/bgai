@@ -70,7 +70,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_loss",
+          "expr": "max(bgai_training_loss)",
           "legendFormat": "Loss",
           "refId": "A"
         }
@@ -101,7 +101,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_steps_total",
+          "expr": "max(bgai_training_steps_total)",
           "legendFormat": "Steps",
           "refId": "A"
         }
@@ -133,7 +133,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_steps_per_second",
+          "expr": "max(bgai_training_steps_per_second)",
           "legendFormat": "Steps/s",
           "refId": "A"
         }
@@ -164,7 +164,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_batches_total",
+          "expr": "max(bgai_training_batches_total)",
           "legendFormat": "Batches",
           "refId": "A"
         }
@@ -195,7 +195,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_games_since_last_train",
+          "expr": "max(bgai_games_since_last_train)",
           "legendFormat": "Games",
           "refId": "A"
         }
@@ -241,7 +241,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_training_loss",
+          "expr": "max(bgai_training_loss)",
           "legendFormat": "Training Loss",
           "refId": "A"
         }
@@ -287,12 +287,12 @@
       },
       "targets": [
         {
-          "expr": "rate(bgai_training_steps_total[1m])",
+          "expr": "sum(rate(bgai_training_steps_total[1m]))",
           "legendFormat": "Training Steps/s",
           "refId": "A"
         },
         {
-          "expr": "rate(bgai_collection_steps_total[1m])",
+          "expr": "sum(rate(bgai_collection_steps_total[1m]))",
           "legendFormat": "Collection Steps/s",
           "refId": "B"
         }
@@ -1003,7 +1003,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_size",
+          "expr": "max(bgai_buffer_size)",
           "legendFormat": "Experiences",
           "refId": "A"
         }
@@ -1034,7 +1034,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_games",
+          "expr": "max(bgai_buffer_games)",
           "legendFormat": "Games",
           "refId": "A"
         }
@@ -1065,7 +1065,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_episodes",
+          "expr": "max(bgai_buffer_episodes)",
           "legendFormat": "Episodes",
           "refId": "A"
         }
@@ -1096,7 +1096,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_episodes_with_surprise",
+          "expr": "max(bgai_episodes_with_surprise)",
           "legendFormat": "Episodes",
           "refId": "A"
         }
@@ -1142,12 +1142,12 @@
       },
       "targets": [
         {
-          "expr": "bgai_buffer_size",
+          "expr": "max(bgai_buffer_size)",
           "legendFormat": "Experiences",
           "refId": "A"
         },
         {
-          "expr": "bgai_buffer_games",
+          "expr": "max(bgai_buffer_games)",
           "legendFormat": "Games",
           "refId": "B"
         }
@@ -1193,12 +1193,12 @@
       },
       "targets": [
         {
-          "expr": "bgai_surprise_score_max",
+          "expr": "max(bgai_surprise_score_max)",
           "legendFormat": "Max Surprise",
           "refId": "A"
         },
         {
-          "expr": "bgai_surprise_score_mean",
+          "expr": "max(bgai_surprise_score_mean)",
           "legendFormat": "Mean Surprise",
           "refId": "B"
         }
@@ -1236,7 +1236,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_surprise_score_max",
+          "expr": "max(bgai_surprise_score_max)",
           "legendFormat": "Max",
           "refId": "A"
         }
@@ -1268,7 +1268,7 @@
       },
       "targets": [
         {
-          "expr": "bgai_surprise_score_mean",
+          "expr": "max(bgai_surprise_score_mean)",
           "legendFormat": "Mean",
           "refId": "A"
         }
@@ -1369,11 +1369,11 @@
       "targets": [
         {
           "expr": "bgai_cpu_percent",
-          "legendFormat": "{{worker_id}}",
+          "legendFormat": "{{host}}",
           "refId": "A"
         }
       ],
-      "title": "CPU Usage by Worker",
+      "title": "CPU Usage by Host",
       "type": "timeseries"
     },
     {
@@ -1417,11 +1417,11 @@
       "targets": [
         {
           "expr": "bgai_memory_percent",
-          "legendFormat": "{{worker_id}}",
+          "legendFormat": "{{host}}",
           "refId": "A"
         }
       ],
-      "title": "System RAM Usage by Worker",
+      "title": "System RAM Usage by Host",
       "type": "timeseries"
     },
     {
@@ -1465,11 +1465,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_utilization_percent",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Utilization by Worker",
+      "title": "GPU Utilization by Host",
       "type": "timeseries"
     },
     {
@@ -1513,11 +1513,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_memory_percent",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Memory Usage by Worker",
+      "title": "GPU Memory Usage by Host",
       "type": "timeseries"
     },
     {
@@ -1559,11 +1559,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_temperature_celsius",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Temperature by Worker",
+      "title": "GPU Temperature by Host",
       "type": "timeseries"
     },
     {
@@ -1605,11 +1605,11 @@
       "targets": [
         {
           "expr": "bgai_gpu_power_watts",
-          "legendFormat": "{{worker_id}} ({{gpu_name}})",
+          "legendFormat": "{{host}} ({{gpu_name}})",
           "refId": "A"
         }
       ],
-      "title": "GPU Power Draw by Worker",
+      "title": "GPU Power Draw by Host",
       "type": "timeseries"
     },
     {
@@ -1660,11 +1660,11 @@
           "targets": [
             {
               "expr": "bgai_tpu_duty_cycle_percent",
-              "legendFormat": "{{worker_id}} (TPU {{tpu_index}})",
+              "legendFormat": "{{host}} (TPU {{tpu_index}})",
               "refId": "A"
             }
           ],
-          "title": "TPU Duty Cycle by Worker",
+          "title": "TPU Duty Cycle by Host",
           "type": "timeseries"
         },
         {
@@ -1708,11 +1708,11 @@
           "targets": [
             {
               "expr": "bgai_tpu_hbm_memory_percent",
-              "legendFormat": "{{worker_id}} (TPU {{tpu_index}})",
+              "legendFormat": "{{host}} (TPU {{tpu_index}})",
               "refId": "A"
             }
           ],
-          "title": "TPU HBM Memory by Worker",
+          "title": "TPU HBM Memory by Host",
           "type": "timeseries"
         }
       ]
