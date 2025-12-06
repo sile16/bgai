@@ -2,11 +2,13 @@
 //! - Uses gnubg's bearoff ID ordering (PositionBearoff).
 //! - Exact CubeEquity rule (double/take/pass) on cubeless equities.
 //! - Computes only the upper triangle (i <= j) and mirrors the rest.
-//! - Outputs 7 float32 values per packed entry:
+//! - Outputs packed upper triangle (i <= j) with 7 uint24-fixed values
+//!   (3 bytes each, little endian), fields:
 //!   [win, gammon_win, loss, gammon_loss, eq_center, eq_owner, eq_opponent].
+//!   Probabilities use [0,1] scaling; equities use [-1,1] mapped to [0,1].
 
 use bkgm::{Dice as BgDice, Position as BgPosition, O_BAR, X_BAR};
-use numpy::{IntoPyArray, PyArray2};
+use numpy::{IntoPyArray, PyArray3};
 use pyo3::prelude::*;
 use serde::Serialize;
 use serde_json;
@@ -117,11 +119,7 @@ fn position_sum(pos: &Position) -> usize {
     pos.iter().map(|&x| x as usize).sum()
 }
 
-fn to_bg_position(
-    us: &Position,
-    them: &Position,
-    max_checkers: usize,
-) -> Option<BgPosition> {
+fn to_bg_position(us: &Position, them: &Position, max_checkers: usize) -> Option<BgPosition> {
     let us_sum = position_sum(us);
     let them_sum = position_sum(them);
     if us_sum > max_checkers || them_sum > max_checkers {
@@ -247,7 +245,11 @@ fn generate_moves_sub(
         }
         used = true;
         if let Some(next) = apply_sub_move(pos, src, rolls[depth]) {
-            let next_start = if rolls[0] == rolls[1] { src } else { NUM_POINTS - 1 };
+            let next_start = if rolls[0] == rolls[1] {
+                src
+            } else {
+                NUM_POINTS - 1
+            };
             if generate_moves_sub(&next, rolls, depth + 1, next_start, allow_partial, out) {
                 out.push(next);
             }
@@ -260,7 +262,12 @@ fn generate_moves_sub(
 fn generate_moves(pos: &Position, d0: u8, d1: u8) -> Vec<Position> {
     let mut results = Vec::new();
 
-    let rolls1 = [d0, d1, if d0 == d1 { d0 } else { 0 }, if d0 == d1 { d0 } else { 0 }];
+    let rolls1 = [
+        d0,
+        d1,
+        if d0 == d1 { d0 } else { 0 },
+        if d0 == d1 { d0 } else { 0 },
+    ];
     generate_moves_sub(pos, &rolls1, 0, NUM_POINTS - 1, false, &mut results);
 
     if d0 != d1 {
@@ -277,14 +284,9 @@ fn generate_moves(pos: &Position, d0: u8, d1: u8) -> Vec<Position> {
 }
 
 fn build_pos_index(positions: &[Position]) -> HashMap<Position, usize> {
-    positions
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (*p, i))
-        .collect()
+    positions.iter().enumerate().map(|(i, p)| (*p, i)).collect()
 }
 
-#[allow(dead_code)]
 fn packed_index(i: usize, j: usize, n: usize) -> usize {
     // i <= j
     i * n - (i * (i - 1)) / 2 + (j - i)
@@ -314,7 +316,7 @@ fn solve_equity(
     us: usize,
     them: usize,
     n_positions: usize,
-    transitions: &[Vec<Vec<(usize, usize)>>],
+    move_table: &[Vec<Vec<usize>>],
     position_sums: &[usize],
     table: &mut Vec<[i16; 4]>,
     computed: &mut Vec<bool>,
@@ -343,16 +345,19 @@ fn solve_equity(
 
     let mut totals = [0i32; 4];
 
-    for (dice_idx, (d0, d1)) in DICE_OUTCOMES.iter().enumerate() {
-        let weight: i32 = if d0 == d1 { 1 } else { 2 };
+    for (dice_idx, (_d0, _d1)) in DICE_OUTCOMES.iter().enumerate() {
+        let weight: i32 = if _d0 == _d1 { 1 } else { 2 };
         let mut best = [i16::MIN; 4];
 
-        for &(next_us, next_them) in &transitions[idx][dice_idx] {
+        let next_us = them; // roles swap after we move.
+        let next_positions = &move_table[us][dice_idx];
+
+        for &next_them in next_positions {
             let child = solve_equity(
                 next_us,
                 next_them,
                 n_positions,
-                transitions,
+                move_table,
                 position_sums,
                 table,
                 computed,
@@ -409,6 +414,7 @@ struct Header {
     cubeful: bool,
     entries: usize,
     n_positions: usize,
+    quantization: &'static str,
 }
 
 #[pyfunction]
@@ -417,7 +423,7 @@ fn generate_packed_bearoff(
     max_checkers: usize,
     tolerance: f32,
     max_iter: usize,
-) -> PyResult<(PyObject, Py<PyArray2<f32>>)> {
+) -> PyResult<(PyObject, Py<PyArray3<u8>>)> {
     // tolerance and max_iter kept for API compatibility (unused in exact solver)
     let _ = tolerance;
     let _ = max_iter;
@@ -431,59 +437,82 @@ fn generate_packed_bearoff(
 
     let position_sums: Vec<usize> = positions.iter().map(position_sum).collect();
 
-    // Transition table for each (us, them) pair and dice outcome.
-    let total_states = n_positions * n_positions;
-    let mut transitions: Vec<Vec<Vec<(usize, usize)>>> =
-        vec![vec![Vec::new(); DICE_OUTCOMES.len()]; total_states];
-
+    // For bearoff, legal moves depend only on the current player's board and dice.
+    let mut move_table: Vec<Vec<Vec<usize>>> =
+        vec![vec![Vec::new(); DICE_OUTCOMES.len()]; n_positions];
     for us_idx in 0..n_positions {
-        for them_idx in 0..n_positions {
-            let bg = to_bg_position(&positions[us_idx], &positions[them_idx], max_checkers)
-                .expect("valid bearoff position");
-            let pair_idx = pair_index(us_idx, them_idx, n_positions);
-            for (dice_idx, (d1, d2)) in DICE_OUTCOMES.iter().enumerate() {
-                let dice = BgDice::new(*d1 as usize, *d2 as usize);
-                let mut next_pairs = Vec::new();
-                for child in bg.all_positions_after_moving(&dice) {
-                    if let Some((child_us, child_them)) =
-                        from_bg_position(&child, max_checkers)
-                    {
-                        let cu = *pos_to_idx.get(&child_us).expect("missing position");
-                        let ct = *pos_to_idx.get(&child_them).expect("missing position");
-                        next_pairs.push((cu, ct));
-                    }
-                }
-                next_pairs.sort();
-                next_pairs.dedup();
-                transitions[pair_idx][dice_idx] = next_pairs;
+        let pos = positions[us_idx];
+        for (dice_idx, (d0, d1)) in DICE_OUTCOMES.iter().enumerate() {
+            let mut next_idxs = Vec::new();
+            for child in generate_moves(&pos, *d0, *d1) {
+                let idx = *pos_to_idx.get(&child).expect("missing position");
+                next_idxs.push(idx);
             }
+            next_idxs.sort();
+            next_idxs.dedup();
+            move_table[us_idx][dice_idx] = next_idxs;
         }
     }
 
+    let total_states = n_positions * n_positions;
     let mut eq_table: Vec<[i16; 4]> = vec![[0; 4]; total_states];
     let mut computed: Vec<bool> = vec![false; total_states];
 
-    let mut arr = ndarray::Array3::<f32>::zeros((n_positions, n_positions, 7));
+    let entries = packed_index(n_positions - 1, n_positions - 1, n_positions) + 1;
+    // Shape: (entries, 7 slots, 3 bytes per uint24)
+    let mut arr = ndarray::Array3::<u8>::zeros((entries, 7, 3));
+
+    let encode_unit = |v: f32| -> [u8; 3] {
+        let clamped = if v < 0.0 {
+            0.0
+        } else if v > 1.0 {
+            1.0
+        } else {
+            v
+        };
+        let q = ((clamped * 16_777_215.0).round() as u32).min(16_777_215);
+        [
+            (q & 0xff) as u8,
+            ((q >> 8) & 0xff) as u8,
+            ((q >> 16) & 0xff) as u8,
+        ]
+    };
+
+    let encode_prob = |v: f32| encode_unit(v);
+    let encode_equity = |v: f32| encode_unit(0.5 * (v.max(-1.0).min(1.0) + 1.0));
+
     for i in 0..n_positions {
-        for j in 0..n_positions {
+        for j in i..n_positions {
             let eqs = solve_equity(
                 i,
                 j,
                 n_positions,
-                &transitions,
+                &move_table,
                 &position_sums,
                 &mut eq_table,
                 &mut computed,
             );
             let cubeless_f = eqs[0] as f32 / EQUITY_P1 as f32;
             let win = 0.5 * (1.0 + cubeless_f);
-            arr[(i, j, 0)] = win;
-            arr[(i, j, 1)] = 0.0; // gammon win placeholder
-            arr[(i, j, 2)] = 1.0 - win;
-            arr[(i, j, 3)] = 0.0; // gammon loss placeholder
-            arr[(i, j, 4)] = eqs[2] as f32 / EQUITY_P1 as f32;
-            arr[(i, j, 5)] = eqs[1] as f32 / EQUITY_P1 as f32;
-            arr[(i, j, 6)] = eqs[3] as f32 / EQUITY_P1 as f32;
+            let idx = packed_index(i, j, n_positions);
+            let loss = 1.0 - win;
+            let eq_center = eqs[2] as f32 / EQUITY_P1 as f32; // centered
+            let eq_owner = eqs[1] as f32 / EQUITY_P1 as f32; // owner
+            let eq_opp = eqs[3] as f32 / EQUITY_P1 as f32; // opponent
+
+            let mut store = |slot: usize, bytes: [u8; 3]| {
+                arr[(idx, slot, 0)] = bytes[0];
+                arr[(idx, slot, 1)] = bytes[1];
+                arr[(idx, slot, 2)] = bytes[2];
+            };
+
+            store(0, encode_prob(win));
+            store(1, encode_prob(0.0)); // gammon win placeholder
+            store(2, encode_prob(loss));
+            store(3, encode_prob(0.0)); // gammon loss placeholder
+            store(4, encode_equity(eq_center));
+            store(5, encode_equity(eq_owner));
+            store(6, encode_equity(eq_opp));
         }
     }
 
@@ -491,21 +520,18 @@ fn generate_packed_bearoff(
         version: 1,
         max_checkers,
         max_points: NUM_POINTS,
-        packed: false,
+        packed: true,
         slots: 7,
-        dtype: "float32",
-        layout: "full",
+        dtype: "uint24_fixed",
+        layout: "packed_upper",
         cubeful: true,
-        entries: n_positions * n_positions,
+        entries,
         n_positions,
+        quantization: "prob:[0,1]->uint24, equity:[-1,1]->uint24",
     };
     let header_obj = serde_json::to_string(&header)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-    let py_arr = arr
-        .into_pyarray(py)
-        .reshape((n_positions * n_positions, 7))
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{e}")))?
-        .to_owned();
+    let py_arr = arr.into_pyarray(py).to_owned();
     Ok((header_obj.into_py(py), py_arr))
 }
 
