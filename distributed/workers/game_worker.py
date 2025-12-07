@@ -114,6 +114,10 @@ class GameWorker(BaseWorker):
         self._collection_state = None
         self._rng_key = jax.random.PRNGKey(int(time.time() * 1000) % (2**31))
 
+        # Timing accumulators for GPU vs CPU breakdown
+        self._gpu_time_accum = 0.0
+        self._cpu_time_accum = 0.0
+
         # Warm tree state
         self._warm_tree = None
         self._warm_tree_version = 0
@@ -400,6 +404,8 @@ class GameWorker(BaseWorker):
         # Step all environments
         step_keys = jax.random.split(key, self.batch_size)
 
+        # Time the GPU step (non-blocking - measures dispatch time, not actual GPU time)
+        gpu_start = time.perf_counter()
         eval_outputs, new_env_states, new_metadatas, terminateds, truncateds, rewards_batch = self._jitted_batched_step(
             env_states,
             metadatas,
@@ -407,6 +413,9 @@ class GameWorker(BaseWorker):
             self._nn_params,
             step_keys
         )
+        self._gpu_time_accum += time.perf_counter() - gpu_start
+
+        cpu_start = time.perf_counter()
 
         # Process experiences and handle episode completion
         completed_episodes = 0
@@ -457,6 +466,9 @@ class GameWorker(BaseWorker):
         self._collection_state['env_states'] = new_env_states
         self._collection_state['metadatas'] = new_metadatas
         self._collection_state['eval_states'] = eval_outputs.eval_state
+
+        # Track CPU time
+        self._cpu_time_accum += time.perf_counter() - cpu_start
 
         return completed_episodes
 
@@ -577,6 +589,7 @@ class GameWorker(BaseWorker):
         total_steps = 0
         start_time = time.time()
         last_model_check = start_time
+        last_pause_log = 0
 
         while self.running:
             if num_iterations >= 0 and iteration >= num_iterations:
@@ -584,6 +597,9 @@ class GameWorker(BaseWorker):
 
             # Check if collection is paused (during training epochs)
             if self.state.is_collection_paused():
+                if time.time() - last_pause_log > 10:
+                    print(f"Worker {self.worker_id}: Collection paused, waiting for training...")
+                    last_pause_log = time.time()
                 time.sleep(0.5)  # Wait while paused
                 continue
 
@@ -640,12 +656,26 @@ class GameWorker(BaseWorker):
                     pass
 
                 temp_str = f", temp={self._current_temperature:.2f}" if self._use_temperature_schedule else ""
+
+                # Calculate GPU/CPU time breakdown
+                total_tracked = self._gpu_time_accum + self._cpu_time_accum
+                if total_tracked > 0:
+                    gpu_pct = (self._gpu_time_accum / total_tracked) * 100
+                    cpu_pct = (self._cpu_time_accum / total_tracked) * 100
+                    timing_str = f", GPU={gpu_pct:.0f}%/CPU={cpu_pct:.0f}%"
+                else:
+                    timing_str = ""
+
                 print(
                     f"Worker {self.worker_id}: "
                     f"iter={iteration}, games={total_games}, "
                     f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}, "
-                    f"model_v{self.current_model_version}{temp_str}"
+                    f"model_v{self.current_model_version}{temp_str}{timing_str}"
                 )
+
+                # Reset timing accumulators for next reporting period
+                self._gpu_time_accum = 0.0
+                self._cpu_time_accum = 0.0
 
         # Mark worker as stopped
         metrics.worker_status.labels(
