@@ -270,8 +270,16 @@ class GameWorker(BaseWorker):
 
         if self._warm_tree is not None:
             # Replicate warm tree across batch dimension
-            eval_states = self._replicate_warm_tree(self._warm_tree)
-            print(f"Worker {self.worker_id}: Using warm tree for game initialization")
+            try:
+                eval_states = self._replicate_warm_tree(self._warm_tree)
+                print(f"Worker {self.worker_id}: Using warm tree for game initialization")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Warm tree replication failed ({e}), using empty trees")
+                self._warm_tree = None  # Disable warm tree for this worker
+                eval_states = self._evaluator.init_batched(
+                    self.batch_size,
+                    template_embedding=template_state
+                )
         else:
             # Create empty trees
             eval_states = self._evaluator.init_batched(

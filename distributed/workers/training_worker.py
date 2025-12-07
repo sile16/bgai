@@ -1343,6 +1343,10 @@ class TrainingWorker(BaseWorker):
         self._setup_neural_network()
         self._initialize_train_state()
 
+        # Ensure collection is not paused from a previous crash
+        self.state.set_collection_paused(False)
+        print(f"Worker {self.worker_id}: Cleared collection pause state")
+
         # Set up MLflow tracking
         self._setup_mlflow()
 
@@ -1469,10 +1473,14 @@ class TrainingWorker(BaseWorker):
                 f"{new_games} new games -> {target_steps} training steps"
             )
 
+            # Pause game collection for exclusive GPU access during training
+            self.state.set_collection_paused(True)
+            print(f"Worker {self.worker_id}: Paused game collection for training")
+
             # Set training phase
             set_phase(WorkerPhase.TRAINING)
 
-            # Run training epoch (game collection continues in parallel)
+            # Run training epoch (game collection is paused)
             batch_metrics = self._run_training_batch(target_steps)
 
             # Push updated weights to Redis
@@ -1480,6 +1488,10 @@ class TrainingWorker(BaseWorker):
 
             # Back to idle after training completes
             set_phase(WorkerPhase.IDLE)
+
+            # Resume game collection
+            self.state.set_collection_paused(False)
+            print(f"Worker {self.worker_id}: Resumed game collection")
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games

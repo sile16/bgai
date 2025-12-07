@@ -21,17 +21,17 @@ game:
   simple_doubles: False # simple doubles only plays doubles to limit randomness
 
 mcts:
-  collect_simulations: 100     # MCTS iterations per move (GLOBAL)    changed to collect specifically
+  collect_simulations: 200     # MCTS iterations per move (GLOBAL)    changed to collect specifically
   eval_simulations: 50         # added specifically for eval ,
-  max_nodes: 400               # Maximum tree size (GLOBAL)
-  warm_tree_simulations: 400   # MCTS sims for warm tree (0 = disabled)
+  max_nodes: 2000               # Maximum tree size (GLOBAL)
+  warm_tree_simulations: 500   # MCTS sims for warm tree (0 = disabled)
   persist_tree: true           # Keep tree between moves
   temperature_start: 0.8       # Initial exploration
-  temperature_end: 0.2         
+  temperature_end: 0.2         # End temperature.        
   temperature_epochs:  50      # The number of epochs it takes to go from start to end, then we just stay at ending temp 
 
 training:
-  batch_size: 256                  # Samples per training step, 
+  batch_size: 1024                 # Samples per training step, 
   learning_rate: 0.0003            # Adam learning rate
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
@@ -40,7 +40,7 @@ training:
   lookup_enabled: False            # disables the lookup positions.
   lookup_learning_weight: 1.5      # this is for future if we have specific anchor positions with value AND policy
   l2_reg_lambda: 0.0001            # L2 regularization
-  games_per_epoch: 5               # New games before training step (lower = more frequent training) 
+  games_per_epoch: 200               # New games before training step (lower = more frequent training) 
   surprise_weight: 0.5             # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_epoch_interval: 5     # number of epochs berfore we write checkpoint to disk
   max_checkpoints: 5
@@ -107,18 +107,21 @@ network:
 device_configs:
   cuda:
     # NVIDIA GPUs (RTX 4090, etc.)
-    game_batch_size: 256
-    game_gpu_memory_fraction: 0.5
-    train_batch_size: 256
-    train_gpu_memory_fraction: 0.3
+    # With mutually exclusive training/collection, each gets full GPU compute
+    # Memory is split 45%/45% but compute alternates for 100% utilization
+    # batch_size=128 with max_nodes=2000 fits in 11GB with ~62% GPU util
+    game_batch_size: 128
+    game_gpu_memory_fraction: 0.45
+    train_batch_size: 512
+    train_gpu_memory_fraction: 0.45
     eval_batch_size: 32
     eval_gpu_memory_fraction: 0.1
 
   metal:
     # Apple Silicon (M1, M2, M3)
-    game_batch_size: 16
+    game_batch_size: 24
     train_batch_size: 128
-    eval_batch_size: 8
+    eval_batch_size: 16
 
   tpu:
     # Google Cloud TPUs
@@ -128,9 +131,9 @@ device_configs:
 
   cpu:
     # CPU-only fallback
-    game_batch_size: 4
+    game_batch_size: 24
     train_batch_size: 64
-    eval_batch_size: 4
+    eval_batch_size: 8
 
 # =============================================================================
 # PATHS
