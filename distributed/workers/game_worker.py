@@ -383,14 +383,12 @@ class GameWorker(BaseWorker):
 
         self._jitted_batched_step = jax.jit(jax.vmap(batched_step, in_axes=(0, 0, 0, None, 0)))
 
-    def _collect_step(self) -> int:
-        """Run one step of game collection across all batch environments.
+    def _start_gpu_step(self, key):
+        """Start GPU computation for one step (non-blocking).
 
-        Returns:
-            Number of completed episodes in this step.
+        Returns the GPU results and the input state needed for CPU processing.
+        The results are JAX arrays that haven't been materialized yet.
         """
-        key, self._rng_key = jax.random.split(self._rng_key)
-
         state = self._collection_state
         env_states = state['env_states']
         metadatas = state['metadatas']
@@ -404,7 +402,7 @@ class GameWorker(BaseWorker):
         # Step all environments
         step_keys = jax.random.split(key, self.batch_size)
 
-        # Time the GPU step (non-blocking - measures dispatch time, not actual GPU time)
+        # Time the GPU step dispatch (non-blocking)
         gpu_start = time.perf_counter()
         eval_outputs, new_env_states, new_metadatas, terminateds, truncateds, rewards_batch = self._jitted_batched_step(
             env_states,
@@ -415,7 +413,23 @@ class GameWorker(BaseWorker):
         )
         self._gpu_time_accum += time.perf_counter() - gpu_start
 
+        # Return all state needed for CPU processing
+        return {
+            'gpu_results': (eval_outputs, new_env_states, new_metadatas, terminateds, truncateds, rewards_batch),
+            'input_state': (env_states, metadatas, eval_states),
+        }
+
+    def _process_step_results(self, step_data) -> int:
+        """Process GPU results on CPU (blocking - materializes JAX arrays).
+
+        Returns:
+            Number of completed episodes in this step.
+        """
         cpu_start = time.perf_counter()
+
+        eval_outputs, new_env_states, new_metadatas, terminateds, truncateds, rewards_batch = step_data['gpu_results']
+        env_states, metadatas, eval_states = step_data['input_state']
+        state = self._collection_state
 
         # Process experiences and handle episode completion
         completed_episodes = 0
@@ -463,6 +477,7 @@ class GameWorker(BaseWorker):
                 state['episode_ids'][i] = None
                 state['episode_steps'][i] = 0  # Reset step counter for new episode
 
+        # Update state with new values from GPU
         self._collection_state['env_states'] = new_env_states
         self._collection_state['metadatas'] = new_metadatas
         self._collection_state['eval_states'] = eval_outputs.eval_state
@@ -471,6 +486,18 @@ class GameWorker(BaseWorker):
         self._cpu_time_accum += time.perf_counter() - cpu_start
 
         return completed_episodes
+
+    def _collect_step(self) -> int:
+        """Run one step of game collection across all batch environments.
+
+        This is the original synchronous version, kept for compatibility.
+
+        Returns:
+            Number of completed episodes in this step.
+        """
+        key, self._rng_key = jax.random.split(self._rng_key)
+        step_data = self._start_gpu_step(key)
+        return self._process_step_results(step_data)
 
     def _send_episode_to_buffer(
         self,
@@ -623,7 +650,7 @@ class GameWorker(BaseWorker):
             metrics.steps_total.labels(worker_id=self.worker_id).inc(self.batch_size)
 
             # Log progress periodically
-            if iteration % 100 == 0:
+            if iteration % 10 == 0:
                 elapsed = time.time() - start_time
                 steps_per_sec = total_steps / max(elapsed, 0.001)
                 games_per_min = (total_games / max(elapsed, 0.001)) * 60
