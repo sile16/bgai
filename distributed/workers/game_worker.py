@@ -117,6 +117,11 @@ class GameWorker(BaseWorker):
         # Timing accumulators for GPU vs CPU breakdown
         self._gpu_time_accum = 0.0
         self._cpu_time_accum = 0.0
+        # Detailed CPU timing breakdown
+        self._cpu_loop_time = 0.0
+        self._cpu_exp_build_time = 0.0
+        self._cpu_value_pred_time = 0.0
+        self._cpu_send_episode_time = 0.0
 
         # Warm tree state
         self._warm_tree = None
@@ -434,10 +439,12 @@ class GameWorker(BaseWorker):
         # Process experiences and handle episode completion
         completed_episodes = 0
 
+        loop_start = time.perf_counter()
         for i in range(self.batch_size):
             is_stochastic = env_states._is_stochastic[i] if hasattr(env_states, '_is_stochastic') else False
 
             if not is_stochastic:
+                exp_start = time.perf_counter()
                 exp = {
                     'observation_nn': self._state_to_nn_input_fn(
                         jax.tree.map(lambda x: x[i], env_states)
@@ -448,7 +455,9 @@ class GameWorker(BaseWorker):
                 }
                 state['episode_experiences'][i].append(exp)
                 state['episode_steps'][i] += 1  # Track episode progress for temperature
+                self._cpu_exp_build_time += time.perf_counter() - exp_start
 
+                value_start = time.perf_counter()
                 eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
                 value_pred = float(self._evaluator.get_value(eval_state_i))
                 cur_player = int(metadatas.cur_player_id[i])
@@ -458,17 +467,20 @@ class GameWorker(BaseWorker):
                 # For player 1: use 1 - value (opponent's win prob = our loss prob)
                 value_pred_p0 = value_pred if cur_player == 0 else 1.0 - value_pred
                 state['episode_value_preds'][i].append(value_pred_p0)
+                self._cpu_value_pred_time += time.perf_counter() - value_start
 
             terminated = terminateds[i]
             truncated = truncateds[i]
 
             if terminated or truncated:
                 if terminated and len(state['episode_experiences'][i]) > 0:
+                    send_start = time.perf_counter()
                     self._send_episode_to_buffer(
                         state['episode_experiences'][i],
                         rewards_batch[i],
                         state['episode_value_preds'][i],
                     )
+                    self._cpu_send_episode_time += time.perf_counter() - send_start
                     completed_episodes += 1
                     self.stats.games_generated += 1
 
@@ -476,6 +488,8 @@ class GameWorker(BaseWorker):
                 state['episode_value_preds'][i] = []
                 state['episode_ids'][i] = None
                 state['episode_steps'][i] = 0  # Reset step counter for new episode
+
+        self._cpu_loop_time += time.perf_counter() - loop_start
 
         # Update state with new values from GPU
         self._collection_state['env_states'] = new_env_states
@@ -690,19 +704,33 @@ class GameWorker(BaseWorker):
                     gpu_pct = (self._gpu_time_accum / total_tracked) * 100
                     cpu_pct = (self._cpu_time_accum / total_tracked) * 100
                     timing_str = f", GPU={gpu_pct:.0f}%/CPU={cpu_pct:.0f}%"
+
+                    # Detailed CPU breakdown (as % of CPU time)
+                    if self._cpu_time_accum > 0:
+                        exp_pct = (self._cpu_exp_build_time / self._cpu_time_accum) * 100
+                        val_pct = (self._cpu_value_pred_time / self._cpu_time_accum) * 100
+                        send_pct = (self._cpu_send_episode_time / self._cpu_time_accum) * 100
+                        cpu_detail = f" [exp={exp_pct:.0f}%/val={val_pct:.0f}%/send={send_pct:.0f}%]"
+                    else:
+                        cpu_detail = ""
                 else:
                     timing_str = ""
+                    cpu_detail = ""
 
                 print(
                     f"Worker {self.worker_id}: "
                     f"iter={iteration}, games={total_games}, "
                     f"steps/s={steps_per_sec:.1f}, games/min={games_per_min:.1f}, "
-                    f"model_v{self.current_model_version}{temp_str}{timing_str}"
+                    f"model_v{self.current_model_version}{temp_str}{timing_str}{cpu_detail}"
                 )
 
                 # Reset timing accumulators for next reporting period
                 self._gpu_time_accum = 0.0
                 self._cpu_time_accum = 0.0
+                self._cpu_loop_time = 0.0
+                self._cpu_exp_build_time = 0.0
+                self._cpu_value_pred_time = 0.0
+                self._cpu_send_episode_time = 0.0
 
         # Mark worker as stopped
         metrics.worker_status.labels(
