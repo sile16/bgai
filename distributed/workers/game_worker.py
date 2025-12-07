@@ -439,35 +439,54 @@ class GameWorker(BaseWorker):
         # Process experiences and handle episode completion
         completed_episodes = 0
 
+        # OPTIMIZATION: Batch extract all data from GPU in one go instead of 128 individual extractions
+        # This reduces GPU->CPU transfers from 256 tree_map calls to a few batched array operations
+        exp_start = time.perf_counter()
+
+        # Extract all observations at once (batched) - state_to_nn_input just returns state.observation
+        all_observations = env_states.observation  # Shape: (batch_size, obs_dim)
+
+        # Extract stochastic flags for filtering
+        is_stochastic_batch = env_states._is_stochastic if hasattr(env_states, '_is_stochastic') else jnp.zeros(self.batch_size, dtype=bool)
+
+        # Extract all policy data at once (these are already batched from eval_outputs)
+        all_policy_weights = eval_outputs.policy_weights  # Shape: (batch_size, num_actions)
+        all_action_masks = metadatas.action_mask  # Shape: (batch_size, num_actions)
+        all_cur_player_ids = metadatas.cur_player_id  # Shape: (batch_size,)
+
+        self._cpu_exp_build_time += time.perf_counter() - exp_start
+
+        # OPTIMIZATION: Extract all value predictions at once using direct batched array access
+        # Instead of 128x jax.tree.map + get_value calls, we access the q-values directly
+        # eval_states.data.q has shape (batch_size, max_nodes), root is at index 0
+        value_start = time.perf_counter()
+        ROOT_INDEX = 0  # MCTSTree.ROOT_INDEX is always 0
+        all_value_preds = eval_states.data.q[:, ROOT_INDEX]  # Shape: (batch_size,)
+        self._cpu_value_pred_time += time.perf_counter() - value_start
+
+        # Now iterate through environments - all data is already on CPU
         loop_start = time.perf_counter()
         for i in range(self.batch_size):
-            is_stochastic = env_states._is_stochastic[i] if hasattr(env_states, '_is_stochastic') else False
+            is_stochastic = bool(is_stochastic_batch[i])
 
             if not is_stochastic:
-                exp_start = time.perf_counter()
                 exp = {
-                    'observation_nn': self._state_to_nn_input_fn(
-                        jax.tree.map(lambda x: x[i], env_states)
-                    ),
-                    'policy_weights': eval_outputs.policy_weights[i],
-                    'policy_mask': metadatas.action_mask[i],
-                    'cur_player_id': metadatas.cur_player_id[i],
+                    'observation_nn': all_observations[i],
+                    'policy_weights': all_policy_weights[i],
+                    'policy_mask': all_action_masks[i],
+                    'cur_player_id': all_cur_player_ids[i],
                 }
                 state['episode_experiences'][i].append(exp)
                 state['episode_steps'][i] += 1  # Track episode progress for temperature
-                self._cpu_exp_build_time += time.perf_counter() - exp_start
 
-                value_start = time.perf_counter()
-                eval_state_i = jax.tree.map(lambda x: x[i], eval_states)
-                value_pred = float(self._evaluator.get_value(eval_state_i))
-                cur_player = int(metadatas.cur_player_id[i])
+                value_pred = float(all_value_preds[i])
+                cur_player = int(all_cur_player_ids[i])
                 # get_value returns equity in [0, 1] from current player's perspective
                 # Convert to player 0's perspective for consistent surprise scoring
                 # For player 0: use value directly (P(p0 wins))
                 # For player 1: use 1 - value (opponent's win prob = our loss prob)
                 value_pred_p0 = value_pred if cur_player == 0 else 1.0 - value_pred
                 state['episode_value_preds'][i].append(value_pred_p0)
-                self._cpu_value_pred_time += time.perf_counter() - value_start
 
             terminated = terminateds[i]
             truncated = truncateds[i]
