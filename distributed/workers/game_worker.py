@@ -6,6 +6,8 @@ generating training experiences and sending them to the Redis replay buffer.
 No Ray dependency - uses Redis for all coordination.
 """
 
+import queue
+import threading
 import time
 from functools import partial
 from typing import Dict, Any, Optional
@@ -126,6 +128,72 @@ class GameWorker(BaseWorker):
         # Warm tree state
         self._warm_tree = None
         self._warm_tree_version = 0
+
+        # Async Redis sender - queue completed episodes for background sending
+        # This allows GPU to continue with next batch while Redis I/O happens in parallel
+        self._send_queue = queue.Queue(maxsize=200)  # Buffer up to 200 episodes
+        self._send_thread = None  # Started lazily in _run_loop
+        self._send_thread_running = False
+        self._episodes_queued = 0
+        self._episodes_sent = 0
+
+    def _start_async_sender(self):
+        """Start the background thread for async Redis sending."""
+        if self._send_thread is not None:
+            return  # Already started
+        self._send_thread_running = True
+        self._send_thread = threading.Thread(
+            target=self._async_send_worker,
+            name=f"redis-sender-{self.worker_id}",
+            daemon=True,
+        )
+        self._send_thread.start()
+
+    def _stop_async_sender(self):
+        """Stop the background sender thread and flush remaining episodes."""
+        if self._send_thread is None:
+            return
+        self._send_thread_running = False
+        # Signal thread to stop by putting None
+        try:
+            self._send_queue.put(None, timeout=1.0)
+        except queue.Full:
+            pass
+        # Wait for thread to finish (with timeout)
+        self._send_thread.join(timeout=5.0)
+        if self._send_thread.is_alive():
+            print(f"Worker {self.worker_id}: Warning - async sender thread did not stop cleanly")
+
+    def _async_send_worker(self):
+        """Background thread that sends episodes to Redis.
+
+        Runs continuously, pulling episodes from the queue and sending them
+        to Redis. This allows the main collection loop to continue without
+        blocking on Redis I/O.
+        """
+        while self._send_thread_running or not self._send_queue.empty():
+            try:
+                episode_data = self._send_queue.get(timeout=1.0)
+                if episode_data is None:  # Shutdown signal
+                    break
+                # Send to Redis
+                self.buffer.add_episode(**episode_data)
+                self._episodes_sent += 1
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Async send error: {e}")
+        # Drain any remaining items on shutdown
+        while not self._send_queue.empty():
+            try:
+                episode_data = self._send_queue.get_nowait()
+                if episode_data is not None:
+                    self.buffer.add_episode(**episode_data)
+                    self._episodes_sent += 1
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Async send drain error: {e}")
 
     @property
     def worker_type(self) -> str:
@@ -538,7 +606,11 @@ class GameWorker(BaseWorker):
         final_rewards: jnp.ndarray,
         value_predictions: list,
     ) -> None:
-        """Send a completed episode to the Redis buffer."""
+        """Queue a completed episode for async sending to the Redis buffer.
+
+        Serializes the episode data and queues it for the background sender thread.
+        This allows the main collection loop to continue without blocking on Redis I/O.
+        """
         serialized_exps = []
         for exp in experiences:
             exp_bytes = serialize_experience(exp)
@@ -561,20 +633,31 @@ class GameWorker(BaseWorker):
         metrics = get_metrics()
         metrics.surprise_score.labels(worker_id=self.worker_id).observe(surprise_score)
 
+        # Queue for async sending instead of blocking
+        episode_data = {
+            'experiences': serialized_exps,
+            'final_rewards': rewards_bytes,
+            'model_version': self.current_model_version,
+            'metadata': {
+                'worker_id': self.worker_id,
+                'episode_length': len(experiences),
+                'mean_value_pred': float(sum(value_predictions) / len(value_predictions)) if value_predictions else 0.0,
+            },
+            'surprise_score': surprise_score,
+        }
+
         try:
-            self.buffer.add_episode(
-                experiences=serialized_exps,
-                final_rewards=rewards_bytes,
-                model_version=self.current_model_version,
-                metadata={
-                    'worker_id': self.worker_id,
-                    'episode_length': len(experiences),
-                    'mean_value_pred': float(sum(value_predictions) / len(value_predictions)) if value_predictions else 0.0,
-                },
-                surprise_score=surprise_score,
-            )
-        except Exception as e:
-            print(f"Worker {self.worker_id}: Error sending episode to buffer: {e}")
+            # Use put with timeout to avoid blocking indefinitely if queue is full
+            self._send_queue.put(episode_data, timeout=5.0)
+            self._episodes_queued += 1
+        except queue.Full:
+            # Queue is full - this shouldn't happen often with 200 slot buffer
+            # Fall back to synchronous send to avoid data loss
+            print(f"Worker {self.worker_id}: Send queue full, falling back to sync send")
+            try:
+                self.buffer.add_episode(**episode_data)
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Error sending episode to buffer: {e}")
 
     def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:
         """Main worker loop.
@@ -637,12 +720,27 @@ class GameWorker(BaseWorker):
             worker_id=self.worker_id, worker_type='game'
         ).set(1)
 
+        # Set configuration metrics (for correlating with memory usage)
+        metrics.worker_batch_size.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(self.batch_size)
+        metrics.worker_num_simulations.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(self.num_simulations)
+        metrics.worker_max_nodes.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(self.max_nodes)
+
         # Game worker is always in collecting phase when running
         metrics.worker_phase.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(WorkerPhase.COLLECTING)
 
         print(f"Worker {self.worker_id}: Starting game collection loop...")
+
+        # Start async Redis sender thread
+        self._start_async_sender()
+        print(f"Worker {self.worker_id}: Async Redis sender started")
 
         iteration = 0
         total_games = 0
@@ -755,6 +853,11 @@ class GameWorker(BaseWorker):
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(0)
+
+        # Stop async sender and flush remaining episodes
+        print(f"Worker {self.worker_id}: Stopping async sender (queued={self._episodes_queued}, sent={self._episodes_sent})...")
+        self._stop_async_sender()
+        print(f"Worker {self.worker_id}: Async sender stopped (final sent={self._episodes_sent})")
 
         # Cleanup
         self.buffer.close()
