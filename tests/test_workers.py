@@ -86,7 +86,7 @@ def training_config():
         'train_batch_size': 32,
         'learning_rate': 3e-4,
         'min_buffer_size': 10,
-        'games_per_training_batch': 5,
+        'games_per_epoch': 5,
         'steps_per_game': 2,
         'metrics_port': 9200,
     }
@@ -280,7 +280,7 @@ class TestTrainingWorkerBasics:
 
                 assert worker.train_batch_size >= 1
                 assert worker.learning_rate > 0
-                assert worker.games_per_training_batch >= 1
+                assert worker.games_per_epoch >= 1
 
     def test_training_worker_custom_config(self):
         """Test TrainingWorker accepts custom configuration."""
@@ -295,13 +295,13 @@ class TestTrainingWorkerBasics:
                     'redis_port': 6379,
                     'train_batch_size': 256,
                     'learning_rate': 1e-4,
-                    'games_per_training_batch': 20,
+                    'games_per_epoch': 20,
                     'steps_per_game': 5,
                 })
 
                 assert worker.train_batch_size == 256
                 assert worker.learning_rate == 1e-4
-                assert worker.games_per_training_batch == 20
+                assert worker.games_per_epoch == 20
                 assert worker.steps_per_game == 5
 
 

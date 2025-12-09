@@ -273,11 +273,7 @@ class TrainingWorker(BaseWorker):
 
         # Collection-gated training configuration
         # Training triggers after this many new games collected (epoch = games_per_epoch games)
-        # games_per_epoch (new) with fallback to games_per_training_batch (old)
-        self.games_per_epoch = self.config.get(
-            'games_per_epoch',
-            self.config.get('games_per_training_batch', 10)
-        )
+        self.games_per_epoch = self.config.get('games_per_epoch', 10)
         # Number of training steps to run per collected game
         # Default high to train on most experiences (avg game ~60 moves / batch_size)
         # Set to 0 to auto-calculate based on buffer size
@@ -1707,7 +1703,7 @@ class TrainingWorker(BaseWorker):
             'buffer_size': buffer_size,
             'total_games': current_games,
             # Collection-gated training stats
-            'games_per_training_batch': self.games_per_epoch,
+            'games_per_epoch': self.games_per_epoch,
             'steps_per_game': self.steps_per_game,
             'total_training_batches': self._training_stats.total_batches_trained,
             'games_at_last_train': self._training_stats.games_at_last_train,
