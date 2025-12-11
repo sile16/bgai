@@ -15,7 +15,7 @@ redis
 msgpack-numpy
 mlflow
 psutil
-pynvml; sys_platform == "linux"  # GPU monitoring (NVIDIA)
+nvidia-ml-py; sys_platform == "linux"  # GPU monitoring (NVIDIA)
 
 # Utilities
 numpy
