@@ -466,6 +466,31 @@ class BGAIMetrics:
         )
 
         # =================================================================
+        # Worker Configuration Metrics (batch size, simulations, etc.)
+        # Helps correlate memory/GPU usage with configuration
+        # =================================================================
+        self.worker_batch_size = Gauge(
+            'bgai_worker_batch_size',
+            'Batch size configured for this worker',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_num_simulations = Gauge(
+            'bgai_worker_num_simulations',
+            'Number of MCTS simulations per move',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_max_nodes = Gauge(
+            'bgai_worker_max_nodes',
+            'Maximum MCTS tree nodes',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        # =================================================================
         # JAX Memory Metrics (per-worker, requires cuda_async allocator)
         # These track actual JAX memory usage, not just GPU allocation
         # =================================================================

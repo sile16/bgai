@@ -30,10 +30,12 @@ from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
 from bgai.endgame.packed_table import BearoffLookup, pack_upper, solve_size_to_n
-from core.training.loss_fns import az_default_loss_fn
-from core.evaluators.mcts.equity import terminal_value_probs_from_reward, probs_to_equity
+from core.training.loss_fns import az_default_loss_fn, four_way_value_loss, reward_to_value_targets
+from core.evaluators.mcts.equity import value_outputs_to_equity
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
+# 4-way value functions (reward_to_value_targets, four_way_value_loss, value_outputs_to_equity)
+# are imported from TurboZero core.training.loss_fns and core.evaluators.mcts.equity
 
 
 def weighted_az_loss_fn(
@@ -43,11 +45,11 @@ def weighted_az_loss_fn(
     sample_weights: jnp.ndarray,
     l2_reg_lambda: float = 0.0001,
 ) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
-    """AlphaZero loss function with per-sample weighting and 6-way value head.
+    """AlphaZero loss function with per-sample weighting and 4-way conditional value head.
 
     This allows us to weight bearoff samples more heavily since they have
-    known-perfect target values. Value loss is cross-entropy over 6 outcomes:
-    [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+    known-perfect target values. Value head outputs 4 independent sigmoids:
+    [win, gam_win_cond, gam_loss_cond, bg_rate]
 
     Args:
         params: Neural network parameters
@@ -64,7 +66,7 @@ def weighted_az_loss_fn(
         if hasattr(train_state, 'batch_stats') else {'params': params}
     mutables = ['batch_stats'] if hasattr(train_state, 'batch_stats') else []
 
-    # Get predictions - value head now outputs 6-way logits
+    # Get predictions - value head outputs 4-way logits (sigmoid, not softmax)
     (pred_policy_logits, pred_value_logits), updates = train_state.apply_fn(
         variables,
         x=experience.observation_nn,
@@ -88,13 +90,16 @@ def weighted_az_loss_fn(
     batch_indices = jnp.arange(experience.reward.shape[0])
     target_reward = experience.reward[batch_indices, current_player]
 
-    # Convert scalar reward to 6-way target probability distribution
-    target_value_probs = terminal_value_probs_from_reward(target_reward)
+    # Convert scalar reward to 4-way targets with masks
+    targets, masks = reward_to_value_targets(target_reward)
 
-    # Compute per-sample value loss (cross-entropy over 6 outcomes)
-    pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
-    value_loss_per_sample = -(target_value_probs * pred_value_log_probs).sum(axis=-1)
-    # Apply weights and average
+    # Compute value loss with per-sample weighting
+    # First compute per-sample BCE with masking
+    bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
+    masked_bce = bce * masks  # (batch, 4)
+    value_loss_per_sample = masked_bce.sum(axis=-1) / jnp.maximum(masks.sum(axis=-1), 1.0)
+
+    # Apply sample weights and average
     value_loss = jnp.sum(value_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
 
     # Compute L2 regularization (not weighted by samples)
@@ -112,32 +117,31 @@ def weighted_az_loss_fn(
     target_top1 = jnp.argmax(experience.policy_weights, axis=-1)
     policy_accuracy = jnp.mean(pred_top1 == target_top1)
 
-    # Value accuracy: top-1 match between predicted and target outcome
-    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
-    value_top1 = jnp.argmax(pred_value_probs, axis=-1)
-    target_value_top1 = jnp.argmax(target_value_probs, axis=-1)
-    value_accuracy = jnp.mean(value_top1 == target_value_top1)
+    # Value accuracy: did we predict win correctly?
+    pred_value_probs = jax.nn.sigmoid(pred_value_logits)
+    pred_win = pred_value_probs[:, 0] > 0.5
+    target_win = targets[:, 0] > 0.5
+    value_accuracy = jnp.mean(pred_win == target_win)
 
-    # Per-outcome value losses for monitoring (6-way breakdown)
-    # Compute per-outcome cross-entropy contribution: -target_prob * log(pred_prob)
-    # This shows which outcomes are hardest to predict
-    per_outcome_ce = -target_value_probs * pred_value_log_probs  # (batch, 6)
-    mean_per_outcome_ce = per_outcome_ce.mean(axis=0)  # (6,)
+    # Per-output value losses for monitoring
+    # Compute per-output BCE (unweighted by sample weights, but masked)
+    mean_per_output_bce = (masked_bce.sum(axis=0)) / jnp.maximum(masks.sum(axis=0), 1.0)
 
-    # Outcome names: win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss
-    value_loss_win = mean_per_outcome_ce[0]
-    value_loss_gammon_win = mean_per_outcome_ce[1]
-    value_loss_backgammon_win = mean_per_outcome_ce[2]
-    value_loss_loss = mean_per_outcome_ce[3]
-    value_loss_gammon_loss = mean_per_outcome_ce[4]
-    value_loss_backgammon_loss = mean_per_outcome_ce[5]
+    # Output names: win, gam_win_cond, gam_loss_cond, bg_rate
+    value_loss_win = mean_per_output_bce[0]
+    value_loss_gam_win_cond = mean_per_output_bce[1]
+    value_loss_gam_loss_cond = mean_per_output_bce[2]
+    value_loss_bg_rate = mean_per_output_bce[3]
 
-    # Predicted outcome distribution (mean over batch)
-    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
-    mean_pred_probs = pred_value_probs.mean(axis=0)  # (6,)
+    # Predicted output distribution (mean over batch)
+    mean_pred_probs = pred_value_probs.mean(axis=0)  # (4,)
 
-    # Target outcome distribution (mean over batch)
-    mean_target_probs = target_value_probs.mean(axis=0)  # (6,)
+    # Target distribution (mean over batch)
+    mean_target_probs = targets.mean(axis=0)  # (4,)
+
+    # Compute equity from predictions for monitoring
+    pred_equity = value_outputs_to_equity(pred_value_probs)
+    mean_pred_equity = pred_equity.mean()
 
     aux_metrics = {
         'policy_loss': policy_loss,
@@ -145,27 +149,23 @@ def weighted_az_loss_fn(
         'l2_reg': l2_reg,
         'policy_accuracy': policy_accuracy,
         'value_accuracy': value_accuracy,
-        # Per-outcome value losses
+        # Per-output value losses (4-way)
         'value_loss_win': value_loss_win,
-        'value_loss_gammon_win': value_loss_gammon_win,
-        'value_loss_backgammon_win': value_loss_backgammon_win,
-        'value_loss_loss': value_loss_loss,
-        'value_loss_gammon_loss': value_loss_gammon_loss,
-        'value_loss_backgammon_loss': value_loss_backgammon_loss,
-        # Predicted outcome probabilities (for calibration monitoring)
+        'value_loss_gam_win_cond': value_loss_gam_win_cond,
+        'value_loss_gam_loss_cond': value_loss_gam_loss_cond,
+        'value_loss_bg_rate': value_loss_bg_rate,
+        # Predicted output probabilities (for calibration monitoring)
         'pred_prob_win': mean_pred_probs[0],
-        'pred_prob_gammon_win': mean_pred_probs[1],
-        'pred_prob_backgammon_win': mean_pred_probs[2],
-        'pred_prob_loss': mean_pred_probs[3],
-        'pred_prob_gammon_loss': mean_pred_probs[4],
-        'pred_prob_backgammon_loss': mean_pred_probs[5],
-        # Target outcome probabilities (ground truth distribution)
+        'pred_prob_gam_win_cond': mean_pred_probs[1],
+        'pred_prob_gam_loss_cond': mean_pred_probs[2],
+        'pred_prob_bg_rate': mean_pred_probs[3],
+        # Target probabilities (ground truth)
         'target_prob_win': mean_target_probs[0],
-        'target_prob_gammon_win': mean_target_probs[1],
-        'target_prob_backgammon_win': mean_target_probs[2],
-        'target_prob_loss': mean_target_probs[3],
-        'target_prob_gammon_loss': mean_target_probs[4],
-        'target_prob_backgammon_loss': mean_target_probs[5],
+        'target_prob_gam_win_cond': mean_target_probs[1],
+        'target_prob_gam_loss_cond': mean_target_probs[2],
+        'target_prob_bg_rate': mean_target_probs[3],
+        # Derived equity
+        'pred_equity': mean_pred_equity,
     }
     return loss, (aux_metrics, updates)
 
@@ -453,21 +453,28 @@ class TrainingWorker(BaseWorker):
         return self._bearoff_lookup.probs_for_player(x_idx, o_idx, cur_player)
 
     def _get_bearoff_target_probs(self, x_idx: int, o_idx: int, cur_player: int) -> np.ndarray:
-        """Get 6-way probability distribution for bearoff position.
+        """Get 4-way conditional probability targets for bearoff position.
 
         Returns:
-            [single win, gammon win, backgammon win,
-             single loss, gammon loss, backgammon loss]
+            [win, gam_win_cond, gam_loss_cond, bg_rate]
+            - win: P(win)
+            - gam_win_cond: P(gammon | win) - conditional probability
+            - gam_loss_cond: P(gammon | loss) - conditional probability
+            - bg_rate: P(backgammon | gammon) - always 0 for bearoff
         """
         probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player)
-        win, gammon_win, loss, gammon_loss = probs
+        win, gammon_win_uncond, loss, gammon_loss_uncond = probs[0], probs[1], probs[2], probs[3]
+
+        # Convert unconditional gammon probabilities to conditional
+        # gam_win_cond = P(gammon | win) = P(gammon AND win) / P(win)
+        gam_win_cond = gammon_win_uncond / max(win, 1e-8) if win > 0 else 0.0
+        gam_loss_cond = gammon_loss_uncond / max(loss, 1e-8) if loss > 0 else 0.0
+
         return np.array([
-            win - gammon_win,   # single win
-            gammon_win,         # gammon win
-            0.0,                # backgammon win (impossible in bearoff)
-            loss - gammon_loss, # single loss
-            gammon_loss,        # gammon loss
-            0.0,                # backgammon loss (impossible)
+            win,           # P(win)
+            gam_win_cond,  # P(gammon | win)
+            gam_loss_cond, # P(gammon | loss)
+            0.0,           # P(backgammon | gammon) - impossible in bearoff
         ], dtype=np.float32)
 
     def _apply_bearoff_values_to_batch(
@@ -581,7 +588,8 @@ class TrainingWorker(BaseWorker):
         valid_targets = [tp for tp in target_probs_list if tp is not None]
         if valid_targets:
             stacked = np.stack(valid_targets)
-            metrics['bearoff_avg_gammon_win'] = jnp.array(float(np.mean(stacked[:, 1])))
+            # Index 1 is gam_win_cond (conditional P(gammon | win))
+            metrics['bearoff_avg_gam_win_cond'] = jnp.array(float(np.mean(stacked[:, 1])))
 
         return modified_batch, metrics
 
@@ -724,15 +732,19 @@ class TrainingWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
-            """ResNet-style network with 6-way value head for backgammon outcomes.
+            """ResNet-style network with 4-way conditional value head for backgammon.
 
-            Value head outputs logits for 6 outcomes:
-            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            Value head outputs logits for 4 independent probabilities (sigmoid):
+            [win, gam_win_cond, gam_loss_cond, bg_rate]
+            - win: P(current player wins)
+            - gam_win_cond: P(gammon | win) - conditional probability
+            - gam_loss_cond: P(gammon | loss) - conditional probability
+            - bg_rate: P(backgammon | gammon) - combined rate
             """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
-            value_head_out_size: int = 6  # 6-way outcome distribution
+            value_head_out_size: int = 4  # 4-way conditional probabilities
 
             @nn.compact
             def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
@@ -745,7 +757,7 @@ class TrainingWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                # 6-way value head: outputs logits, converted to probs by loss fn
+                # 4-way conditional value head: outputs logits, converted to probs via sigmoid
                 value_logits = nn.Dense(self.value_head_out_size)(x)
                 return policy_logits, value_logits
 
@@ -1176,8 +1188,8 @@ class TrainingWorker(BaseWorker):
             total_count = int(bearoff_metrics['total_count'])
             metrics['bearoff_count'] = bearoff_count
             metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
-            if 'bearoff_avg_gammon_win' in bearoff_metrics:
-                metrics['bearoff_avg_gammon_win'] = float(bearoff_metrics['bearoff_avg_gammon_win'])
+            if 'bearoff_avg_gam_win_cond' in bearoff_metrics:
+                metrics['bearoff_avg_gam_win_cond'] = float(bearoff_metrics['bearoff_avg_gam_win_cond'])
 
             # Compute separate losses for bearoff vs non-bearoff positions
             is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
@@ -1195,14 +1207,18 @@ class TrainingWorker(BaseWorker):
                     jnp.finfo(jnp.float32).min
                 )
 
-                # Get target values and convert to 6-way probabilities
+                # Get target values and masks for 4-way value head
                 current_player = jax_batch.cur_player_id
                 target_reward = jax_batch.reward[jnp.arange(jax_batch.reward.shape[0]), current_player]
-                target_value_probs = terminal_value_probs_from_reward(target_reward)
+                targets, masks = jax.vmap(reward_to_value_targets)(target_reward)
 
-                # Compute per-sample value cross-entropy
-                pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
-                value_ce = -(target_value_probs * pred_value_log_probs).sum(axis=-1)
+                # Compute per-sample 4-way masked BCE value loss
+                # Numerically stable sigmoid cross-entropy per element
+                bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
+                masked_bce = bce * masks
+                # Per-sample loss = sum over 4 outputs / count of active masks
+                per_sample_mask_count = jnp.sum(masks, axis=-1)
+                value_ce = jnp.sum(masked_bce, axis=-1) / jnp.maximum(per_sample_mask_count, 1.0)
 
                 # Compute per-sample policy cross-entropy
                 policy_ce = optax.softmax_cross_entropy(pred_policy_logits, jax_batch.policy_weights)
@@ -1514,26 +1530,12 @@ class TrainingWorker(BaseWorker):
                 # 3. Bearoff-specific losses (endgame positions with known-perfect values)
                 'bearoff_value_loss': batch_metrics.get('bearoff_value_loss', 0),
                 'bearoff_policy_loss': batch_metrics.get('bearoff_policy_loss', 0),
-                # 4. Per-outcome value losses (6-way breakdown)
-                'value_loss_win': batch_metrics.get('value_loss_win', 0),
-                'value_loss_gammon_win': batch_metrics.get('value_loss_gammon_win', 0),
-                'value_loss_backgammon_win': batch_metrics.get('value_loss_backgammon_win', 0),
-                'value_loss_loss': batch_metrics.get('value_loss_loss', 0),
-                'value_loss_gammon_loss': batch_metrics.get('value_loss_gammon_loss', 0),
-                'value_loss_backgammon_loss': batch_metrics.get('value_loss_backgammon_loss', 0),
-                # 5. Predicted vs target outcome distributions (calibration)
-                'pred_prob_win': batch_metrics.get('pred_prob_win', 0),
-                'pred_prob_gammon_win': batch_metrics.get('pred_prob_gammon_win', 0),
-                'pred_prob_backgammon_win': batch_metrics.get('pred_prob_backgammon_win', 0),
-                'pred_prob_loss': batch_metrics.get('pred_prob_loss', 0),
-                'pred_prob_gammon_loss': batch_metrics.get('pred_prob_gammon_loss', 0),
-                'pred_prob_backgammon_loss': batch_metrics.get('pred_prob_backgammon_loss', 0),
-                'target_prob_win': batch_metrics.get('target_prob_win', 0),
-                'target_prob_gammon_win': batch_metrics.get('target_prob_gammon_win', 0),
-                'target_prob_backgammon_win': batch_metrics.get('target_prob_backgammon_win', 0),
-                'target_prob_loss': batch_metrics.get('target_prob_loss', 0),
-                'target_prob_gammon_loss': batch_metrics.get('target_prob_gammon_loss', 0),
-                'target_prob_backgammon_loss': batch_metrics.get('target_prob_backgammon_loss', 0),
+                # 4. Per-output value metrics (4-way conditional format)
+                'pred_win': batch_metrics.get('pred_win', 0),
+                'pred_gam_win_cond': batch_metrics.get('pred_gam_win_cond', 0),
+                'pred_gam_loss_cond': batch_metrics.get('pred_gam_loss_cond', 0),
+                'pred_bg_rate': batch_metrics.get('pred_bg_rate', 0),
+                'target_win': batch_metrics.get('target_win', 0),
                 # 6. Accuracy metrics
                 'value_accuracy': batch_metrics.get('value_accuracy', 0),
                 'policy_accuracy': batch_metrics.get('policy_accuracy', 0),
@@ -1566,18 +1568,12 @@ class TrainingWorker(BaseWorker):
                 worker_id=self.worker_id, loss_type='policy'
             ).set(batch_metrics.get('policy_loss', 0))
 
-            # Per-outcome value losses (6-way breakdown)
-            outcome_names = ['win', 'gammon_win', 'backgammon_win', 'loss', 'gammon_loss', 'backgammon_loss']
-            for outcome in outcome_names:
-                metrics.value_loss_per_outcome.labels(
-                    worker_id=self.worker_id, outcome=outcome
-                ).set(batch_metrics.get(f'value_loss_{outcome}', 0))
+            # Per-output value metrics (4-way conditional format)
+            output_names = ['win', 'gam_win_cond', 'gam_loss_cond', 'bg_rate']
+            for output_name in output_names:
                 metrics.predicted_outcome_prob.labels(
-                    worker_id=self.worker_id, outcome=outcome
-                ).set(batch_metrics.get(f'pred_prob_{outcome}', 0))
-                metrics.target_outcome_prob.labels(
-                    worker_id=self.worker_id, outcome=outcome
-                ).set(batch_metrics.get(f'target_prob_{outcome}', 0))
+                    worker_id=self.worker_id, outcome=output_name
+                ).set(batch_metrics.get(f'pred_{output_name}', 0))
 
             # Accuracy metrics
             metrics.value_accuracy.labels(

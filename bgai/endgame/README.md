@@ -1,63 +1,78 @@
 # Bearoff Tables (Rust)
 
-This package now uses the Rust generator in `rust/bearoff` (Pyo3 bindings) to
-reproduce gnubg's two‑sided cubeful bearoff equities. The legacy Python/Numpy
-generators and bundled gnubg sources have been removed.
+This package uses the Rust generator in `rust/bearoff` (Pyo3 bindings) to
+reproduce gnubg's two-sided cubeful bearoff equities.
 
-## What is generated
-- gnubg `PositionBearoff` ordering (6-point bearoff).
-- Exact gnubg cube logic (`CubeEquity` from `makebearoff.c`).
-- Full matrix `(n_positions, n_positions, 7)` as float32, where:
-  1. `win`
-  2. `gammon_win` (0.0 placeholder)
-  3. `loss`
-  4. `gammon_loss` (0.0 placeholder)
-  5. `eq_center` (centered cube equity)
-  6. `eq_owner` (equity when X owns the cube)
-  7. `eq_opponent` (equity when O owns the cube)
+## Formats
 
-Current build stores the full matrix; add upper-triangle packing if you want to
-halve generation and disk space (see `pack_upper` in `bgai.endgame.packed_table`).
+### Version 1: Packed Upper Triangle (Legacy)
+Single-perspective storage with mirroring. Has a limitation: cannot correctly
+represent both (i,j) and (j,i) perspectives when they differ.
+
+### Version 2: Tiered Dual-Perspective (Recommended)
+Stores BOTH perspectives for each upper-triangle entry:
+- **Tier 1** (no gammons): Positions where both players have borne off at least 1 checker
+- **Tier 2** (gammons possible): At least one player has all checkers on board
+
+Layout per entry:
+- Tier 1: 10 values (5 per perspective) = 30 bytes
+  `[win_ij, eq_cl_ij, eq_own_ij, eq_ctr_ij, eq_opp_ij, win_ji, ...]`
+- Tier 2: 14 values (7 per perspective) = 42 bytes
+  `[win_ij, gam_win_ij, gam_loss_ij, eq_cl_ij, eq_own_ij, eq_ctr_ij, eq_opp_ij, win_ji, ...]`
+
+All values stored as uint24 (3 bytes, little endian).
+
+## Storage Sizes (15 checkers)
+
+| Format | Disk Size | Memory (FLOAT32) | Memory (UINT16) |
+|--------|-----------|------------------|-----------------|
+| V1 (broken) | ~31 GB | N/A | N/A |
+| V2 Tiered | ~57 GB | ~77 GB | ~38 GB |
 
 ## Build Python bindings
 ```bash
 cd rust/bearoff
-maturin develop --release  # installs `bearoff` module into the active venv
+maturin develop --release
 ```
 
-## Generate a table (packed upper triangle, uint24 fixed)
-```bash
-python - <<'PY'
-import numpy as np
-from bearoff import generate_packed_bearoff
+## Generate v2 tiered table
+```python
+from bgai.endgame.packed_table import generate_and_save_tiered
 
-header_json, flat = generate_packed_bearoff(
-    max_checkers=10,   # per side, 6 points
-    tolerance=0.0,     # kept for API compatibility (unused)
-    max_iter=0,        # kept for API compatibility (unused)
+tier1, tier2, header = generate_and_save_tiered(
+    max_checkers=15,
+    output_dir="data/tiered",
 )
-header = header_json
-arr = np.array(flat, copy=False)  # shape (entries, 7, 3) uint8 (uint24 fixed)
-np.save("data/bearoff_ts6x10_cubeful.npy", arr)
-print(header)
-print("saved", arr.shape, arr.dtype)
-PY
 ```
 
-## Validation (done)
+## Load with configurable precision
+```python
+from bgai.endgame.packed_table import load_tiered_bearoff, Precision
+
+# Full precision (fastest lookup, highest memory)
+lookup = load_tiered_bearoff(tier1_path, tier2_path, header_path, Precision.FLOAT32)
+
+# Reduced precision (moderate memory, decode on lookup)
+lookup = load_tiered_bearoff(tier1_path, tier2_path, header_path, Precision.UINT16)
+
+# Raw storage (lowest memory, decode on lookup)
+lookup = load_tiered_bearoff(tier1_path, tier2_path, header_path, Precision.UINT24)
+
+# Lookup returns: (win, gammon_win, gammon_loss, eq_cubeless, eq_owner, eq_center, eq_opponent)
+result = lookup.lookup(x_idx, o_idx)
+
+# Memory usage
+print(f"Memory: {lookup.memory_usage_bytes() / 1e9:.2f} GB")
+```
+
+## Validation
 - `max_checkers=6`: matches `gnubg_ts0.bd` within 1 LSB of gnubg's uint16.
 - `max_checkers=10`: matches `gnubg_6pip10checker.bd` within quantization error.
 
-## CLI helper
-```
-# generate (writes .npy and .json header)
-python scripts/bearoff_cli.py generate --max-checkers 10 --output data/bearoff_ts6x10_packed_u24.npy
+## Legacy v1 format (for backwards compatibility)
+```python
+from bearoff import generate_packed_bearoff
 
-# show header (reads .json if present, otherwise infers basics)
-python scripts/bearoff_cli.py show-header data/bearoff_ts6x10_packed_u24.npy
+header_json, arr = generate_packed_bearoff(max_checkers=10)
+# Returns shape (entries, 7, 3) uint8
 ```
-
-## Loading in training
-Use `BearoffLookup` from `bgai.endgame.packed_table` (handles full or packed
-tables, 4- or 7-slot layout). The training worker already understands the new
-format; point `bearoff_table_path` at your generated `.npy` file.
