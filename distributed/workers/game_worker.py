@@ -265,15 +265,15 @@ class GameWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
-            """ResNet-style network with 6-way value head for backgammon outcomes.
+            """ResNet-style network with 4-way conditional value head for backgammon.
 
-            Value head outputs logits for 6 outcomes:
-            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            Value head outputs 4 independent sigmoid logits:
+            [win, gam_win_cond, gam_loss_cond, bg_rate]
             """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
-            value_head_out_size: int = 6  # 6-way outcome distribution
+            value_head_out_size: int = 4  # 4-way conditional probabilities
 
             @nn.compact
             def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
@@ -286,7 +286,7 @@ class GameWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                # 6-way value head: outputs logits, converted to probs by evaluator
+                # 4-way value head: outputs sigmoid logits
                 value_logits = nn.Dense(self.value_head_out_size)(x)
                 return policy_logits, value_logits
 

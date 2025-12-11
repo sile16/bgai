@@ -587,18 +587,38 @@ class RedisReplayBuffer:
         pass
 
     def _enforce_episode_capacity(self) -> None:
-        """Remove old episodes when episode capacity is exceeded (FIFO)."""
-        current_episodes = self.redis.llen(self.EPISODE_LIST)
+        """Remove old episodes when episode capacity is exceeded (FIFO).
 
-        if current_episodes > self.episode_capacity:
-            num_to_remove = current_episodes - self.episode_capacity
+        Uses atomic pop-if-over-capacity to prevent race conditions when
+        multiple workers call this simultaneously. Each worker pops at most
+        one episode per call, ensuring we don't over-evict.
+        """
+        # Pop ONE oldest episode only if we're over capacity.
+        # This Lua script atomically checks length and pops, preventing
+        # race conditions where multiple workers see the same length
+        # and each pop an episode, causing over-eviction.
+        lua_script = """
+        local current = redis.call('LLEN', KEYS[1])
+        if current > tonumber(ARGV[1]) then
+            return redis.call('RPOP', KEYS[1])
+        end
+        return nil
+        """
+        # Get or register the script
+        if not hasattr(self, '_evict_script'):
+            self._evict_script = self.redis.register_script(lua_script)
 
-            for _ in range(num_to_remove):
-                # Pop oldest episode from the end
-                episode_id_bytes = self.redis.rpop(self.EPISODE_LIST)
-                if episode_id_bytes:
-                    episode_id = episode_id_bytes.decode() if isinstance(episode_id_bytes, bytes) else episode_id_bytes
-                    self._delete_episode(episode_id)
+        # Keep popping until we're at or under capacity
+        # Each iteration is atomic, so concurrent workers won't over-evict
+        while True:
+            episode_id_bytes = self._evict_script(
+                keys=[self.EPISODE_LIST],
+                args=[self.episode_capacity]
+            )
+            if episode_id_bytes is None:
+                break
+            episode_id = episode_id_bytes.decode() if isinstance(episode_id_bytes, bytes) else episode_id_bytes
+            self._delete_episode(episode_id)
 
     def _delete_episode(self, episode_id: str) -> None:
         """Delete an episode and all its experiences."""

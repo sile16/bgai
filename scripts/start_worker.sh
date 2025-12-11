@@ -76,9 +76,11 @@ detect_platform() {
     elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         PLATFORM="cuda"
         DEVICE_TYPE="cuda"
-        # Set memory fraction to allow multiple workers to share GPU
-        export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
-        echo "JAX memory fraction: 0.45 (shared GPU)"
+        # Set memory fraction based on actual JAX memory usage analysis
+        # Game worker: 2.51 GB peak → 5 GB (0.21), Eval: ~1 GB → 2 GB (0.09)
+        # This will be overridden per-worker if needed
+        export XLA_PYTHON_CLIENT_MEM_FRACTION=0.21
+        echo "JAX memory fraction: 0.21 (5 GB for game worker)"
     else
         PLATFORM="cpu"
         DEVICE_TYPE="cpu"

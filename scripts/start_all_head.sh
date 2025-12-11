@@ -89,13 +89,15 @@ export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
 # =============================================================================
-# JAX memory configuration - prevent first process from grabbing all GPU RAM
-# Based on benchmarks: game worker ~2GB, training worker ~2GB
-# Set to 45% each (11GB) for headroom (24GB total GPU)
-# Note: cuda_async allocator can cause issues with multiple workers, so use MEM_FRACTION
+# JAX memory configuration - updated after OOM with batch_size=128
+# Game worker with 128 parallel envs requires ~9 GB during JIT compilation
+# Training worker: 0.98 GB peak → 2 GB buffer (0.09 fraction)
+# Eval worker: runs on CPU (benchmark showed CPU is ~10% faster for MLP)
 # =============================================================================
+# Default fraction - overridden per worker below
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
-echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION (11GB per worker on 24GB GPU)"
+echo "JAX memory: Using per-worker allocations"
+echo "  Game worker: 10 GB (0.45), Training: 2 GB (0.09), Eval: CPU"
 
 # =============================================================================
 # Disable XLA command buffers to prevent CUDA graph OOM errors
@@ -230,36 +232,36 @@ if ! kill -0 $COORD_PID 2>/dev/null; then
 fi
 
 # =============================================================================
-# Start Training Worker (uses config file, 0.5 GPU to share with game worker)
+# Start Training Worker (uses config file, 2 GB memory = 0.09 fraction)
 # =============================================================================
 echo "[5/7] Starting training worker..."
-python -m distributed.cli.main training-worker \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.09 python -m distributed.cli.main training-worker \
     --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --num-gpus 0.5 \
+    --num-gpus 1.0 \
     > "$LOG_DIR/training_$TIMESTAMP.log" 2>&1 &
 TRAIN_PID=$!
 echo "       Training worker PID: $TRAIN_PID"
 echo "       Log: $LOG_DIR/training_$TIMESTAMP.log"
 
 # =============================================================================
-# Start GPU Game Worker (uses config file, 0.5 GPU to share with training worker)
+# Start GPU Game Worker (needs ~9 GB for 128 parallel envs + JIT compilation)
 # =============================================================================
 echo "[6/7] Starting GPU game worker..."
-python -m distributed.cli.main game-worker \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.45 python -m distributed.cli.main game-worker \
     --config-file "$CONFIG_FILE" \
     --worker-id "gpu-head" \
-    --num-gpus 0.5 \
+    --num-gpus 1.0 \
     > "$LOG_DIR/game_gpu_$TIMESTAMP.log" 2>&1 &
 GAME_PID=$!
 echo "       Game worker PID: $GAME_PID"
 echo "       Log: $LOG_DIR/game_gpu_$TIMESTAMP.log"
 
 # =============================================================================
-# Start Evaluation Worker (CPU-based, runs random and self-play evals)
+# Start Evaluation Worker (CPU-based - benchmark shows CPU is ~10% faster for MLP inference)
+# See scripts/benchmark_eval_gpu_vs_cpu.py for details
 # =============================================================================
-echo "[7/7] Starting evaluation worker..."
-# Force CPU-only mode to avoid GPU memory conflicts
+echo "[7/7] Starting evaluation worker (CPU)..."
 JAX_PLATFORMS=cpu python -m distributed.cli.main eval-worker \
     --config-file "$CONFIG_FILE" \
     --eval-games 50 \

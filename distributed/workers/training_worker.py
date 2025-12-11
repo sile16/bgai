@@ -30,7 +30,7 @@ from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
 from bgai.endgame.packed_table import BearoffLookup, pack_upper, solve_size_to_n
-from core.training.loss_fns import az_default_loss_fn, four_way_value_loss, reward_to_value_targets
+from core.training.loss_fns import four_way_value_loss, reward_to_value_targets
 from core.evaluators.mcts.equity import value_outputs_to_equity
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
@@ -348,9 +348,6 @@ class TrainingWorker(BaseWorker):
         self._nn_model = None
         self._train_state = None
         self._env = None
-
-        # Loss function
-        self._loss_fn = partial(az_default_loss_fn, l2_reg_lambda=self.l2_reg_lambda)
 
         # Training state
         self._total_steps = 0
@@ -1030,40 +1027,6 @@ class TrainingWorker(BaseWorker):
             os.remove(old_file)
 
     @partial(jax.jit, static_argnums=(0,))
-    def _train_step(
-        self,
-        train_state: TrainState,
-        batch: BaseExperience,
-    ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
-        """Perform a single training step (uniform weights).
-
-        Args:
-            train_state: Current training state.
-            batch: Batch of experiences.
-
-        Returns:
-            Tuple of (updated_train_state, metrics_dict).
-        """
-        grad_fn = jax.value_and_grad(self._loss_fn, has_aux=True)
-        (loss, (metrics, updates)), grads = grad_fn(
-            train_state.params,
-            train_state,
-            batch
-        )
-
-        # Apply gradients
-        new_state = train_state.apply_gradients(grads=grads)
-
-        # Update batch_stats if present (for BatchNorm layers)
-        if updates and 'batch_stats' in updates and hasattr(new_state, 'batch_stats'):
-            new_state = new_state.replace(batch_stats=updates['batch_stats'])
-
-        # Add loss to metrics
-        metrics = {**metrics, 'loss': loss}
-
-        return new_state, metrics
-
-    @partial(jax.jit, static_argnums=(0,))
     def _train_step_weighted(
         self,
         train_state: TrainState,
@@ -1166,18 +1129,15 @@ class TrainingWorker(BaseWorker):
                 import traceback
                 traceback.print_exc()
 
-        # Perform training step - use weighted version if we have weights
-        if sample_weights is not None and self.bearoff_value_weight != 1.0:
-            self._train_state, metrics = self._train_step_weighted(
-                self._train_state,
-                jax_batch,
-                sample_weights,
-            )
-        else:
-            self._train_state, metrics = self._train_step(
-                self._train_state,
-                jax_batch,
-            )
+        # Perform training step - always use weighted version for 4-way value head
+        # If sample_weights is None, use uniform weights of 1.0
+        if sample_weights is None:
+            sample_weights = jnp.ones(jax_batch.reward.shape[0])
+        self._train_state, metrics = self._train_step_weighted(
+            self._train_state,
+            jax_batch,
+            sample_weights,
+        )
 
         # Convert metrics to Python floats
         metrics = {k: float(v) for k, v in metrics.items()}
