@@ -27,7 +27,7 @@ from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.evaluator import EvalOutput
-from core.common import step_env_and_evaluator
+from core.common import two_player_game
 from core.types import StepMetadata
 
 from .base_worker import BaseWorker, WorkerStats
@@ -41,7 +41,6 @@ class EvalType(Enum):
     """Types of evaluation that can be performed."""
     GNUBG = "gnubg"           # Against GNU Backgammon
     RANDOM = "random"         # Against random policy
-    SELF_PLAY = "self_play"   # Current model vs itself
     GREEDY = "greedy"         # Against greedy policy (no MCTS)
 
 
@@ -123,7 +122,6 @@ class EvalWorker(BaseWorker):
         self.enabled_eval_types = self.config.get('eval_types', [
             EvalType.GNUBG.value,
             EvalType.RANDOM.value,
-            EvalType.SELF_PLAY.value,
         ])
 
         # Initialize Redis buffer for coordination
@@ -240,15 +238,15 @@ class EvalWorker(BaseWorker):
                 return nn.relu(x + residual)
 
         class ResNetTurboZero(nn.Module):
-            """ResNet-style network with 6-way value head for backgammon outcomes.
+            """ResNet-style network with 4-way conditional value head for backgammon.
 
-            Value head outputs logits for 6 outcomes:
-            [win, gammon_win, backgammon_win, loss, gammon_loss, backgammon_loss]
+            Value head outputs 4 logits (use sigmoid, not softmax):
+            [win, gammon_win|win, gammon_loss|loss, backgammon_rate]
             """
             num_actions: int
             num_hidden: int = 256
             num_blocks: int = 6
-            value_head_out_size: int = 6  # 6-way outcome distribution
+            value_head_out_size: int = 4  # 4-way conditional value head
 
             @nn.compact
             def __call__(self, x, train: bool = False):  # noqa: ARG002 - train required by interface
@@ -261,7 +259,7 @@ class EvalWorker(BaseWorker):
                     x = ResidualDenseBlock(self.num_hidden)(x)
 
                 policy_logits = nn.Dense(self.num_actions)(x)
-                # 6-way value head: outputs logits, converted to probs by evaluator
+                # 4-way value head: outputs logits, converted to probs by evaluator
                 value_logits = nn.Dense(self.value_head_out_size)(x)
                 return policy_logits, value_logits
 
@@ -312,6 +310,7 @@ class EvalWorker(BaseWorker):
     def _setup_random_evaluator(self) -> None:
         """Set up a random action evaluator."""
         # Simple random evaluator that samples uniformly from legal actions
+        # Compatible with TurboZero's two_player_game interface
 
         class RandomEvaluator:
             def __init__(self, env):
@@ -321,6 +320,8 @@ class EvalWorker(BaseWorker):
                 )
                 self._num_stochastic_actions = int(self._stochastic_probs.shape[0])
                 self._num_actions = env.num_actions
+                # Required by two_player_game
+                self.discount = 1.0
 
             def init(self, *args, **kwargs):
                 return jnp.array(0, dtype=jnp.int32)
@@ -334,7 +335,9 @@ class EvalWorker(BaseWorker):
             def step(self, state, action):
                 return state
 
-            def evaluate(self, key, eval_state, env_state, **kwargs):
+            def evaluate(self, key, eval_state, env_state, root_metadata=None,
+                        params=None, env_step_fn=None, **kwargs):
+                # Accept but ignore extra args for two_player_game compatibility
                 is_stochastic = env_state._is_stochastic
 
                 # Stochastic action
@@ -631,47 +634,28 @@ class EvalWorker(BaseWorker):
                 self._nn_params = deserialize_weights(weights_bytes)
                 self.current_model_version = version
 
-        # Get opponent evaluator
+        # Route to appropriate evaluation method based on eval_type
         if eval_type == EvalType.GNUBG.value:
             if self._gnubg_evaluator is None:
                 print(f"Worker {self.worker_id}: GNUBG not available, skipping")
                 return None
-            opponent_evaluator = self._gnubg_evaluator
+            # GNUBG uses pure_callback, not JIT-compatible with two_player_game
+            results = self._run_gnubg_eval()
         elif eval_type == EvalType.RANDOM.value:
-            opponent_evaluator = self._random_evaluator
-        elif eval_type == EvalType.SELF_PLAY.value:
-            opponent_evaluator = self._mcts_evaluator
+            # Use TurboZero's two_player_game (JIT-compatible)
+            results = self._run_two_player_eval(self._random_evaluator, None)
         else:
             print(f"Worker {self.worker_id}: Unknown eval type: {eval_type}")
             return None
 
-        # Run evaluation games
-        wins, losses, draws = 0, 0, 0
-        total_game_length = 0
-        total_points = 0.0
+        if results is None:
+            return None
 
-        games_per_batch = min(self.batch_size, self.eval_games)
-        num_batches = (self.eval_games + games_per_batch - 1) // games_per_batch
-
-        for batch_idx in range(num_batches):
-            batch_size = min(games_per_batch, self.eval_games - batch_idx * games_per_batch)
-            if batch_size <= 0:
-                break
-
-            batch_results = self._run_eval_batch(
-                batch_size,
-                opponent_evaluator,
-                eval_type,
-            )
-
-            wins += batch_results['wins']
-            losses += batch_results['losses']
-            draws += batch_results['draws']
-            total_game_length += batch_results['total_length']
-            total_points += batch_results['total_points']
-
-            if not self.running:
-                break
+        wins = results['wins']
+        losses = results['losses']
+        draws = results['draws']
+        total_game_length = results['total_length']
+        total_points = results['total_points']
 
         games_played = wins + losses + draws
         if games_played == 0:
@@ -691,202 +675,172 @@ class EvalWorker(BaseWorker):
             timestamp=time.time(),
         )
 
-    def _run_eval_batch(
+    def _run_two_player_eval(
         self,
-        batch_size: int,
         opponent_evaluator,
-        eval_type: str,
+        opponent_params: Optional[chex.ArrayTree],
     ) -> Dict[str, Any]:
-        """Run a batch of evaluation games.
+        """Run evaluation games using TurboZero's two_player_game.
+
+        Uses jax.lax.scan for efficient JIT-compiled game loops with proper
+        evaluator state management (calls evaluator.step() after each action).
 
         Args:
-            batch_size: Number of parallel games.
             opponent_evaluator: The opponent's evaluator.
-            eval_type: Type of evaluation.
+            opponent_params: Parameters for opponent (None for random).
 
         Returns:
             Dict with wins, losses, draws, total_length, total_points.
         """
-        key, self._rng_key = jax.random.split(self._rng_key)
-
-        # Initialize environments
-        init_keys = jax.random.split(key, batch_size)
-        env_states, metadatas = jax.vmap(self._env_init_fn)(init_keys)
-
-        # Initialize evaluator states
-        template_state, _ = self._env_init_fn(jax.random.PRNGKey(0))
-
-        # Our model plays as player 0, opponent as player 1
-        our_eval_states = self._mcts_evaluator.init_batched(
-            batch_size, template_embedding=template_state
-        )
-
-        # For opponent, handle both MCTS-style and simple evaluators
-        if hasattr(opponent_evaluator, 'init_batched'):
-            opp_eval_states = opponent_evaluator.init_batched(
-                batch_size, template_embedding=template_state
-            )
-        else:
-            opp_eval_states = jax.vmap(opponent_evaluator.init)(
-                jax.random.split(key, batch_size)
-            )
-
-        # Track game state
-        game_lengths = jnp.zeros(batch_size, dtype=jnp.int32)
-        final_rewards = jnp.zeros((batch_size, 2), dtype=jnp.float32)
-        done = jnp.zeros(batch_size, dtype=bool)
+        wins, losses, draws = 0, 0, 0
+        total_game_length = 0
+        total_points = 0.0
 
         max_steps = 500
 
-        for step_idx in range(max_steps):
-            if jnp.all(done):
+        # Run games one at a time (two_player_game handles single games)
+        for game_idx in range(self.eval_games):
+            if not self.running:
                 break
 
-            key, step_key = jax.random.split(key)
-            step_keys = jax.random.split(step_key, batch_size)
+            key, self._rng_key = jax.random.split(self._rng_key)
 
-            # Determine which player's turn it is
-            current_players = metadatas.cur_player_id
-
-            # Get actions from both evaluators
-            our_outputs = self._eval_batch(
-                self._mcts_evaluator,
-                our_eval_states,
-                env_states,
-                metadatas,
-                self._nn_params,
-                step_keys,
+            # Run a single game using TurboZero's two_player_game
+            # Our MCTS evaluator is player 1, opponent is player 2
+            outcomes, frames, p_ids = two_player_game(
+                key=key,
+                evaluator_1=self._mcts_evaluator,
+                evaluator_2=opponent_evaluator,
+                params_1=self._nn_params,
+                params_2=opponent_params if opponent_params is not None else self._nn_params,
+                env_step_fn=self._env_step_fn,
+                env_init_fn=self._env_init_fn,
+                max_steps=max_steps,
             )
 
-            # For self_play, opponent is also MCTS and needs full interface
-            is_mcts = eval_type == EvalType.SELF_PLAY.value
-            opp_outputs = self._eval_batch_opponent(
-                opponent_evaluator,
-                opp_eval_states,
-                env_states,
-                metadatas,
-                step_keys,
-                is_mcts=is_mcts,
-            )
+            # outcomes[0] is evaluator_1's outcome, outcomes[1] is evaluator_2's
+            # p_ids tells us which player ID each evaluator got assigned
+            our_outcome = float(outcomes[0])
+            game_length = int(jnp.sum(~frames.completed))
 
-            # Select action based on current player
-            actions = jnp.where(
-                current_players[:, None] == 0,
-                our_outputs.action[:, None],
-                opp_outputs.action[:, None]
-            ).squeeze(-1)
+            if our_outcome > 0:
+                wins += 1
+            elif our_outcome < 0:
+                losses += 1
+            else:
+                draws += 1
 
-            # Step environments
-            def step_single(args):
-                env_state, metadata, action, step_key, is_done = args
-                new_env_state, new_metadata = jax.lax.cond(
-                    is_done,
-                    lambda _: (env_state, metadata),
-                    lambda _: self._env_step_fn(env_state, action, step_key),
-                    None
-                )
-                return new_env_state, new_metadata
-
-            new_env_states, new_metadatas = jax.vmap(step_single)(
-                (env_states, metadatas, actions, step_keys, done)
-            )
-
-            # Update done mask and rewards
-            newly_done = new_metadatas.terminated & ~done
-            game_lengths = game_lengths + jnp.where(~done, 1, 0)
-
-            # Capture final rewards when game ends
-            final_rewards = jnp.where(
-                newly_done[:, None],
-                new_metadatas.rewards,
-                final_rewards
-            )
-
-            done = done | new_metadatas.terminated
-
-            # Update states
-            env_states = new_env_states
-            metadatas = new_metadatas
-            our_eval_states = our_outputs.eval_state
-            opp_eval_states = opp_outputs.eval_state
-
-        # Count results (player 0 is our model)
-        our_rewards = final_rewards[:, 0]
-        wins = int(jnp.sum(our_rewards > 0))
-        losses = int(jnp.sum(our_rewards < 0))
-        draws = int(jnp.sum(our_rewards == 0))
+            total_game_length += game_length
+            total_points += our_outcome
 
         return {
             'wins': wins,
             'losses': losses,
             'draws': draws,
-            'total_length': int(jnp.sum(game_lengths)),
-            'total_points': float(jnp.sum(our_rewards)),
+            'total_length': total_game_length,
+            'total_points': total_points,
         }
 
-    def _eval_batch(
-        self,
-        evaluator,
-        eval_states,
-        env_states,
-        metadatas,
-        params,
-        keys,
-    ):
-        """Evaluate a batch with our MCTS evaluator."""
+    def _run_gnubg_eval(self) -> Dict[str, Any]:
+        """Run evaluation games against GNUBG.
 
-        def eval_single(eval_state, env_state, metadata, key):
-            return evaluator.evaluate(
-                key=key,
-                eval_state=eval_state,
-                env_state=env_state,
-                root_metadata=metadata,
-                params=params,
-                env_step_fn=self._env_step_fn,
-            )
+        Uses a Python loop since GNUBG evaluator uses jax.pure_callback
+        which is not compatible with jax.lax.scan in two_player_game.
 
-        return jax.vmap(eval_single)(eval_states, env_states, metadatas, keys)
+        This method properly steps both evaluators after each action.
 
-    def _eval_batch_opponent(
-        self,
-        evaluator,
-        eval_states,
-        env_states,
-        metadatas,
-        keys,
-        is_mcts: bool = False,
-    ):
-        """Evaluate a batch with opponent evaluator.
-
-        Args:
-            evaluator: The evaluator to use.
-            eval_states: Evaluator states for each game.
-            env_states: Environment states for each game.
-            metadatas: Game metadata for each game.
-            keys: Random keys for each game.
-            is_mcts: If True, use MCTS-style interface with full parameters.
+        Returns:
+            Dict with wins, losses, draws, total_length, total_points.
         """
-        if is_mcts:
-            # MCTS evaluators need the full interface
-            def eval_single(eval_state, env_state, metadata, key):
-                return evaluator.evaluate(
-                    key=key,
-                    eval_state=eval_state,
-                    env_state=env_state,
-                    root_metadata=metadata,
-                    params=self._nn_params,
-                    env_step_fn=self._env_step_fn,
-                )
-            return jax.vmap(eval_single)(eval_states, env_states, metadatas, keys)
-        else:
-            # Simple evaluators (random, gnubg) use basic interface
-            def eval_single(eval_state, env_state, key):
-                return evaluator.evaluate(
-                    key=key,
-                    eval_state=eval_state,
-                    env_state=env_state,
-                )
-            return jax.vmap(eval_single)(eval_states, env_states, keys)
+        wins, losses, draws = 0, 0, 0
+        total_game_length = 0
+        total_points = 0.0
+
+        max_steps = 500
+
+        for game_idx in range(self.eval_games):
+            if not self.running:
+                break
+
+            key, self._rng_key = jax.random.split(self._rng_key)
+
+            # Initialize game
+            key, init_key = jax.random.split(key)
+            env_state, metadata = self._env_init_fn(init_key)
+
+            # Initialize evaluator states
+            our_eval_state = self._mcts_evaluator.init(template_embedding=env_state)
+            opp_eval_state = self._gnubg_evaluator.init(template_embedding=env_state)
+
+            # Randomly assign which evaluator plays which color
+            key, turn_key = jax.random.split(key)
+            first_player = int(jax.random.randint(turn_key, (), 0, 2))
+            we_are_player_0 = (first_player == 0)
+
+            game_length = 0
+            done = False
+
+            while not done and game_length < max_steps:
+                key, step_key = jax.random.split(key)
+                current_player = int(metadata.cur_player_id)
+
+                # Determine which evaluator should move
+                if (current_player == 0) == we_are_player_0:
+                    # Our turn (MCTS)
+                    output = self._mcts_evaluator.evaluate(
+                        key=step_key,
+                        eval_state=our_eval_state,
+                        env_state=env_state,
+                        root_metadata=metadata,
+                        params=self._nn_params,
+                        env_step_fn=self._env_step_fn,
+                    )
+                    action = output.action
+                    # Step our evaluator and the opponent's evaluator
+                    our_eval_state = self._mcts_evaluator.step(output.eval_state, action)
+                    opp_eval_state = self._gnubg_evaluator.step(opp_eval_state, action)
+                else:
+                    # Opponent's turn (GNUBG)
+                    output = self._gnubg_evaluator.evaluate(
+                        key=step_key,
+                        eval_state=opp_eval_state,
+                        env_state=env_state,
+                    )
+                    action = output.action
+                    # Step both evaluators
+                    opp_eval_state = self._gnubg_evaluator.step(output.eval_state, action)
+                    our_eval_state = self._mcts_evaluator.step(our_eval_state, action)
+
+                # Step environment
+                env_state, metadata = self._env_step_fn(env_state, action, step_key)
+                game_length += 1
+
+                if metadata.terminated:
+                    done = True
+
+            # Determine outcome from our perspective
+            if we_are_player_0:
+                our_reward = float(metadata.rewards[0])
+            else:
+                our_reward = float(metadata.rewards[1])
+
+            if our_reward > 0:
+                wins += 1
+            elif our_reward < 0:
+                losses += 1
+            else:
+                draws += 1
+
+            total_game_length += game_length
+            total_points += our_reward
+
+        return {
+            'wins': wins,
+            'losses': losses,
+            'draws': draws,
+            'total_length': total_game_length,
+            'total_points': total_points,
+        }
 
     def _run_loop(self, num_iterations: int = -1) -> Dict[str, Any]:
         """Main evaluation loop.
@@ -941,6 +895,17 @@ class EvalWorker(BaseWorker):
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='eval'
         ).set(1)
+
+        # Set configuration metrics (for correlating with memory usage)
+        metrics.worker_batch_size.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(self.batch_size)
+        metrics.worker_num_simulations.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(self.num_simulations)
+        metrics.worker_max_nodes.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(self.max_nodes)
 
         print(f"Worker {self.worker_id}: Starting evaluation loop...")
         print(f"Worker {self.worker_id}: Enabled eval types: {self.enabled_eval_types}")
