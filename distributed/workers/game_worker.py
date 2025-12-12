@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.evaluation_fns import make_nn_eval_fn
-from core.evaluators.mcts.equity import terminal_value_probs_from_reward_4way, probs_to_equity
+from core.evaluators.mcts.equity import terminal_value_probs_from_reward_4way, probs_to_equity_4way
 from core.common import step_env_and_evaluator
 from core.types import StepMetadata
 
@@ -627,7 +627,7 @@ class GameWorker(BaseWorker):
             # Convert final reward to equity for comparison
             actual_reward = float(final_rewards[0])
             actual_probs = terminal_value_probs_from_reward_4way(jnp.array(actual_reward))
-            actual_equity = float(probs_to_equity(actual_probs, match_score=None))
+            actual_equity = float(probs_to_equity_4way(actual_probs, match_score=None))
             surprise_score = abs(mean_value_pred - actual_equity)
 
         metrics = get_metrics()
