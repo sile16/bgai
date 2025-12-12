@@ -13,5 +13,5 @@ scrape_configs:
 - job_name: 'bgai_workers'
   file_sd_configs:
   - files:
-    - 'tools/bgai_prometheus_targets.json'
+    - 'bgai_prometheus_targets.json'
     refresh_interval: 15s

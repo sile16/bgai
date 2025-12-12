@@ -24,60 +24,13 @@ Example usage:
     python -m distributed.cli.main status
 """
 
-from .device import detect_device, get_device_config, DeviceInfo
-from .serialization import (
-    serialize_weights,
-    deserialize_weights,
-    serialize_experience,
-    deserialize_experience,
-    serialize_warm_tree,
-    deserialize_warm_tree,
-)
-from .coordinator.head_node import (
-    Coordinator,
-    create_coordinator,
-)
-from .coordinator.redis_state import (
-    RedisStateManager,
-    WorkerInfo,
-    WorkerStatus,
-    RunStatus,
-    create_state_manager,
-)
-from .workers.base_worker import BaseWorker, WorkerStats
-from .workers.game_worker import GameWorker
-from .workers.training_worker import TrainingWorker
-from .workers.eval_worker import EvalWorker
-from .buffer.redis_buffer import RedisReplayBuffer, BufferStats
+# Keep package import lightweight.
+#
+# Many submodules (device detection, workers, evaluators) import JAX and may
+# initialize CUDA. CLI commands like `status` should be able to run even when
+# the GPU is fully occupied, so avoid importing heavy modules at import time.
+#
+# Import needed symbols from their specific modules instead of from
+# `distributed` directly.
 
-__all__ = [
-    # Device detection
-    'detect_device',
-    'get_device_config',
-    'DeviceInfo',
-    # Serialization
-    'serialize_weights',
-    'deserialize_weights',
-    'serialize_experience',
-    'deserialize_experience',
-    'serialize_warm_tree',
-    'deserialize_warm_tree',
-    # Coordinator
-    'Coordinator',
-    'create_coordinator',
-    # Redis State
-    'RedisStateManager',
-    'WorkerInfo',
-    'WorkerStatus',
-    'RunStatus',
-    'create_state_manager',
-    # Workers
-    'BaseWorker',
-    'WorkerStats',
-    'GameWorker',
-    'TrainingWorker',
-    'EvalWorker',
-    # Buffer
-    'RedisReplayBuffer',
-    'BufferStats',
-]
+__all__ = []

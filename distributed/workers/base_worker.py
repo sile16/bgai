@@ -150,7 +150,8 @@ class BaseWorker(ABC):
         import uuid
         hostname = socket.gethostname().split('.')[0]
         short_id = uuid.uuid4().hex[:8]
-        return f"{self.worker_type}-{hostname}-{short_id}"
+        # Consistent scheme across all hosts: <hostname>-<worker_type>-<shortid>
+        return f"{hostname}-{self.worker_type}-{short_id}"
 
     # =========================================================================
     # Registration and Heartbeat

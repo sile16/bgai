@@ -12,7 +12,6 @@
 #   ./scripts/worker_start.sh game eval -g 32 -e 16        # Both with overrides
 #
 # Environment:
-#   WORKER_ID       - Override auto-generated worker ID
 #   GAME_BATCH_SIZE - Override game batch size
 #   EVAL_BATCH_SIZE - Override eval batch size
 
@@ -103,7 +102,6 @@ detect_platform
 # =============================================================================
 WORKER_TYPES=()
 EXTRA_ARGS=""
-CUSTOM_WORKER_ID="${WORKER_ID:-}"
 CUSTOM_GAME_BATCH="${GAME_BATCH_SIZE:-}"
 CUSTOM_EVAL_BATCH="${EVAL_BATCH_SIZE:-}"
 
@@ -121,10 +119,6 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_EVAL_BATCH="$2"
             shift 2
             ;;
-        --worker-id)
-            CUSTOM_WORKER_ID="$2"
-            shift 2
-            ;;
         -h|--help)
             echo "Usage: $0 [game] [eval] [options]"
             echo ""
@@ -135,7 +129,6 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  -g, --game-batch-size N   Override game batch size"
             echo "  -e, --eval-batch-size N   Override eval batch size"
-            echo "  --worker-id ID            Override worker ID"
             echo "  -h, --help                Show this help"
             exit 0
             ;;
@@ -151,13 +144,8 @@ if [[ ${#WORKER_TYPES[@]} -eq 0 ]]; then
     WORKER_TYPES=("game")
 fi
 
-# Generate worker ID if not provided.
-# Default to hostname only; device/platform is tracked separately in Redis/metrics.
-if [[ -z "$CUSTOM_WORKER_ID" ]]; then
-    WORKER_ID_BASE="${HOSTNAME_SHORT}"
-else
-    WORKER_ID_BASE="$CUSTOM_WORKER_ID"
-fi
+# Local tag for logs/stop files
+WORKER_TAG_BASE="${HOSTNAME_SHORT}"
 
 # =============================================================================
 # Display configuration
@@ -167,7 +155,7 @@ echo "  BGAI Worker"
 echo "=============================================="
 echo "Platform:     $PLATFORM ($DEVICE_TYPE)"
 echo "Worker types: ${WORKER_TYPES[*]}"
-echo "Worker ID:    $WORKER_ID_BASE"
+echo "Worker tag:   $WORKER_TAG_BASE"
 echo "Head node:    $HEAD_IP (Redis port: $REDIS_PORT)"
 echo "MLflow:       http://$HEAD_IP:5000"
 echo "Config file:  $CONFIG_FILE"
@@ -200,20 +188,19 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 PIDS=()
 
 start_game_worker() {
-    local worker_id="${WORKER_ID_BASE}-game"
-    local log_file="$LOG_DIR/game_${worker_id}_${TIMESTAMP}.log"
-    local stop_file="$LOG_DIR/game_${worker_id}.stop"
-    local pid_file="$LOG_DIR/game_${worker_id}.pid"
+    local worker_tag="${WORKER_TAG_BASE}-game"
+    local log_file="$LOG_DIR/game_${worker_tag}_${TIMESTAMP}.log"
+    local stop_file="$LOG_DIR/game_${worker_tag}.stop"
+    local pid_file="$LOG_DIR/game_${worker_tag}.pid"
 
     rm -f "$stop_file"
 
-    echo "Starting game worker: $worker_id"
+    echo "Starting game worker: $worker_tag"
     echo "  Log: $log_file"
 
     # Build command
     local cmd="python -m distributed.cli.main game-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
-    cmd="$cmd --worker-id $worker_id"
     cmd="$cmd --head-ip $HEAD_IP"
 
     if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
@@ -253,22 +240,21 @@ start_game_worker() {
 }
 
 start_eval_worker() {
-    local worker_id="${WORKER_ID_BASE}-eval"
-    local log_file="$LOG_DIR/eval_${worker_id}_${TIMESTAMP}.log"
-    local stop_file="$LOG_DIR/eval_${worker_id}.stop"
-    local pid_file="$LOG_DIR/eval_${worker_id}.pid"
+    local worker_tag="${WORKER_TAG_BASE}-eval"
+    local log_file="$LOG_DIR/eval_${worker_tag}_${TIMESTAMP}.log"
+    local stop_file="$LOG_DIR/eval_${worker_tag}.stop"
+    local pid_file="$LOG_DIR/eval_${worker_tag}.pid"
     local eval_types=$(get_eval_types)
 
     rm -f "$stop_file"
 
-    echo "Starting eval worker: $worker_id"
+    echo "Starting eval worker: $worker_tag"
     echo "  Eval types: $eval_types"
     echo "  Log: $log_file"
 
     # Build command
     local cmd="python -m distributed.cli.main eval-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
-    cmd="$cmd --worker-id $worker_id"
     cmd="$cmd --head-ip $HEAD_IP"
 
     if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
@@ -328,11 +314,11 @@ echo "  Workers Started"
 echo "=============================================="
 echo ""
 echo "Monitor logs:"
-echo "  tail -f $LOG_DIR/*_${WORKER_ID_BASE}*_${TIMESTAMP}.log"
+echo "  tail -f $LOG_DIR/*_${WORKER_TAG_BASE}*_${TIMESTAMP}.log"
 echo ""
 echo "Stop all workers:"
 for worker_type in "${WORKER_TYPES[@]}"; do
-    echo "  touch $LOG_DIR/${worker_type}_${WORKER_ID_BASE}-${worker_type}.stop"
+    echo "  touch $LOG_DIR/${worker_type}_${WORKER_TAG_BASE}-${worker_type}.stop"
 done
 echo ""
 echo "Check cluster status:"

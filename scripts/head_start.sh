@@ -61,8 +61,8 @@ echo "Loading config from: $CONFIG_FILE"
 
 TAILSCALE_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host:" | head -1 | awk -F'"' '{print $2}')
 LOCAL_IP=$(grep -A5 "^head:" "$CONFIG_FILE" | grep "host_local:" | awk -F'"' '{print $2}')
-REDIS_PORT=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "port:" | awk '{print $2}')
-REDIS_PASSWORD=$(grep -A5 "^redis:" "$CONFIG_FILE" | grep "password:" | awk -F'"' '{print $2}')
+REDIS_PORT=$(grep -A20 "^redis:" "$CONFIG_FILE" | grep "port:" | head -1 | awk '{print $2}')
+REDIS_PASSWORD=$(grep -A20 "^redis:" "$CONFIG_FILE" | grep "password:" | head -1 | awk -F'"' '{print $2}')
 
 TAILSCALE_IP="${TAILSCALE_IP:-100.105.50.111}"
 LOCAL_IP="${LOCAL_IP:-192.168.20.40}"
@@ -132,9 +132,13 @@ export PYTHONUNBUFFERED=1
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${HEAD_MEM_FRACTION:-0.45}"
 
-TRAIN_MEM_FRACTION="${TRAIN_MEM_FRACTION:-0.09}"
-GAME_MEM_FRACTION="${GAME_MEM_FRACTION:-0.45}"
+TRAIN_MEM_FRACTION="${TRAIN_MEM_FRACTION:-0.30}"
+GAME_MEM_FRACTION="${GAME_MEM_FRACTION:-0.15}"
 EVAL_JAX_PLATFORMS="${EVAL_JAX_PLATFORMS:-cpu}"
+
+# Optional per-head batch overrides.
+HEAD_TRAIN_BATCH_SIZE="${HEAD_TRAIN_BATCH_SIZE:-}"
+HEAD_GAME_BATCH_SIZE="${HEAD_GAME_BATCH_SIZE:-}"
 
 # =============================================================================
 # Start MLflow
@@ -245,14 +249,15 @@ XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRACTION" python -m distributed.cli.m
     --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --num-gpus 1.0 \
+    ${HEAD_TRAIN_BATCH_SIZE:+--batch-size $HEAD_TRAIN_BATCH_SIZE} \
     > "$LOG_DIR/training_$TIMESTAMP.log" 2>&1 &
 TRAIN_PID=$!
 
 echo "       Starting game worker..."
 XLA_PYTHON_CLIENT_MEM_FRACTION="$GAME_MEM_FRACTION" python -m distributed.cli.main game-worker \
     --config-file "$CONFIG_FILE" \
-    --worker-id "gpu-head" \
     --num-gpus 1.0 \
+    ${HEAD_GAME_BATCH_SIZE:+--batch-size $HEAD_GAME_BATCH_SIZE} \
     > "$LOG_DIR/game_gpu_$TIMESTAMP.log" 2>&1 &
 GAME_PID=$!
 

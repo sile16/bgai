@@ -146,10 +146,7 @@ def start_game_worker(args):
         print(f"  {k}: {v}")
 
     # Create and run worker
-    worker = GameWorker(
-        config=config,
-        worker_id=args.worker_id,
-    )
+    worker = GameWorker(config=config)
 
     print("\nGame worker running. Press Ctrl+C to stop.")
     try:
@@ -214,10 +211,7 @@ def start_training_worker(args):
         print(f"  {k}: {v}")
 
     # Create and run worker
-    worker = TrainingWorker(
-        config=config,
-        worker_id=args.worker_id,
-    )
+    worker = TrainingWorker(config=config)
 
     print("\nTraining worker running. Press Ctrl+C to stop.")
     try:
@@ -274,10 +268,7 @@ def start_eval_worker(args):
             print(f"  {k}: {v}")
 
     # Create and run worker
-    worker = EvalWorker(
-        config=config,
-        worker_id=args.worker_id,
-    )
+    worker = EvalWorker(config=config)
 
     print("\nEvaluation worker running. Press Ctrl+C to stop.")
     try:
@@ -485,12 +476,6 @@ def main():
         help='Path to config file (default: configs/distributed.yaml)'
     )
     game_parser.add_argument(
-        '--worker-id',
-        type=str,
-        default=None,
-        help='Worker ID (auto-generated if not provided)'
-    )
-    game_parser.add_argument(
         '--batch-size',
         type=int,
         default=16,
@@ -576,12 +561,6 @@ def main():
         type=str,
         default=None,
         help='Path to config file (default: configs/distributed.yaml)'
-    )
-    train_parser.add_argument(
-        '--worker-id',
-        type=str,
-        default=None,
-        help='Worker ID (auto-generated if not provided)'
     )
     train_parser.add_argument(
         '--batch-size',
@@ -705,12 +684,6 @@ def main():
         type=str,
         default=None,
         help='Path to config file (default: configs/distributed.yaml)'
-    )
-    eval_parser.add_argument(
-        '--worker-id',
-        type=str,
-        default=None,
-        help='Worker ID (auto-generated if not provided)'
     )
     eval_parser.add_argument(
         '--eval-games',

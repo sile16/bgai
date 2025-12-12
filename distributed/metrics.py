@@ -25,7 +25,9 @@ Usage:
 
 import json
 import os
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from typing import Optional, Dict, Any, List
@@ -664,16 +666,56 @@ DISCOVERY_FILE_PATH = os.environ.get(
 
 
 def _get_worker_ip() -> str:
-    """Get the IP address of this worker."""
+    """Get the best IP address for Prometheus scraping.
+
+    Preference order:
+    1) Explicit override via `BGAI_WORKER_IP`.
+    2) Tailscale IPv4 (if available).
+    3) Interface IP chosen for outbound routing.
+    4) Hostname resolution fallback.
+    """
+    override = os.environ.get("BGAI_WORKER_IP")
+    if override:
+        return override.strip()
+
+    # Prefer Tailscale IP when running across machines.
     try:
-        # Try to get the IP that would be used to connect to an external host
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        if shutil.which("tailscale"):
+            result = subprocess.run(
+                ["tailscale", "ip", "-4"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            ts_ip = result.stdout.strip().splitlines()[0] if result.stdout else ""
+            if ts_ip:
+                return ts_ip
     except Exception:
-        return "127.0.0.1"
+        pass
+
+    # Try to get the IP that would be used to connect to an external host.
+    for probe_host in [("8.8.8.8", 80), ("1.1.1.1", 80)]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(probe_host)
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and ip != "0.0.0.0":
+                return ip
+        except Exception:
+            continue
+
+    # Final fallback: resolve hostname.
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip:
+            return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
 
 
 def register_metrics_endpoint(
