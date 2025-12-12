@@ -7,6 +7,9 @@
 #   ./scripts/worker_start.sh game                     # Start game worker
 #   ./scripts/worker_start.sh eval                     # Start eval worker
 #   ./scripts/worker_start.sh game eval                # Start both workers
+#   ./scripts/worker_start.sh --cpu game               # Force CPU worker (on GPU machine)
+#   ./scripts/worker_start.sh --gpu game               # Force GPU worker (if available)
+#   ./scripts/worker_start.sh --tpu game               # Force TPU worker (if available)
 #   ./scripts/worker_start.sh game --game-batch-size 32    # Override game batch size
 #   ./scripts/worker_start.sh eval --eval-batch-size 16    # Override eval batch size
 #   ./scripts/worker_start.sh game eval -g 32 -e 16        # Both with overrides
@@ -104,11 +107,24 @@ WORKER_TYPES=()
 EXTRA_ARGS=""
 CUSTOM_GAME_BATCH="${GAME_BATCH_SIZE:-}"
 CUSTOM_EVAL_BATCH="${EVAL_BATCH_SIZE:-}"
+FORCE_DEVICE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         game|eval)
             WORKER_TYPES+=("$1")
+            shift
+            ;;
+        --cpu)
+            FORCE_DEVICE="cpu"
+            shift
+            ;;
+        --gpu)
+            FORCE_DEVICE="gpu"
+            shift
+            ;;
+        --tpu)
+            FORCE_DEVICE="tpu"
             shift
             ;;
         -g|--game-batch-size)
@@ -127,6 +143,9 @@ while [[ $# -gt 0 ]]; do
             echo "  eval    Start evaluation worker"
             echo ""
             echo "Options:"
+            echo "      --cpu                Force CPU worker (JAX_PLATFORMS=cpu)"
+            echo "      --gpu                Force GPU worker (JAX_PLATFORMS=cuda)"
+            echo "      --tpu                Force TPU worker (JAX_PLATFORMS=tpu)"
             echo "  -g, --game-batch-size N   Override game batch size"
             echo "  -e, --eval-batch-size N   Override eval batch size"
             echo "  -h, --help                Show this help"
@@ -139,13 +158,55 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+apply_force_device() {
+    if [[ -z "$FORCE_DEVICE" ]]; then
+        return 0
+    fi
+
+    if [[ "$OS_TYPE" == "Darwin" && "$FORCE_DEVICE" != "cpu" ]]; then
+        echo "ERROR: --$FORCE_DEVICE requested on macOS; only --cpu is supported"
+        exit 1
+    fi
+
+    case "$FORCE_DEVICE" in
+        cpu)
+            PLATFORM="cpu"
+            DEVICE_TYPE="cpu"
+            export JAX_PLATFORMS=cpu
+            unset XLA_PYTHON_CLIENT_MEM_FRACTION 2>/dev/null || true
+            ;;
+        gpu)
+            if ! command -v nvidia-smi &>/dev/null || ! nvidia-smi &>/dev/null; then
+                echo "ERROR: --gpu requested but no working NVIDIA GPU detected (nvidia-smi failed)"
+                exit 1
+            fi
+            PLATFORM="cuda"
+            DEVICE_TYPE="cuda"
+            export JAX_PLATFORMS=cuda
+            export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.21}"
+            ;;
+        tpu)
+            PLATFORM="tpu"
+            DEVICE_TYPE="tpu"
+            export JAX_PLATFORMS=tpu
+            unset XLA_PYTHON_CLIENT_MEM_FRACTION 2>/dev/null || true
+            ;;
+        *)
+            echo "ERROR: Unknown device override: $FORCE_DEVICE"
+            exit 1
+            ;;
+    esac
+}
+
+apply_force_device
+
 # Default to game worker if none specified
 if [[ ${#WORKER_TYPES[@]} -eq 0 ]]; then
     WORKER_TYPES=("game")
 fi
 
-# Local tag for logs/stop files
-WORKER_TAG_BASE="${HOSTNAME_SHORT}"
+# Local tag for logs/stop files (include device so CPU+GPU can coexist)
+WORKER_TAG_BASE="${HOSTNAME_SHORT}-${DEVICE_TYPE}"
 
 # =============================================================================
 # Display configuration
