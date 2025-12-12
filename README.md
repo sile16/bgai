@@ -29,7 +29,7 @@ pip install -r requirements.txt
 redis-server --daemonize yes --requirepass bgai-password
 
 # Start all services
-./scripts/start_all_head.sh
+./scripts/head_start.sh
 ```
 
 This starts:
@@ -45,7 +45,7 @@ This starts:
 
 On remote machines:
 ```bash
-./scripts/start_game_worker.sh
+./scripts/worker_start.sh game
 ```
 
 ### Monitor Training

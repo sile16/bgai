@@ -16,6 +16,7 @@
 
 
 game:
+  batch_size: 16               # Base game batch size (overridden by device_configs)
   max_episode_steps: 500  # Max moves per game, safety to prevent infinite moves, todo; log metric: max_episode_limit_hit_count
   short_game: True # starting position is a mid game position rather than complete beginning
   simple_doubles: False # simple doubles only plays doubles to limit randomness
@@ -25,23 +26,26 @@ mcts:
   eval_simulations: 50         # added specifically for eval ,
   max_nodes: 2000               # Maximum tree size (GLOBAL)
   warm_tree_simulations: 500   # MCTS sims for warm tree (0 = disabled)
+  warm_tree_max_nodes: 10000   # Max nodes for warm tree expansion
   persist_tree: true           # Keep tree between moves
   temperature_start: 0.8       # Initial exploration
   temperature_end: 0.2         # End temperature.        
   temperature_epochs:  50      # The number of epochs it takes to go from start to end, then we just stay at ending temp 
+  discount: -1.0               # -1 for two-player zero-sum games
 
 training:
-  batch_size: 1024                 # Samples per training step, 
+  batch_size: 128              # Base training batch size (overridden by device_configs)
+  steps_per_epoch: 20000           # Training steps run once games_per_epoch new games are collected
   learning_rate: 0.0003            # Adam learning rate
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
-  bearoff_enabled: False           # disable bearoff DB completely
+  bearoff_enabled: True           # disable bearoff DB completely
   bearoff_value_weight: 2.0        # the learning rate multiplier for values pulled from bearoff db
   lookup_enabled: False            # disables the lookup positions.
   lookup_learning_weight: 1.5      # this is for future if we have specific anchor positions with value AND policy
   l2_reg_lambda: 0.0001            # L2 regularization
   games_per_epoch: 200               # New games before training step (lower = more frequent training) 
-  surprise_weight: 0.5             # Blend of uniform (0) vs surprise-weighted (1) sampling
+  surprise_weight: 0.2             # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_epoch_interval: 5     # number of epochs berfore we write checkpoint to disk
   max_checkpoints: 5
 
@@ -62,6 +66,8 @@ gnubg:
 # =============================================================================
 
 redis:
+  host: "localhost"
+  db: 0
   # use head host host: "100.105.50.111"  # Head node (Tailscale IP)
   # use head host_local host_local: "192.168.20.40"  # LAN fallback
   port: 6379
@@ -110,10 +116,10 @@ device_configs:
     # With mutually exclusive training/collection, each gets full GPU compute
     # Memory is split 45%/45% but compute alternates for 100% utilization
     # batch_size=128 with max_nodes=2000 fits in 11GB with ~62% GPU util
-    game_batch_size: 128
-    game_gpu_memory_fraction: 0.45
-    train_batch_size: 512
-    train_gpu_memory_fraction: 0.45
+    game_batch_size: 200
+    game_gpu_memory_fraction: 0.3
+    train_batch_size: 4096
+    train_gpu_memory_fraction: 0.3
     eval_batch_size: 32
     eval_gpu_memory_fraction: 0.1
 

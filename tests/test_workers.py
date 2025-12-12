@@ -87,7 +87,7 @@ def training_config():
         'learning_rate': 3e-4,
         'min_buffer_size': 10,
         'games_per_epoch': 5,
-        'steps_per_game': 2,
+        'steps_per_epoch': 10,
         'metrics_port': 9200,
     }
 
@@ -296,14 +296,13 @@ class TestTrainingWorkerBasics:
                     'train_batch_size': 256,
                     'learning_rate': 1e-4,
                     'games_per_epoch': 20,
-                    'steps_per_game': 5,
+                    'steps_per_epoch': 100,
                 })
 
                 assert worker.train_batch_size == 256
                 assert worker.learning_rate == 1e-4
                 assert worker.games_per_epoch == 20
-                assert worker.steps_per_game == 5
-
+                assert worker.steps_per_epoch == 100
 
 # ============================================================================
 # EvalWorker Tests

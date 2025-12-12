@@ -155,7 +155,7 @@ class BGAIMetrics:
         )
 
         # =================================================================
-        # Per-Outcome Value Loss Metrics (6-way value head)
+        # Per-Outcome Value Loss Metrics (4-way conditional value head)
         # =================================================================
         self.value_loss_per_outcome = Gauge(
             'bgai_value_loss_per_outcome',
@@ -655,7 +655,12 @@ def reset_metrics():
 # =============================================================================
 
 WORKER_REGISTRY_KEY = "bgai:metrics:workers"
-DISCOVERY_FILE_PATH = "/tmp/bgai_prometheus_targets.json"
+# Default location for Prometheus file-based service discovery.
+# Can be overridden via BGAI_PROM_DISCOVERY_PATH env var.
+DISCOVERY_FILE_PATH = os.environ.get(
+    "BGAI_PROM_DISCOVERY_PATH",
+    os.path.join("tools", "bgai_prometheus_targets.json"),
+)
 
 
 def _get_worker_ip() -> str:
@@ -864,6 +869,7 @@ def start_discovery_updater(
     redis_port: int,
     redis_password: Optional[str] = None,
     update_interval: int = 15,
+    output_path: str = DISCOVERY_FILE_PATH,
 ) -> MetricsDiscoveryUpdater:
     """Start the background discovery updater thread.
 
@@ -872,6 +878,7 @@ def start_discovery_updater(
         redis_port: Redis server port.
         redis_password: Optional Redis password.
         update_interval: Seconds between updates.
+        output_path: Path to write the discovery JSON file.
 
     Returns:
         The MetricsDiscoveryUpdater thread.
@@ -886,6 +893,7 @@ def start_discovery_updater(
         redis_port=redis_port,
         redis_password=redis_password,
         update_interval=update_interval,
+        output_path=output_path,
     )
     _discovery_updater.start()
     return _discovery_updater

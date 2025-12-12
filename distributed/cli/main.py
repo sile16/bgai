@@ -189,8 +189,8 @@ def start_training_worker(args):
         config['l2_reg_lambda'] = args.l2_reg
     if args.games_per_epoch != 10:
         config['games_per_epoch'] = args.games_per_epoch
-    if args.steps_per_game != 10:
-        config['steps_per_game'] = args.steps_per_game
+    if args.steps_per_epoch is not None:
+        config['steps_per_epoch'] = args.steps_per_epoch
     if args.surprise_weight != 0.5:
         config['surprise_weight'] = args.surprise_weight
     if args.checkpoint_epoch_interval != 5:
@@ -608,10 +608,10 @@ def main():
         help='New games required to trigger a training epoch (default: 10)'
     )
     train_parser.add_argument(
-        '--steps-per-game',
+        '--steps-per-epoch',
         type=int,
-        default=10,
-        help='Training steps to run per collected game (default: 10)'
+        default=None,
+        help='Training steps to run each epoch (default: config value)'
     )
     train_parser.add_argument(
         '--surprise-weight',

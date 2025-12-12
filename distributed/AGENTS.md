@@ -38,10 +38,10 @@ Head Node                          Remote Workers
 
 ```bash
 # Head node (all services)
-./scripts/start_all_head.sh
+./scripts/head_start.sh
 
 # Remote game worker
-./scripts/start_game_worker.sh
+./scripts/worker_start.sh game
 
 # Check status
 ./scripts/status.sh

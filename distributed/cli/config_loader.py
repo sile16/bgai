@@ -322,8 +322,10 @@ def get_training_worker_config(
 
     # Network config for model architecture
     network = config.get('network', {})
+    games_per_epoch = training.get('games_per_epoch', training.get('games_per_batch', 10))
+    steps_per_epoch = training.get('steps_per_epoch')
 
-    return {
+    worker_config = {
         'train_batch_size': batch_size,
         'learning_rate': training.get('learning_rate', 3e-4),
         'l2_reg_lambda': training.get('l2_reg_lambda', 1e-4),
@@ -336,8 +338,7 @@ def get_training_worker_config(
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
         # games_per_epoch (new) with fallback to games_per_batch (old)
-        'games_per_epoch': training.get('games_per_epoch', training.get('games_per_batch', 10)),
-        # steps_per_game removed - now trains on all available steps
+        'games_per_epoch': games_per_epoch,
         'surprise_weight': training.get('surprise_weight', 0.5),
         # Bearoff/endgame settings
         'bearoff_enabled': training.get('bearoff_enabled', False),
@@ -365,6 +366,12 @@ def get_training_worker_config(
         'redis': redis,
         'gnubg': config.get('gnubg', {}),
     }
+
+    # Training cadence (optional to keep configs clean when unset)
+    if steps_per_epoch is not None:
+        worker_config['steps_per_epoch'] = steps_per_epoch
+
+    return worker_config
 
 
 def get_eval_worker_config(

@@ -222,12 +222,12 @@ python -m distributed.cli.main runs delete --run-id abc123 --delete-checkpoints
 
 ### Script Updates
 
-1. **`scripts/start_all_head.sh`**
+1. **`scripts/head_start.sh`**
    - Remove Ray head start
    - Add MLflow server start
    - Start coordinator as Python process
 
-2. **`scripts/start_worker.sh`**
+2. **`scripts/worker_start.sh`**
    - Remove Ray join
    - Simple Python process start
    - No cluster connection needed

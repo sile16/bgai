@@ -30,11 +30,11 @@ from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
 from bgai.endgame.packed_table import BearoffLookup, pack_upper, solve_size_to_n
-from core.training.loss_fns import four_way_value_loss, reward_to_value_targets
+from core.training.loss_fns import reward_to_value_targets
 from core.evaluators.mcts.equity import value_outputs_to_equity
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
-# 4-way value functions (reward_to_value_targets, four_way_value_loss, value_outputs_to_equity)
+# 4-way value functions (reward_to_value_targets, value_outputs_to_equity)
 # are imported from TurboZero core.training.loss_fns and core.evaluators.mcts.equity
 
 
@@ -42,20 +42,26 @@ def weighted_az_loss_fn(
     params: chex.ArrayTree,
     train_state: TrainState,
     experience: BaseExperience,
-    sample_weights: jnp.ndarray,
+    value_targets: jnp.ndarray,
+    value_masks: jnp.ndarray,
+    value_sample_weights: jnp.ndarray,
+    policy_sample_weights: jnp.ndarray,
     l2_reg_lambda: float = 0.0001,
 ) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
     """AlphaZero loss function with per-sample weighting and 4-way conditional value head.
 
-    This allows us to weight bearoff samples more heavily since they have
-    known-perfect target values. Value head outputs 4 independent sigmoids:
+    This allows us to weight bearoff value samples more heavily without also
+    overweighting policy loss. Value head outputs 4 independent sigmoids:
     [win, gam_win_cond, gam_loss_cond, bg_rate]
 
     Args:
         params: Neural network parameters
         train_state: Flax TrainState
         experience: Batch of experiences
-        sample_weights: Per-sample weights (e.g., higher for bearoff positions)
+        value_targets: Precomputed 4-way value targets
+        value_masks: Masks for which targets are valid
+        value_sample_weights: Per-sample weights for value loss (e.g., higher for bearoff)
+        policy_sample_weights: Per-sample weights for policy loss
         l2_reg_lambda: L2 regularization weight
 
     Returns:
@@ -83,24 +89,16 @@ def weighted_az_loss_fn(
     # Compute per-sample policy loss (cross entropy)
     policy_loss_per_sample = optax.softmax_cross_entropy(pred_policy_logits, experience.policy_weights)
     # Apply weights and average
-    policy_loss = jnp.sum(policy_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
-
-    # Select appropriate reward from experience.reward for current player
-    current_player = experience.cur_player_id
-    batch_indices = jnp.arange(experience.reward.shape[0])
-    target_reward = experience.reward[batch_indices, current_player]
-
-    # Convert scalar reward to 4-way targets with masks
-    targets, masks = reward_to_value_targets(target_reward)
+    policy_loss = jnp.sum(policy_loss_per_sample * policy_sample_weights) / jnp.maximum(jnp.sum(policy_sample_weights), 1e-8)
 
     # Compute value loss with per-sample weighting
     # First compute per-sample BCE with masking
-    bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
-    masked_bce = bce * masks  # (batch, 4)
-    value_loss_per_sample = masked_bce.sum(axis=-1) / jnp.maximum(masks.sum(axis=-1), 1.0)
+    bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * value_targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
+    masked_bce = bce * value_masks  # (batch, 4)
+    value_loss_per_sample = masked_bce.sum(axis=-1) / jnp.maximum(value_masks.sum(axis=-1), 1.0)
 
     # Apply sample weights and average
-    value_loss = jnp.sum(value_loss_per_sample * sample_weights) / jnp.sum(sample_weights)
+    value_loss = jnp.sum(value_loss_per_sample * value_sample_weights) / jnp.maximum(jnp.sum(value_sample_weights), 1e-8)
 
     # Compute L2 regularization (not weighted by samples)
     l2_reg = l2_reg_lambda * jax.tree_util.tree_reduce(
@@ -120,12 +118,12 @@ def weighted_az_loss_fn(
     # Value accuracy: did we predict win correctly?
     pred_value_probs = jax.nn.sigmoid(pred_value_logits)
     pred_win = pred_value_probs[:, 0] > 0.5
-    target_win = targets[:, 0] > 0.5
+    target_win = value_targets[:, 0] > 0.5
     value_accuracy = jnp.mean(pred_win == target_win)
 
     # Per-output value losses for monitoring
     # Compute per-output BCE (unweighted by sample weights, but masked)
-    mean_per_output_bce = (masked_bce.sum(axis=0)) / jnp.maximum(masks.sum(axis=0), 1.0)
+    mean_per_output_bce = (masked_bce.sum(axis=0)) / jnp.maximum(value_masks.sum(axis=0), 1.0)
 
     # Output names: win, gam_win_cond, gam_loss_cond, bg_rate
     value_loss_win = mean_per_output_bce[0]
@@ -137,7 +135,7 @@ def weighted_az_loss_fn(
     mean_pred_probs = pred_value_probs.mean(axis=0)  # (4,)
 
     # Target distribution (mean over batch)
-    mean_target_probs = targets.mean(axis=0)  # (4,)
+    mean_target_probs = value_targets.mean(axis=0)  # (4,)
 
     # Compute equity from predictions for monitoring
     pred_equity = value_outputs_to_equity(pred_value_probs)
@@ -274,10 +272,8 @@ class TrainingWorker(BaseWorker):
         # Collection-gated training configuration
         # Training triggers after this many new games collected (epoch = games_per_epoch games)
         self.games_per_epoch = self.config.get('games_per_epoch', 10)
-        # Number of training steps to run per collected game
-        # Default high to train on most experiences (avg game ~60 moves / batch_size)
-        # Set to 0 to auto-calculate based on buffer size
-        self.steps_per_game = self.config.get('steps_per_game', 50)
+        # Training steps to run each epoch (triggered by games_per_epoch)
+        self.steps_per_epoch = self.config.get('steps_per_epoch', 500)
 
         # Surprise-weighted sampling configuration
         # 0 = uniform sampling, 1 = fully surprise-weighted
@@ -477,7 +473,7 @@ class TrainingWorker(BaseWorker):
     def _apply_bearoff_values_to_batch(
         self,
         batch: BaseExperience,
-    ) -> Tuple[BaseExperience, Dict[str, jnp.ndarray]]:
+    ) -> Tuple[BaseExperience, Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Replace rewards with perfect bearoff values where applicable.
 
         Uses numpy for bearoff detection and table lookup (table is too large for GPU),
@@ -489,7 +485,7 @@ class TrainingWorker(BaseWorker):
             batch: Batch of experiences
 
         Returns:
-            Tuple of (modified_batch, bearoff_metrics)
+            Tuple of (modified_batch, bearoff_metrics, value_targets, value_masks, value_sample_weights)
             bearoff_metrics includes:
                 - bearoff_count: number of bearoff positions
                 - total_count: total batch size
@@ -497,11 +493,19 @@ class TrainingWorker(BaseWorker):
         """
         if self._bearoff_table_np is None or not self.bearoff_enabled:
             batch_size = batch.reward.shape[0]
-            return batch, {
-                'bearoff_count': jnp.array(0),
-                'total_count': jnp.array(batch_size),
-                'is_bearoff_mask': jnp.zeros(batch_size, dtype=jnp.bool_),
-            }
+            target_reward = batch.reward[jnp.arange(batch_size), batch.cur_player_id]
+            targets, masks = jax.vmap(reward_to_value_targets)(target_reward)
+            return (
+                batch,
+                {
+                    'bearoff_count': jnp.array(0),
+                    'total_count': jnp.array(batch_size),
+                    'is_bearoff_mask': jnp.zeros(batch_size, dtype=jnp.bool_),
+                },
+                targets,
+                masks,
+                jnp.ones(batch_size, dtype=jnp.float32),
+            )
 
         batch_size = batch.observation_nn.shape[0]
 
@@ -542,7 +546,13 @@ class TrainingWorker(BaseWorker):
         # =========================================================================
         bearoff_count = int(np.sum(is_bearoff))
 
-        # Collect target probs for bearoff positions
+        # Precompute default targets/masks from discrete rewards
+        target_reward_np = rewards_np[np.arange(batch_size), cur_player_np]
+        default_targets, default_masks = reward_to_value_targets(jnp.array(target_reward_np))
+        value_targets_np = np.array(default_targets)
+        value_masks_np = np.array(default_masks)
+
+        # Collect target probs for bearoff positions and override targets/masks
         for i in range(batch_size):
             if is_bearoff[i]:
                 board = boards[i]
@@ -554,7 +564,21 @@ class TrainingWorker(BaseWorker):
                 x_idx = position_to_index_fast(x_pos)
                 o_idx = position_to_index_fast(o_pos)
 
-                target_probs_list.append(self._get_bearoff_target_probs(x_idx, o_idx, cur_player))
+                bearoff_targets = self._get_bearoff_target_probs(x_idx, o_idx, cur_player)
+                target_probs_list.append(bearoff_targets)
+
+                # Override targets/masks with perfect bearoff values
+                value_targets_np[i] = bearoff_targets
+                win_prob, gam_win_cond, gam_loss_cond, _ = bearoff_targets
+                has_win = win_prob > 0.0
+                has_loss = (1.0 - win_prob) > 0.0
+                has_gammon = (gam_win_cond > 0.0) or (gam_loss_cond > 0.0)
+                value_masks_np[i] = np.array([
+                    1.0,
+                    1.0 if has_win else 0.0,
+                    1.0 if has_loss else 0.0,
+                    1.0 if has_gammon else 0.0,
+                ], dtype=np.float32)
             else:
                 target_probs_list.append(None)
 
@@ -575,6 +599,15 @@ class TrainingWorker(BaseWorker):
         new_rewards_jax = jnp.array(new_rewards)
         modified_batch = batch.replace(reward=new_rewards_jax)
 
+        # Prepare value targets/masks/weights
+        value_targets = jnp.array(value_targets_np, dtype=jnp.float32)
+        value_masks = jnp.array(value_masks_np, dtype=jnp.float32)
+        value_sample_weights = jnp.where(
+            jnp.array(is_bearoff),
+            jnp.array(self.bearoff_value_weight, dtype=jnp.float32),
+            jnp.ones(batch_size, dtype=jnp.float32),
+        )
+
         # Metrics - include mask for separate loss tracking
         is_bearoff_jax = jnp.array(is_bearoff)
         metrics = {
@@ -588,7 +621,7 @@ class TrainingWorker(BaseWorker):
             # Index 1 is gam_win_cond (conditional P(gammon | win))
             metrics['bearoff_avg_gam_win_cond'] = jnp.array(float(np.mean(stacked[:, 1])))
 
-        return modified_batch, metrics
+        return modified_batch, metrics, value_targets, value_masks, value_sample_weights
 
     def _setup_mlflow(self) -> None:
         """Set up MLflow tracking if configured."""
@@ -1031,7 +1064,10 @@ class TrainingWorker(BaseWorker):
         self,
         train_state: TrainState,
         batch: BaseExperience,
-        sample_weights: jnp.ndarray,
+        value_targets: jnp.ndarray,
+        value_masks: jnp.ndarray,
+        value_sample_weights: jnp.ndarray,
+        policy_sample_weights: jnp.ndarray,
     ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
         """Perform a single training step with per-sample weights.
 
@@ -1041,7 +1077,10 @@ class TrainingWorker(BaseWorker):
         Args:
             train_state: Current training state.
             batch: Batch of experiences.
-            sample_weights: Per-sample weights (e.g., bearoff_value_weight for bearoff positions).
+            value_targets: Precomputed 4-way value targets.
+            value_masks: Masks indicating which value targets are active.
+            value_sample_weights: Per-sample weights for value loss (e.g., bearoff_value_weight).
+            policy_sample_weights: Per-sample weights for policy loss.
 
         Returns:
             Tuple of (updated_train_state, metrics_dict).
@@ -1052,7 +1091,10 @@ class TrainingWorker(BaseWorker):
             train_state.params,
             train_state,
             batch,
-            sample_weights
+            value_targets,
+            value_masks,
+            value_sample_weights,
+            policy_sample_weights,
         )
 
         # Apply gradients
@@ -1111,32 +1153,30 @@ class TrainingWorker(BaseWorker):
             traceback.print_exc()
             return None
 
-        # Apply perfect bearoff values where applicable
-        bearoff_metrics = None
-        sample_weights = None
-        if self._bearoff_table is not None and self.bearoff_enabled:
-            try:
-                jax_batch, bearoff_metrics = self._apply_bearoff_values_to_batch(jax_batch)
-                # Create sample weights: bearoff_value_weight for bearoff, 1.0 for others
-                is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
-                sample_weights = jnp.where(
-                    is_bearoff_mask,
-                    self.bearoff_value_weight,
-                    1.0
-                )
-            except Exception as e:
-                print(f"Worker {self.worker_id}: Error applying bearoff values: {e}")
-                import traceback
-                traceback.print_exc()
+        # Apply perfect bearoff values and build value targets/masks/weights
+        try:
+            jax_batch, bearoff_metrics, value_targets, value_masks, value_sample_weights = self._apply_bearoff_values_to_batch(jax_batch)
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Error applying bearoff values: {e}")
+            import traceback
+            traceback.print_exc()
+            bearoff_metrics = None
+            batch_size = jax_batch.reward.shape[0]
+            target_reward = jax_batch.reward[jnp.arange(batch_size), jax_batch.cur_player_id]
+            value_targets, value_masks = jax.vmap(reward_to_value_targets)(target_reward)
+            value_sample_weights = jnp.ones(batch_size, dtype=jnp.float32)
+
+        # Keep policy samples unweighted; bearoff logits come from self-play
+        policy_sample_weights = jnp.ones_like(value_sample_weights)
 
         # Perform training step - always use weighted version for 4-way value head
-        # If sample_weights is None, use uniform weights of 1.0
-        if sample_weights is None:
-            sample_weights = jnp.ones(jax_batch.reward.shape[0])
         self._train_state, metrics = self._train_step_weighted(
             self._train_state,
             jax_batch,
-            sample_weights,
+            value_targets,
+            value_masks,
+            value_sample_weights,
+            policy_sample_weights,
         )
 
         # Convert metrics to Python floats
@@ -1167,17 +1207,12 @@ class TrainingWorker(BaseWorker):
                     jnp.finfo(jnp.float32).min
                 )
 
-                # Get target values and masks for 4-way value head
-                current_player = jax_batch.cur_player_id
-                target_reward = jax_batch.reward[jnp.arange(jax_batch.reward.shape[0]), current_player]
-                targets, masks = jax.vmap(reward_to_value_targets)(target_reward)
-
                 # Compute per-sample 4-way masked BCE value loss
                 # Numerically stable sigmoid cross-entropy per element
-                bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
-                masked_bce = bce * masks
+                bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * value_targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
+                masked_bce = bce * value_masks
                 # Per-sample loss = sum over 4 outputs / count of active masks
-                per_sample_mask_count = jnp.sum(masks, axis=-1)
+                per_sample_mask_count = jnp.sum(value_masks, axis=-1)
                 value_ce = jnp.sum(masked_bce, axis=-1) / jnp.maximum(per_sample_mask_count, 1.0)
 
                 # Compute per-sample policy cross-entropy
@@ -1354,7 +1389,7 @@ class TrainingWorker(BaseWorker):
         ).set(1)
 
         print(f"Worker {self.worker_id}: Collection-gated training mode")
-        print(f"Worker {self.worker_id}: Will train {self.steps_per_game} steps "
+        print(f"Worker {self.worker_id}: Will train {self.steps_per_epoch} steps "
               f"for every {self.games_per_epoch} games collected")
 
         start_time = time.time()
@@ -1438,11 +1473,13 @@ class TrainingWorker(BaseWorker):
 
             # Calculate how many steps to train
             # Train proportionally to games collected, catching up if behind
-            target_steps = new_games * self.steps_per_game
+            epoch_scale = new_games / max(self.games_per_epoch, 1)
+            target_steps = math.ceil(epoch_scale * self.steps_per_epoch)
 
             print(
                 f"Worker {self.worker_id}: Training epoch triggered! "
-                f"{new_games} new games -> {target_steps} training steps"
+                f"{new_games} new games -> {target_steps} training steps "
+                f"({epoch_scale:.2f} epochs)"
             )
 
             # Pause game collection for exclusive GPU access during training
@@ -1660,7 +1697,7 @@ class TrainingWorker(BaseWorker):
             'total_games': current_games,
             # Collection-gated training stats
             'games_per_epoch': self.games_per_epoch,
-            'steps_per_game': self.steps_per_game,
+            'steps_per_epoch': self.steps_per_epoch,
             'total_training_batches': self._training_stats.total_batches_trained,
             'games_at_last_train': self._training_stats.games_at_last_train,
             'games_since_last_train': current_games - self._training_stats.games_at_last_train,

@@ -3,13 +3,13 @@
 # Workers connect to Redis directly (no Ray required)
 #
 # Usage:
-#   ./scripts/start_worker.sh                          # Start game worker (default)
-#   ./scripts/start_worker.sh game                     # Start game worker
-#   ./scripts/start_worker.sh eval                     # Start eval worker
-#   ./scripts/start_worker.sh game eval                # Start both workers
-#   ./scripts/start_worker.sh game --game-batch-size 32    # Override game batch size
-#   ./scripts/start_worker.sh eval --eval-batch-size 16    # Override eval batch size
-#   ./scripts/start_worker.sh game eval -g 32 -e 16        # Both with overrides
+#   ./scripts/worker_start.sh                          # Start game worker (default)
+#   ./scripts/worker_start.sh game                     # Start game worker
+#   ./scripts/worker_start.sh eval                     # Start eval worker
+#   ./scripts/worker_start.sh game eval                # Start both workers
+#   ./scripts/worker_start.sh game --game-batch-size 32    # Override game batch size
+#   ./scripts/worker_start.sh eval --eval-batch-size 16    # Override eval batch size
+#   ./scripts/worker_start.sh game eval -g 32 -e 16        # Both with overrides
 #
 # Environment:
 #   WORKER_ID       - Override auto-generated worker ID
@@ -151,9 +151,10 @@ if [[ ${#WORKER_TYPES[@]} -eq 0 ]]; then
     WORKER_TYPES=("game")
 fi
 
-# Generate worker ID if not provided
+# Generate worker ID if not provided.
+# Default to hostname only; device/platform is tracked separately in Redis/metrics.
 if [[ -z "$CUSTOM_WORKER_ID" ]]; then
-    WORKER_ID_BASE="${PLATFORM}-${HOSTNAME_SHORT}"
+    WORKER_ID_BASE="${HOSTNAME_SHORT}"
 else
     WORKER_ID_BASE="$CUSTOM_WORKER_ID"
 fi

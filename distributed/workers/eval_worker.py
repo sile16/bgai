@@ -877,6 +877,29 @@ class EvalWorker(BaseWorker):
             metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
+        # Pre-initialize evaluation metrics so Grafana shows series
+        # even before the first evaluation completes.
+        current_version_str = str(self.current_model_version)
+        for eval_type in self.enabled_eval_types:
+            metrics.eval_win_rate.labels(
+                eval_type=eval_type, model_version=current_version_str
+            ).set(0.0)
+            metrics.eval_avg_game_length.labels(
+                eval_type=eval_type, model_version=current_version_str
+            ).set(0.0)
+            metrics.eval_games_total.labels(
+                worker_id=self.worker_id, eval_type=eval_type
+            ).inc(0)
+            metrics.eval_wins.labels(
+                worker_id=self.worker_id, eval_type=eval_type
+            ).inc(0)
+            metrics.eval_losses.labels(
+                worker_id=self.worker_id, eval_type=eval_type
+            ).inc(0)
+            metrics.eval_runs_total.labels(
+                worker_id=self.worker_id, eval_type=eval_type
+            ).inc(0)
+
         # Register metrics endpoint (use actual bound port)
         register_metrics_endpoint(
             self.buffer.redis,

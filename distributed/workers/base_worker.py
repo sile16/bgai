@@ -216,6 +216,15 @@ class BaseWorker(ABC):
         try:
             stats = self.stats.get_heartbeat_stats(reset=True)
             stats['model_version'] = self.current_model_version
+            # Refresh identity fields so reused worker_ids don't show stale hosts/devices
+            stats['hostname'] = socket.gethostname()
+            stats['metrics_port'] = self.metrics_port
+            stats['device_type'] = (
+                'cuda' if self.device_info.is_cuda else
+                'metal' if self.device_info.is_metal else
+                'cpu'
+            )
+            stats['device_name'] = self.device_info.device_kind
 
             success = self.state.heartbeat_worker(
                 self.worker_id,

@@ -14,8 +14,12 @@ checkpoints
 data/
 rust/bearoff/target
 prometheus-3.8*
+tools/prometheus-*/
+tools/prometheus/
+tools/prometheus-data/
+tools/bgai_prometheus_targets.json
 bgai/endgame/gnubg*
-
+tools/grafana-11.3.0
 
 # C extensions
 *.so

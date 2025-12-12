@@ -2243,7 +2243,7 @@
       },
       "targets": [
         {
-          "expr": "max(bgai_eval_win_rate{eval_type=\"random\"})",
+          "expr": "last_over_time(bgai_eval_win_rate{eval_type=\"random\"}[24h])",
           "legendFormat": "vs Random",
           "refId": "A"
         }
@@ -2275,7 +2275,7 @@
       },
       "targets": [
         {
-          "expr": "max(bgai_eval_win_rate{eval_type=\"gnubg\"})",
+          "expr": "last_over_time(bgai_eval_win_rate{eval_type=\"gnubg\"}[24h])",
           "legendFormat": "vs GNUBG",
           "refId": "A"
         }
@@ -2307,7 +2307,7 @@
       },
       "targets": [
         {
-          "expr": "max(bgai_eval_win_rate{eval_type=\"self_play\"})",
+          "expr": "last_over_time(bgai_eval_win_rate{eval_type=\"self_play\"}[24h])",
           "legendFormat": "Self-Play",
           "refId": "A"
         }
@@ -2339,7 +2339,7 @@
       },
       "targets": [
         {
-          "expr": "max(bgai_eval_avg_game_length)",
+          "expr": "last_over_time(bgai_eval_avg_game_length[24h])",
           "legendFormat": "Avg Length",
           "refId": "A"
         }

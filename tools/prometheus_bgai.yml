@@ -9,15 +9,9 @@ global:
   evaluation_interval: 10s
 
 scrape_configs:
-# Scrape from each Ray node (Ray's own metrics)
-- job_name: 'ray'
-  file_sd_configs:
-  - files:
-    - '/tmp/ray/prom_metrics_service_discovery.json'
-
 # Scrape BGAI workers (dynamically discovered via Redis)
 - job_name: 'bgai_workers'
   file_sd_configs:
   - files:
-    - '/tmp/bgai_prometheus_targets.json'
+    - 'tools/bgai_prometheus_targets.json'
     refresh_interval: 15s

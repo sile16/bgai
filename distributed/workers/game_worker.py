@@ -560,7 +560,7 @@ class GameWorker(BaseWorker):
             truncated = truncateds[i]
 
             if terminated or truncated:
-                if terminated and len(state['episode_experiences'][i]) > 0:
+                if terminated and not truncated and len(state['episode_experiences'][i]) > 0:
                     send_start = time.perf_counter()
                     self._send_episode_to_buffer(
                         state['episode_experiences'][i],

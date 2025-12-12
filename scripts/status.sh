@@ -19,4 +19,4 @@ CONFIG_FILE="$PROJECT_DIR/configs/distributed.yaml"
 
 echo "=== BGAI Cluster Status ==="
 python -m distributed.cli.main status \
-    --config-file "$CONFIG_FILE" 2>/dev/null || echo "No workers registered (start with ./scripts/start_all_head.sh)"
+    --config-file "$CONFIG_FILE" 2>/dev/null || echo "No workers registered (start with ./scripts/head_start.sh)"

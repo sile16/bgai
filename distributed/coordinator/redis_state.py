@@ -390,6 +390,14 @@ class RedisStateManager:
                 info.status = stats['status']
             if 'model_version' in stats:
                 info.model_version = stats['model_version']
+            if 'hostname' in stats:
+                info.hostname = stats['hostname']
+            if 'metrics_port' in stats:
+                info.metrics_port = int(stats['metrics_port'])
+            if 'device_type' in stats:
+                info.device_type = stats['device_type']
+            if 'device_name' in stats:
+                info.device_name = stats['device_name']
 
         self.redis.setex(key, ttl, info.to_json())
         return True

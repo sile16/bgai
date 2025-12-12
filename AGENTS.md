@@ -13,12 +13,12 @@ This is a **single-user ML research project**. The codebase and all hosts are fu
 
 | Directory | Purpose | Details |
 |-----------|---------|---------|
-| `bgai/` | Backgammon environment | [bgai/CLAUDE.md](bgai/CLAUDE.md) |
-| `distributed/` | Worker coordination | [distributed/CLAUDE.md](distributed/CLAUDE.md) |
+| `bgai/` | Backgammon environment | [bgai/AGENTS.md](bgai/AGENTS.md) |
+| `distributed/` | Worker coordination | [distributed/AGENTS.md](distributed/AGENTS.md) |
 | `distributed/` | ML training pipeline | [distributed/TRAINING.md](distributed/TRAINING.md) |
-| `benchmarks/` | Performance benchmarking | [benchmarks/CLAUDE.md](benchmarks/CLAUDE.md) |
-| `tests/` | Test suite | [tests/CLAUDE.md](tests/CLAUDE.md) |
-| `tools/` | Monitoring & visualization | [tools/CLAUDE.md](tools/CLAUDE.md) |
+| `benchmarks/` | Performance benchmarking | [benchmarks/AGENTS.md](benchmarks/AGENTS.md) |
+| `tests/` | Test suite | [tests/AGENTS.md](tests/AGENTS.md) |
+| `tools/` | Monitoring & visualization | [tools/AGENTS.md](tools/AGENTS.md) |
 | `configs/` | Configuration files | `distributed.yaml` |
 | `scripts/` | Startup/management scripts | |
 | `docs/` | Design documents | |
@@ -30,7 +30,7 @@ This is a **single-user ML research project**. The codebase and all hosts are fu
 pip install -r requirements.txt
 
 # Start training cluster
-./scripts/start_all_head.sh
+./scripts/head_start.sh
 
 # Check status
 ./scripts/status.sh
@@ -77,7 +77,7 @@ python benchmark.py stochastic-mcts --validate
 
 **Add remote worker:**
 ```bash
-./scripts/start_game_worker.sh  # On remote machine
+./scripts/worker_start.sh game  # On remote machine
 ```
 
 **Run tests:**

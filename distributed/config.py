@@ -17,77 +17,78 @@ import yaml
 @dataclass
 class MCTSConfig:
     """MCTS evaluator configuration."""
-    collect_simulations: int = 100  # MCTS iterations for game collection
-    eval_simulations: int = 50      # MCTS iterations for evaluation
-    max_nodes: int = 400
-    warm_tree_simulations: int = 0  # MCTS sims for warm tree (0 = disabled)
-    persist_tree: bool = True
-    temperature_start: float = 0.8
-    temperature_end: float = 0.2
-    temperature_epochs: int = 50    # Epochs to decay from start to end
-    discount: float = -1.0  # -1 for two-player zero-sum games
+    collect_simulations: Optional[int] = None  # MCTS iterations for game collection
+    eval_simulations: Optional[int] = None     # MCTS iterations for evaluation
+    max_nodes: Optional[int] = None
+    warm_tree_simulations: Optional[int] = None  # MCTS sims for warm tree (0 = disabled)
+    persist_tree: Optional[bool] = None
+    temperature_start: Optional[float] = None
+    temperature_end: Optional[float] = None
+    temperature_epochs: Optional[int] = None    # Epochs to decay from start to end
+    discount: Optional[float] = None  # -1 for two-player zero-sum games
 
 
 @dataclass
 class TrainingConfig:
     """Neural network training configuration."""
-    batch_size: int = 128
-    learning_rate: float = 3e-4
-    l2_reg_lambda: float = 1e-4
-    games_per_epoch: int = 10           # New games before training epoch
-    surprise_weight: float = 0.5        # Blend of uniform vs surprise-weighted sampling
-    checkpoint_epoch_interval: int = 5  # Epochs between checkpoints
-    max_checkpoints: int = 5
-    bearoff_enabled: bool = False
-    bearoff_value_weight: float = 2.0
-    lookup_enabled: bool = False
-    lookup_learning_weight: float = 1.5
+    batch_size: Optional[int] = None
+    learning_rate: Optional[float] = None
+    l2_reg_lambda: Optional[float] = None
+    games_per_epoch: Optional[int] = None           # New games before training epoch
+    steps_per_epoch: Optional[int] = None           # Training steps per epoch
+    surprise_weight: Optional[float] = None         # Blend of uniform vs surprise-weighted sampling
+    checkpoint_epoch_interval: Optional[int] = None # Epochs between checkpoints
+    max_checkpoints: Optional[int] = None
+    bearoff_enabled: Optional[bool] = None
+    bearoff_value_weight: Optional[float] = None
+    lookup_enabled: Optional[bool] = None
+    lookup_learning_weight: Optional[float] = None
 
 
 @dataclass
 class GameConfig:
     """Game/self-play configuration."""
-    batch_size: int = 16  # Parallel games per worker
-    max_episode_steps: int = 500
-    short_game: bool = True         # Start from mid-game position
-    simple_doubles: bool = False    # Limit randomness with simple doubles
+    batch_size: Optional[int] = None  # Parallel games per worker
+    max_episode_steps: Optional[int] = None
+    short_game: Optional[bool] = None         # Start from mid-game position
+    simple_doubles: Optional[bool] = None    # Limit randomness with simple doubles
 
 
 @dataclass
 class RedisConfig:
     """Redis connection configuration."""
-    host: str = "localhost"
-    port: int = 6379
-    db: int = 0
+    host: Optional[str] = None
+    port: Optional[int] = None
+    db: Optional[int] = None
     password: Optional[str] = None
-    buffer_capacity: int = 100000
-    episode_capacity: int = 5000
+    buffer_capacity: Optional[int] = None
+    episode_capacity: Optional[int] = None
 
 
 @dataclass
 class CoordinatorConfig:
     """Coordinator/head node configuration."""
-    heartbeat_timeout: float = 30.0
-    heartbeat_interval: float = 10.0
-    weight_push_interval: int = 10  # Push weights every N training steps
-    ray_port: int = 10001
-    dashboard_port: int = 8265
+    heartbeat_timeout: Optional[float] = None
+    heartbeat_interval: Optional[float] = None
+    weight_push_interval: Optional[int] = None  # Push weights every N training steps
+    ray_port: Optional[int] = None
+    dashboard_port: Optional[int] = None
 
 
 @dataclass
 class WorkerConfig:
     """Worker node configuration."""
-    worker_type: str = "game"  # 'game', 'training', 'evaluation'
-    prefer_gpu: bool = True
-    auto_config: bool = True  # Auto-configure based on device
+    worker_type: Optional[str] = None  # 'game', 'training', 'evaluation'
+    prefer_gpu: Optional[bool] = None
+    auto_config: Optional[bool] = None  # Auto-configure based on device
 
 
 @dataclass
 class NetworkConfig:
     """Neural network architecture configuration."""
-    hidden_dim: int = 256
-    num_blocks: int = 6
-    num_actions: int = 156  # Backgammon action space
+    hidden_dim: Optional[int] = None
+    num_blocks: Optional[int] = None
+    num_actions: Optional[int] = None  # Backgammon action space
 
 
 @dataclass
@@ -103,25 +104,13 @@ class DistributedConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
 
     # Paths
-    checkpoint_dir: str = "./checkpoints"
-    log_dir: str = "./logs"
+    checkpoint_dir: Optional[str] = None
+    log_dir: Optional[str] = None
 
     # Device-specific overrides (applied based on detected device)
-    cuda_overrides: Dict[str, Any] = field(default_factory=lambda: {
-        'mcts': {'simulations': 200, 'max_nodes': 800},
-        'game': {'batch_size': 64},
-        'training': {'batch_size': 256},
-    })
-    metal_overrides: Dict[str, Any] = field(default_factory=lambda: {
-        'mcts': {'simulations': 100, 'max_nodes': 400},
-        'game': {'batch_size': 16},
-        'training': {'batch_size': 128},
-    })
-    cpu_overrides: Dict[str, Any] = field(default_factory=lambda: {
-        'mcts': {'simulations': 50, 'max_nodes': 200},
-        'game': {'batch_size': 4},
-        'training': {'batch_size': 64},
-    })
+    cuda_overrides: Dict[str, Any] = field(default_factory=dict)
+    metal_overrides: Dict[str, Any] = field(default_factory=dict)
+    cpu_overrides: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
