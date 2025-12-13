@@ -136,6 +136,14 @@ class EvalWorker(BaseWorker):
             worker_id=self.worker_id,
         )
 
+        # Prometheus metrics discovery registration. Eval runs can be long, so
+        # refresh the Redis heartbeat periodically during evaluations to avoid
+        # disappearing from Prometheus/Grafana.
+        self._metrics_port: Optional[int] = None
+        self._metrics_ttl_seconds = 60
+        self._metrics_refresh_interval_seconds = 15.0
+        self._last_metrics_refresh_time = 0.0
+
         # Environment setup (lazy initialization)
         self._env = None
         self._env_step_fn = None
@@ -168,6 +176,27 @@ class EvalWorker(BaseWorker):
             'redis_port': redis_port,
             'redis_password': redis_password,
         })
+
+    def _refresh_metrics_registration(self, force: bool = False) -> None:
+        if self._metrics_port is None:
+            return
+
+        now = time.time()
+        if (not force) and (now - self._last_metrics_refresh_time) < self._metrics_refresh_interval_seconds:
+            return
+
+        try:
+            register_metrics_endpoint(
+                self.buffer.redis,
+                worker_id=self.worker_id,
+                worker_type='eval',
+                port=self._metrics_port,
+                ttl_seconds=self._metrics_ttl_seconds,
+            )
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Failed to refresh metrics registration: {e}")
+        else:
+            self._last_metrics_refresh_time = now
 
     @property
     def worker_type(self) -> str:
@@ -723,6 +752,7 @@ class EvalWorker(BaseWorker):
         for game_idx in range(self.eval_games):
             if not self.running:
                 break
+            self._refresh_metrics_registration()
 
             key, self._rng_key = jax.random.split(self._rng_key)
 
@@ -782,6 +812,7 @@ class EvalWorker(BaseWorker):
         for game_idx in range(self.eval_games):
             if not self.running:
                 break
+            self._refresh_metrics_registration()
 
             key, self._rng_key = jax.random.split(self._rng_key)
 
@@ -800,8 +831,13 @@ class EvalWorker(BaseWorker):
 
             game_length = 0
             done = False
+            last_refresh_time = time.time()
 
             while not done and game_length < max_steps:
+                if time.time() - last_refresh_time >= self._metrics_refresh_interval_seconds:
+                    self._refresh_metrics_registration(force=True)
+                    last_refresh_time = time.time()
+
                 key, step_key = jax.random.split(key)
                 current_player = int(metadata.cur_player_id)
 
@@ -897,6 +933,7 @@ class EvalWorker(BaseWorker):
             print(f"Worker {self.worker_id}: Failed to start metrics server")
             metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
+        self._metrics_port = metrics_port
 
         # Pre-initialize evaluation metrics so Grafana shows series
         # even before the first evaluation completes.
@@ -917,13 +954,7 @@ class EvalWorker(BaseWorker):
             ).inc(0)
 
         # Register metrics endpoint (use actual bound port)
-        register_metrics_endpoint(
-            self.buffer.redis,
-            worker_id=self.worker_id,
-            worker_type='eval',
-            port=metrics_port,
-            ttl_seconds=60,
-        )
+        self._refresh_metrics_registration(force=True)
 
         # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
@@ -977,13 +1008,7 @@ class EvalWorker(BaseWorker):
                 time.sleep(5.0)
 
                 # Refresh metrics registration
-                register_metrics_endpoint(
-                    self.buffer.redis,
-                    worker_id=self.worker_id,
-                    worker_type='eval',
-                    port=metrics_port,
-                    ttl_seconds=60,
-                )
+                self._refresh_metrics_registration(force=True)
                 metrics.worker_phase.labels(
                     worker_id=self.worker_id, worker_type='eval'
                 ).set(WorkerPhase.IDLE)
@@ -994,6 +1019,7 @@ class EvalWorker(BaseWorker):
                 f"Worker {self.worker_id}: Running {eval_type} evaluation "
                 f"for model v{model_version}"
             )
+            self._refresh_metrics_registration(force=True)
             metrics.worker_phase.labels(
                 worker_id=self.worker_id, worker_type='eval'
             ).set(WorkerPhase.EVALUATING)
@@ -1011,6 +1037,7 @@ class EvalWorker(BaseWorker):
 
                 # Log to MLflow
                 self._log_mlflow_eval_metrics(result)
+                self._refresh_metrics_registration(force=True)
             else:
                 # Failed, remove from in-progress
                 task_id = f"v{model_version}:{eval_type}"
