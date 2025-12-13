@@ -447,29 +447,36 @@ class TrainingWorker(BaseWorker):
         if self._bearoff_table_np is None:
             return 0.0
 
-        # Extract X's home board (points 0-5)
-        x_pos = np.maximum(0, board[0:6])
-
-        # Extract O's home board (points 18-23, stored as negative)
-        # Flip the order so o_pos[0] = O's point closest to bear off
-        o_pos = np.maximum(0, -board[23:17:-1])
+        # Board is always in "current player = black" orientation (PGX flips board each turn).
+        # Current player's home board is points 18-23 (with 23 closest to bear-off).
+        # Opponent's home board is points 0-5 (with 0 closest to bear-off).
+        cur_home = np.maximum(0, board[23:17:-1])   # point 1..6 for current player
+        opp_home = np.maximum(0, -board[0:6])       # point 1..6 for opponent
 
         from bgai.endgame.indexing import position_to_index_fast
 
-        x_idx = position_to_index_fast(x_pos)
-        o_idx = position_to_index_fast(o_pos)
+        x_idx = position_to_index_fast(cur_home)
+        o_idx = position_to_index_fast(opp_home)
 
-        probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player)
-        p_win = probs[0]
-        p_gammon_win = probs[1]
-        p_gammon_loss = probs[3]
+        # Use V4's native 4-way conditional format when available.
+        if isinstance(self._bearoff_lookup, V4BearoffLookup):
+            win, gam_win_cond, gam_loss_cond, _ = self._bearoff_lookup.get_4way_values(x_idx, o_idx)
+            p_gammon_win = win * gam_win_cond
+            p_gammon_loss = (1.0 - win) * gam_loss_cond
+            p_win = win
+        else:
+            # Legacy tables return unconditional gammons: [win, gam_win, loss, gam_loss, ...]
+            probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player=0)
+            p_win = float(probs[0])
+            p_gammon_win = float(probs[1])
+            p_gammon_loss = float(probs[3])
 
         # Cubeless equity with gammons valued at 2 points
         equity = (2.0 * p_win - 1.0) + (p_gammon_win - p_gammon_loss)
         return float(equity)
 
     def _get_bearoff_prob_vector(self, x_idx: int, o_idx: int, cur_player: int) -> np.ndarray:
-        """Return [win, gammon_win, loss, gammon_loss, (opt cube eq...)] for current player."""
+        """Return legacy-format probs for compatibility: [win, gam_win, loss, gam_loss, ...]."""
         if self._bearoff_lookup is None:
             return np.zeros(4, dtype=np.float32)
 
@@ -485,20 +492,18 @@ class TrainingWorker(BaseWorker):
             - gam_loss_cond: P(gammon | loss) - conditional probability
             - bg_rate: P(backgammon | gammon) - always 0 for bearoff
         """
+        # V4 tables natively store the NN's expected 4-way conditional values.
+        if isinstance(self._bearoff_lookup, V4BearoffLookup):
+            return self._bearoff_lookup.get_4way_values(x_idx, o_idx)
+
+        # Legacy tables expose unconditional gammons: [win, gam_win, loss, gam_loss, ...]
         probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player)
-        win, gammon_win_uncond, loss, gammon_loss_uncond = probs[0], probs[1], probs[2], probs[3]
+        win, gam_win_uncond, loss, gam_loss_uncond = float(probs[0]), float(probs[1]), float(probs[2]), float(probs[3])
 
-        # Convert unconditional gammon probabilities to conditional
-        # gam_win_cond = P(gammon | win) = P(gammon AND win) / P(win)
-        gam_win_cond = gammon_win_uncond / max(win, 1e-8) if win > 0 else 0.0
-        gam_loss_cond = gammon_loss_uncond / max(loss, 1e-8) if loss > 0 else 0.0
+        gam_win_cond = gam_win_uncond / max(win, 1e-8) if win > 0 else 0.0
+        gam_loss_cond = gam_loss_uncond / max(loss, 1e-8) if loss > 0 else 0.0
 
-        return np.array([
-            win,           # P(win)
-            gam_win_cond,  # P(gammon | win)
-            gam_loss_cond, # P(gammon | loss)
-            0.0,           # P(backgammon | gammon) - impossible in bearoff
-        ], dtype=np.float32)
+        return np.array([win, gam_win_cond, gam_loss_cond, 0.0], dtype=np.float32)
 
     def _apply_bearoff_values_to_batch(
         self,
@@ -590,12 +595,15 @@ class TrainingWorker(BaseWorker):
                 cur_player = int(cur_player_np[i])
 
                 # Index positions for lookup
-                x_pos = np.maximum(0, board[0:6])
-                o_pos = np.maximum(0, -board[23:17:-1])
+                cur_home = np.maximum(0, board[23:17:-1])   # current player point 1..6
+                opp_home = np.maximum(0, -board[0:6])       # opponent point 1..6
+                x_pos = cur_home
+                o_pos = opp_home
                 x_idx = position_to_index_fast(x_pos)
                 o_idx = position_to_index_fast(o_pos)
 
-                bearoff_targets = self._get_bearoff_target_probs(x_idx, o_idx, cur_player)
+                # Observation is already from current player's perspective; lookup uses that orientation.
+                bearoff_targets = self._get_bearoff_target_probs(x_idx, o_idx, cur_player=0)
                 target_probs_list.append(bearoff_targets)
 
                 # Override targets/masks with perfect bearoff values
