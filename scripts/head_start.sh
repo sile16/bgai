@@ -271,7 +271,7 @@ XLA_PYTHON_CLIENT_ALLOCATOR=platform \
 python -m distributed.cli.main eval-worker \
     --config-file "$CONFIG_FILE" \
     --eval-games 50 \
-    --eval-types "random,self_play" \
+    --eval-types "random,gnubg" \
     --num-gpus 0 \
     > "$LOG_DIR/eval_$TIMESTAMP.log" 2>&1 &
 EVAL_PID=$!
