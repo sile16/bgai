@@ -15,6 +15,8 @@ No Ray dependency - uses Redis for all coordination.
 
 import time
 import os
+import threading
+import queue
 from functools import partial
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -278,6 +280,12 @@ class TrainingWorker(BaseWorker):
         # Surprise-weighted sampling configuration
         # 0 = uniform sampling, 1 = fully surprise-weighted
         self.surprise_weight = self.config.get('surprise_weight', 0.5)
+
+        # Prefetch batches in a background thread to overlap Redis I/O with GPU compute.
+        # This is a best-effort throughput optimization; set to 0 to disable.
+        self.prefetch_batches = int(self.config.get('prefetch_batches', 2))
+        self._prefetch_queue: Optional["queue.Queue[list]"] = None
+        self._prefetch_thread: Optional[threading.Thread] = None
 
         # Bearoff/endgame table configuration
         self.bearoff_enabled = self.config.get('bearoff_enabled', False)
@@ -1137,28 +1145,15 @@ class TrainingWorker(BaseWorker):
         Returns:
             Metrics dict or None if buffer is not ready.
         """
+        if self.prefetch_batches > 0:
+            self._ensure_prefetcher_started()
+
         # Check buffer size
         buffer_size = self.buffer.get_size()
         if buffer_size < self.min_buffer_size:
             return None
 
-        # Sample batch from Redis with surprise-weighted sampling
-        min_version = max(0, self.current_model_version - 10)  # Allow slightly old experiences
-
-        if self.surprise_weight > 0:
-            # Use surprise-weighted sampling
-            batch_data = self.buffer.sample_batch_surprise_weighted(
-                self.train_batch_size,
-                surprise_weight=self.surprise_weight,
-                min_model_version=min_version,
-            )
-        else:
-            # Uniform sampling
-            batch_data = self.buffer.sample_batch(
-                self.train_batch_size,
-                min_model_version=min_version,
-                require_rewards=True,
-            )
+        batch_data = self._get_next_batch_data()
 
         if len(batch_data) < self.train_batch_size:
             return None
@@ -1285,6 +1280,77 @@ class TrainingWorker(BaseWorker):
         self.stats.training_steps += 1
 
         return metrics
+
+    def _ensure_prefetcher_started(self) -> None:
+        if self._prefetch_thread is not None:
+            return
+        if self.prefetch_batches <= 0:
+            return
+        self._prefetch_queue = queue.Queue(maxsize=max(1, self.prefetch_batches))
+
+        def _runner():
+            while self.running:
+                try:
+                    # Check buffer size before trying to sample.
+                    if self.buffer.get_size() < self.min_buffer_size:
+                        time.sleep(0.2)
+                        continue
+
+                    # Sample batch from Redis with surprise-weighted sampling.
+                    min_version = max(0, self.current_model_version - 10)
+                    if self.surprise_weight > 0:
+                        batch_data = self.buffer.sample_batch_surprise_weighted(
+                            self.train_batch_size,
+                            surprise_weight=self.surprise_weight,
+                            min_model_version=min_version,
+                        )
+                    else:
+                        batch_data = self.buffer.sample_batch(
+                            self.train_batch_size,
+                            min_model_version=min_version,
+                            require_rewards=True,
+                        )
+
+                    if len(batch_data) < self.train_batch_size:
+                        time.sleep(0.05)
+                        continue
+
+                    # Best-effort: drop if queue is full.
+                    assert self._prefetch_queue is not None
+                    try:
+                        self._prefetch_queue.put(batch_data, timeout=0.1)
+                    except queue.Full:
+                        pass
+                except Exception:
+                    time.sleep(0.1)
+
+        self._prefetch_thread = threading.Thread(
+            target=_runner,
+            name=f"training-prefetch-{self.worker_id}",
+            daemon=True,
+        )
+        self._prefetch_thread.start()
+
+    def _get_next_batch_data(self):
+        if self._prefetch_queue is not None:
+            try:
+                return self._prefetch_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        # Fallback to synchronous sampling.
+        min_version = max(0, self.current_model_version - 10)  # Allow slightly old experiences
+        if self.surprise_weight > 0:
+            return self.buffer.sample_batch_surprise_weighted(
+                self.train_batch_size,
+                surprise_weight=self.surprise_weight,
+                min_model_version=min_version,
+            )
+        return self.buffer.sample_batch(
+            self.train_batch_size,
+            min_model_version=min_version,
+            require_rewards=True,
+        )
 
     def _get_current_games_count(self) -> int:
         """Get total number of completed games ever added (monotonic).
@@ -1418,6 +1484,7 @@ class TrainingWorker(BaseWorker):
         )
         min_backlog_steps = int(self.config.get('min_backlog_steps', 1))
         max_train_steps_per_batch = int(self.config.get('max_train_steps_per_batch', self.steps_per_epoch))
+        pause_collection_during_training = bool(self.config.get('pause_collection_during_training', False))
 
         print(f"Worker {self.worker_id}: Game-ratio-gated training mode")
         print(
@@ -1428,6 +1495,10 @@ class TrainingWorker(BaseWorker):
             f"Worker {self.worker_id}: Will train when backlog >= {min_backlog_steps} "
             f"(max per batch: {max_train_steps_per_batch})"
         )
+        if pause_collection_during_training:
+            print(f"Worker {self.worker_id}: Will pause collection during training (exclusive GPU)")
+        else:
+            print(f"Worker {self.worker_id}: Will NOT pause collection during training (shared GPU)")
 
         start_time = time.time()
         last_log_time = start_time
@@ -1554,9 +1625,10 @@ class TrainingWorker(BaseWorker):
                 f"new_games={new_games})"
             )
 
-            # Pause game collection for exclusive GPU access during training
-            self.state.set_collection_paused(True)
-            print(f"Worker {self.worker_id}: Paused game collection for training")
+            if pause_collection_during_training:
+                # Pause game collection for exclusive GPU access during training
+                self.state.set_collection_paused(True)
+                print(f"Worker {self.worker_id}: Paused game collection for training")
 
             # Set training phase
             set_phase(WorkerPhase.TRAINING)
@@ -1570,9 +1642,10 @@ class TrainingWorker(BaseWorker):
             # Back to idle after training completes
             set_phase(WorkerPhase.IDLE)
 
-            # Resume game collection
-            self.state.set_collection_paused(False)
-            print(f"Worker {self.worker_id}: Resumed game collection")
+            if pause_collection_during_training:
+                # Resume game collection
+                self.state.set_collection_paused(False)
+                print(f"Worker {self.worker_id}: Resumed game collection")
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games
