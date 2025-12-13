@@ -531,6 +531,7 @@ class TrainingWorker(BaseWorker):
                     'bearoff_count': jnp.array(0),
                     'total_count': jnp.array(batch_size),
                     'is_bearoff_mask': jnp.zeros(batch_size, dtype=jnp.bool_),
+                    'bearoff_avg_gam_win_cond': jnp.array(0.0, dtype=jnp.float32),
                 },
                 targets,
                 masks,
@@ -644,6 +645,7 @@ class TrainingWorker(BaseWorker):
             'bearoff_count': jnp.array(bearoff_count),
             'total_count': jnp.array(batch_size),
             'is_bearoff_mask': is_bearoff_jax,
+            'bearoff_avg_gam_win_cond': jnp.array(0.0, dtype=jnp.float32),
         }
         valid_targets = [tp for tp in target_probs_list if tp is not None]
         if valid_targets:
@@ -1177,17 +1179,8 @@ class TrainingWorker(BaseWorker):
             return None
 
         # Apply perfect bearoff values and build value targets/masks/weights
-        try:
-            jax_batch, bearoff_metrics, value_targets, value_masks, value_sample_weights = self._apply_bearoff_values_to_batch(jax_batch)
-        except Exception as e:
-            print(f"Worker {self.worker_id}: Error applying bearoff values: {e}")
-            import traceback
-            traceback.print_exc()
-            bearoff_metrics = None
-            batch_size = jax_batch.reward.shape[0]
-            target_reward = jax_batch.reward[jnp.arange(batch_size), jax_batch.cur_player_id]
-            value_targets, value_masks = jax.vmap(reward_to_value_targets)(target_reward)
-            value_sample_weights = jnp.ones(batch_size, dtype=jnp.float32)
+        # Fail fast: bearoff processing must not silently degrade training targets.
+        jax_batch, bearoff_metrics, value_targets, value_masks, value_sample_weights = self._apply_bearoff_values_to_batch(jax_batch)
 
         # Keep policy samples unweighted; bearoff logits come from self-play
         policy_sample_weights = jnp.ones_like(value_sample_weights)
@@ -1206,81 +1199,79 @@ class TrainingWorker(BaseWorker):
         metrics = {k: float(v) for k, v in metrics.items()}
 
         # Add bearoff metrics and compute separate value losses
-        if bearoff_metrics is not None:
-            bearoff_count = int(bearoff_metrics['bearoff_count'])
-            total_count = int(bearoff_metrics['total_count'])
-            metrics['bearoff_count'] = bearoff_count
-            metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
-            if 'bearoff_avg_gam_win_cond' in bearoff_metrics:
-                metrics['bearoff_avg_gam_win_cond'] = float(bearoff_metrics['bearoff_avg_gam_win_cond'])
+        bearoff_count = int(bearoff_metrics['bearoff_count'])
+        total_count = int(bearoff_metrics['total_count'])
+        metrics['bearoff_count'] = bearoff_count
+        metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
+        metrics['bearoff_avg_gam_win_cond'] = float(bearoff_metrics['bearoff_avg_gam_win_cond'])
 
-            # Compute separate losses for bearoff vs non-bearoff positions
-            is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
-            if bearoff_count > 0:
-                # Get predictions for the batch (no grad computation)
-                pred_policy_logits, pred_value_logits = self._train_state.apply_fn(
-                    {'params': self._train_state.params},
-                    x=jax_batch.observation_nn,
-                )
+        # Compute separate losses for bearoff vs non-bearoff positions
+        is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
+        if bearoff_count > 0:
+            # Get predictions for the batch (no grad computation)
+            pred_policy_logits, pred_value_logits = self._train_state.apply_fn(
+                {'params': self._train_state.params},
+                x=jax_batch.observation_nn,
+            )
 
-                # Mask invalid actions in policy for softmax
-                pred_policy_logits = jnp.where(
-                    jax_batch.policy_mask,
-                    pred_policy_logits,
-                    jnp.finfo(jnp.float32).min
-                )
+            # Mask invalid actions in policy for softmax
+            pred_policy_logits = jnp.where(
+                jax_batch.policy_mask,
+                pred_policy_logits,
+                jnp.finfo(jnp.float32).min
+            )
 
-                # Compute per-sample 4-way masked BCE value loss
-                # Numerically stable sigmoid cross-entropy per element
-                bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * value_targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
-                masked_bce = bce * value_masks
-                # Per-sample loss = sum over 4 outputs / count of active masks
-                per_sample_mask_count = jnp.sum(value_masks, axis=-1)
-                value_ce = jnp.sum(masked_bce, axis=-1) / jnp.maximum(per_sample_mask_count, 1.0)
+            # Compute per-sample 4-way masked BCE value loss
+            # Numerically stable sigmoid cross-entropy per element
+            bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * value_targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
+            masked_bce = bce * value_masks
+            # Per-sample loss = sum over 4 outputs / count of active masks
+            per_sample_mask_count = jnp.sum(value_masks, axis=-1)
+            value_ce = jnp.sum(masked_bce, axis=-1) / jnp.maximum(per_sample_mask_count, 1.0)
 
-                # Compute per-sample policy cross-entropy
-                policy_ce = optax.softmax_cross_entropy(pred_policy_logits, jax_batch.policy_weights)
+            # Compute per-sample policy cross-entropy
+            policy_ce = optax.softmax_cross_entropy(pred_policy_logits, jax_batch.policy_weights)
 
-                bearoff_mask_float = is_bearoff_mask.astype(jnp.float32)
-                non_bearoff_count = total_count - bearoff_count
-                non_bearoff_mask_float = (1.0 - bearoff_mask_float)
-
-                # Bearoff value loss (cross-entropy for bearoff positions only)
-                bearoff_value_loss = jnp.sum(value_ce * bearoff_mask_float) / max(bearoff_count, 1)
-                metrics['bearoff_value_loss'] = float(bearoff_value_loss)
-
-                # Bearoff policy loss (cross-entropy for bearoff positions only)
-                bearoff_policy_loss = jnp.sum(policy_ce * bearoff_mask_float) / max(bearoff_count, 1)
-                metrics['bearoff_policy_loss'] = float(bearoff_policy_loss)
-
-                # Non-bearoff value loss
-                if non_bearoff_count > 0:
-                    non_bearoff_value_loss = jnp.sum(value_ce * non_bearoff_mask_float) / non_bearoff_count
-                    metrics['non_bearoff_value_loss'] = float(non_bearoff_value_loss)
-                    # Non-bearoff policy loss
-                    non_bearoff_policy_loss = jnp.sum(policy_ce * non_bearoff_mask_float) / non_bearoff_count
-                    metrics['non_bearoff_policy_loss'] = float(non_bearoff_policy_loss)
-                else:
-                    metrics['non_bearoff_value_loss'] = 0.0
-                    metrics['non_bearoff_policy_loss'] = 0.0
-
-                # Update cumulative stats
-                self._training_stats.cumulative_bearoff_value_loss += float(bearoff_value_loss) * bearoff_count
-                self._training_stats.bearoff_value_loss_count += bearoff_count
-            else:
-                # No bearoff positions - all are non-bearoff
-                metrics['bearoff_value_loss'] = 0.0
-                metrics['bearoff_policy_loss'] = 0.0
-                metrics['non_bearoff_value_loss'] = metrics.get('value_loss', 0.0)
-                metrics['non_bearoff_policy_loss'] = metrics.get('policy_loss', 0.0)
-
-            # Update experience counts
-            self._training_stats.bearoff_experiences += bearoff_count
+            bearoff_mask_float = is_bearoff_mask.astype(jnp.float32)
             non_bearoff_count = total_count - bearoff_count
-            self._training_stats.non_bearoff_experiences += non_bearoff_count
+            non_bearoff_mask_float = (1.0 - bearoff_mask_float)
+
+            # Bearoff value loss (cross-entropy for bearoff positions only)
+            bearoff_value_loss = jnp.sum(value_ce * bearoff_mask_float) / max(bearoff_count, 1)
+            metrics['bearoff_value_loss'] = float(bearoff_value_loss)
+
+            # Bearoff policy loss (cross-entropy for bearoff positions only)
+            bearoff_policy_loss = jnp.sum(policy_ce * bearoff_mask_float) / max(bearoff_count, 1)
+            metrics['bearoff_policy_loss'] = float(bearoff_policy_loss)
+
+            # Non-bearoff value loss
             if non_bearoff_count > 0:
-                self._training_stats.cumulative_non_bearoff_value_loss += metrics.get('value_loss', 0.0) * non_bearoff_count
-                self._training_stats.non_bearoff_value_loss_count += non_bearoff_count
+                non_bearoff_value_loss = jnp.sum(value_ce * non_bearoff_mask_float) / non_bearoff_count
+                metrics['non_bearoff_value_loss'] = float(non_bearoff_value_loss)
+                # Non-bearoff policy loss
+                non_bearoff_policy_loss = jnp.sum(policy_ce * non_bearoff_mask_float) / non_bearoff_count
+                metrics['non_bearoff_policy_loss'] = float(non_bearoff_policy_loss)
+            else:
+                metrics['non_bearoff_value_loss'] = 0.0
+                metrics['non_bearoff_policy_loss'] = 0.0
+
+            # Update cumulative stats
+            self._training_stats.cumulative_bearoff_value_loss += float(bearoff_value_loss) * bearoff_count
+            self._training_stats.bearoff_value_loss_count += bearoff_count
+        else:
+            # No bearoff positions - all are non-bearoff
+            metrics['bearoff_value_loss'] = 0.0
+            metrics['bearoff_policy_loss'] = 0.0
+            metrics['non_bearoff_value_loss'] = metrics.get('value_loss', 0.0)
+            metrics['non_bearoff_policy_loss'] = metrics.get('policy_loss', 0.0)
+
+        # Update experience counts
+        self._training_stats.bearoff_experiences += bearoff_count
+        non_bearoff_count = total_count - bearoff_count
+        self._training_stats.non_bearoff_experiences += non_bearoff_count
+        if non_bearoff_count > 0:
+            self._training_stats.cumulative_non_bearoff_value_loss += metrics.get('value_loss', 0.0) * non_bearoff_count
+            self._training_stats.non_bearoff_value_loss_count += non_bearoff_count
 
         self._total_steps += 1
         self.stats.training_steps += 1
@@ -1425,14 +1416,21 @@ class TrainingWorker(BaseWorker):
 
         # Compute averaged metrics
         if batch_metrics:
-            metric_sums: Dict[str, float] = {}
-            metric_counts: Dict[str, int] = {}
-            for metric_dict in batch_metrics:
-                for key, value in metric_dict.items():
-                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-                    metric_counts[key] = metric_counts.get(key, 0) + 1
+            expected_keys = set(batch_metrics[0].keys())
+            for i, metric_dict in enumerate(batch_metrics[1:], start=1):
+                keys = set(metric_dict.keys())
+                if keys != expected_keys:
+                    missing = sorted(expected_keys - keys)
+                    extra = sorted(keys - expected_keys)
+                    raise RuntimeError(
+                        f"Training step metrics schema mismatch at step {i}: "
+                        f"missing={missing}, extra={extra}"
+                    )
 
-            avg_metrics = {k: metric_sums[k] / metric_counts[k] for k in metric_sums}
+            avg_metrics = {
+                k: sum(m[k] for m in batch_metrics) / len(batch_metrics)
+                for k in batch_metrics[0].keys()
+            }
             avg_metrics['batch_duration'] = batch_duration
             avg_metrics['batch_steps'] = steps_done
             avg_metrics['steps_per_sec'] = steps_done / max(batch_duration, 0.001)
