@@ -40,6 +40,7 @@ training:
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
   bearoff_enabled: True           # disable bearoff DB completely
+  bearoff_table_path: "./data/bearoff_15_v4"  # path to bearoff table (without extension, adds .bin and .json)
   bearoff_value_weight: 2.0        # the learning rate multiplier for values pulled from bearoff db
   lookup_enabled: False            # disables the lookup positions.
   lookup_learning_weight: 1.5      # this is for future if we have specific anchor positions with value AND policy

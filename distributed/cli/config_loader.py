@@ -342,6 +342,7 @@ def get_training_worker_config(
         'surprise_weight': training.get('surprise_weight', 0.5),
         # Bearoff/endgame settings
         'bearoff_enabled': training.get('bearoff_enabled', False),
+        'bearoff_table_path': training.get('bearoff_table_path'),
         'bearoff_value_weight': training.get('bearoff_value_weight', 2.0),
         'lookup_enabled': training.get('lookup_enabled', False),
         'lookup_learning_weight': training.get('lookup_learning_weight', 1.5),

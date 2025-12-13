@@ -29,7 +29,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
-from bgai.endgame.packed_table import BearoffLookup, pack_upper, solve_size_to_n
+from bgai.endgame.packed_table import BearoffLookup, V4BearoffLookup, load_v4_bearoff, pack_upper, solve_size_to_n
 from core.training.loss_fns import reward_to_value_targets
 from core.evaluators.mcts.equity import value_outputs_to_equity
 
@@ -361,17 +361,35 @@ class TrainingWorker(BaseWorker):
     # =========================================================================
 
     def _load_bearoff_table(self, path: str) -> Tuple[BearoffLookup, np.ndarray]:
-        """Load bearoff table in packed or full form.
+        """Load bearoff table in V4, packed, or legacy format.
 
-        Normalizes to float32 and returns both the lookup wrapper and the
-        underlying numpy array (kept for size logging).
+        Supports:
+        - V4 format: path without extension, loads {path}.bin and {path}.json
+        - Packed numpy: (entries, 4) or (entries, 7) float arrays
+        - Legacy numpy: (n, n) win probability arrays
+        - Full numpy: (n, n, 4) or (n, n, 7) probability arrays
+
+        Returns both the lookup wrapper and underlying array (for size logging).
         """
+        # Check for V4 format (path without extension, with .bin and .json files)
+        bin_path = Path(path + '.bin') if not path.endswith('.bin') else Path(path)
+        json_path = Path(path + '.json') if not path.endswith('.json') else Path(path.replace('.bin', '.json'))
+
+        if bin_path.exists() and json_path.exists():
+            # V4 format
+            lookup = load_v4_bearoff(str(bin_path), str(json_path))
+            # Return the data array for size logging
+            return lookup, lookup.data
+
+        # Fall back to numpy formats
+        if not path.endswith('.npy'):
+            path = path + '.npy'
+
         table = np.load(path, mmap_mode='r')
         packed = False
         n = None
 
         if table.ndim == 1:
-            # Packed flat (entries*4) not supported
             raise ValueError(f"Unexpected 1D bearoff table shape {table.shape}")
 
         if table.ndim == 2 and table.shape[1] in (4, 7) and table.shape[0] != table.shape[1]:
@@ -383,11 +401,11 @@ class TrainingWorker(BaseWorker):
             return lookup, table
 
         if table.ndim == 2:
-            # Legacy file storing P(win) only. Assume no gammons in the table.
+            # Legacy file storing P(win) only
             win = table.astype(np.float32, copy=False)
             loss = 1.0 - win
             zeros = np.zeros_like(win, dtype=np.float32)
-            equity = (2.0 * win - 1.0)  # cubeless equity
+            equity = (2.0 * win - 1.0)
             full = np.stack([win, zeros, loss, zeros, equity, equity, -equity], axis=-1)
             n = full.shape[0]
             lookup = BearoffLookup(full, packed=False, n=n)
@@ -399,7 +417,7 @@ class TrainingWorker(BaseWorker):
             return lookup, table
 
         raise ValueError(
-            f"Unexpected bearoff table shape {table.shape}; expected packed (entries,4|7), legacy (n,n), or full (n,n,4|7)"
+            f"Unexpected bearoff table shape {table.shape}; expected V4 (.bin+.json), packed (entries,4|7), legacy (n,n), or full (n,n,4|7)"
         )
 
     def _get_bearoff_value_np(self, board: np.ndarray, cur_player: int) -> float:
