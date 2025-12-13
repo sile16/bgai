@@ -515,6 +515,31 @@ class BGAIMetrics:
         )
 
         # =================================================================
+        # Per-Worker Process Memory (RAM) Metrics
+        # Useful for CPU workers and multi-process setups.
+        # =================================================================
+        self.worker_process_rss_bytes = Gauge(
+            'bgai_worker_process_rss_bytes',
+            'Worker process resident set size (RSS) in bytes',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_process_vms_bytes = Gauge(
+            'bgai_worker_process_vms_bytes',
+            'Worker process virtual memory size (VMS) in bytes',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_process_rss_percent = Gauge(
+            'bgai_worker_process_rss_percent',
+            'Worker RSS as percent of total system RAM (0-100)',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        # =================================================================
         # JAX Memory Metrics (per-worker, requires cuda_async allocator)
         # These track actual JAX memory usage, not just GPU allocation
         # =================================================================

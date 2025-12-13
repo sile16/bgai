@@ -26,7 +26,13 @@ from ..coordinator.redis_state import (
     WORKER_TTL,
 )
 from ..device import detect_device, get_device_config, DeviceInfo
-from ..metrics import start_system_metrics_collector, stop_system_metrics_collector
+from ..metrics import get_metrics, start_system_metrics_collector, stop_system_metrics_collector
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 
 @dataclass
@@ -115,6 +121,9 @@ class BaseWorker(ABC):
         # Heartbeat thread
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop_event = threading.Event()
+
+        # Process metrics
+        self._psutil_process = psutil.Process() if HAS_PSUTIL else None
 
     @property
     @abstractmethod
@@ -215,6 +224,7 @@ class BaseWorker(ABC):
             True if heartbeat was successful.
         """
         try:
+            self._record_process_memory_metrics()
             stats = self.stats.get_heartbeat_stats(reset=True)
             stats['model_version'] = self.current_model_version
             # Refresh identity fields so reused worker_ids don't show stale hosts/devices
@@ -244,6 +254,34 @@ class BaseWorker(ABC):
         except Exception as e:
             print(f"Worker {self.worker_id}: Heartbeat error: {e}")
             return False
+
+    def _record_process_memory_metrics(self) -> None:
+        if self._psutil_process is None:
+            return
+
+        try:
+            mem_info = self._psutil_process.memory_info()
+            rss_bytes = int(mem_info.rss)
+            vms_bytes = int(getattr(mem_info, "vms", 0))
+
+            vm = psutil.virtual_memory()
+            rss_percent = (rss_bytes / vm.total) * 100.0 if vm.total else 0.0
+
+            metrics = get_metrics()
+            metrics.worker_process_rss_bytes.labels(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+            ).set(rss_bytes)
+            metrics.worker_process_vms_bytes.labels(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+            ).set(vms_bytes)
+            metrics.worker_process_rss_percent.labels(
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+            ).set(rss_percent)
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Failed to record process RAM metrics: {e}")
 
     def _start_heartbeat(self) -> None:
         """Start the heartbeat background thread."""
