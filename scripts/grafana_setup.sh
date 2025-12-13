@@ -56,7 +56,7 @@ providers:
     disableDeletion: false
     editable: true
     updateIntervalSeconds: 30
-    allowUiUpdates: false
+    allowUiUpdates: true
     options:
       path: $BGAI_DASHBOARDS_DIR
       foldersFromFilesStructure: false
