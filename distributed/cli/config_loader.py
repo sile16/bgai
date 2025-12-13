@@ -339,7 +339,13 @@ def get_training_worker_config(
         'redis_password': redis.get('password'),
         # games_per_epoch (new) with fallback to games_per_batch (old)
         'games_per_epoch': games_per_epoch,
+        # Training/collection scheduling
+        'pause_collection_during_training': training.get('pause_collection_during_training', False),
         'surprise_weight': training.get('surprise_weight', 0.5),
+        # CPU-side pipeline tuning (deserialization/stacking)
+        'decode_threads': training.get('decode_threads', 0),
+        # Increase GPU work per CPU decode by reusing the same minibatch for N updates.
+        'batch_reuse_steps': training.get('batch_reuse_steps', 1),
         # Bearoff/endgame settings
         'bearoff_enabled': training.get('bearoff_enabled', False),
         'bearoff_table_path': training.get('bearoff_table_path'),
@@ -371,6 +377,14 @@ def get_training_worker_config(
     # Training cadence (optional to keep configs clean when unset)
     if steps_per_epoch is not None:
         worker_config['steps_per_epoch'] = steps_per_epoch
+
+    # Optional scheduling knobs
+    if training.get('steps_per_game') is not None:
+        worker_config['steps_per_game'] = training.get('steps_per_game')
+    if training.get('min_backlog_steps') is not None:
+        worker_config['min_backlog_steps'] = training.get('min_backlog_steps')
+    if training.get('max_train_steps_per_batch') is not None:
+        worker_config['max_train_steps_per_batch'] = training.get('max_train_steps_per_batch')
 
     return worker_config
 

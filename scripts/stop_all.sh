@@ -6,7 +6,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_DIR="$PROJECT_DIR/logs"
 
 echo "Stopping Grafana..."
-pkill -f "grafana-server" 2>/dev/null || true
+# Only kill Grafana instances started from this repo (match args, not argv0).
+pkill -f -- "--homepath=$PROJECT_DIR/tools/grafana-" 2>/dev/null || true
+pkill -f -- "--config=$PROJECT_DIR/tools/grafana-" 2>/dev/null || true
 
 echo "Stopping Prometheus..."
 pkill -f "prometheus" 2>/dev/null || true

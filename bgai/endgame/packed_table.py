@@ -599,7 +599,17 @@ class V4BearoffLookup:
             bytes_per_entry=hdr["bytes_per_entry"],
         )
 
-        # Load binary data
+        data_path = Path(data_path)
+        expected = header.total_entries * cls.VALUES_PER_ENTRY
+        expected_bytes = expected * np.dtype(np.uint16).itemsize
+
+        actual_bytes = data_path.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"Bearoff V4 data size mismatch: expected {expected_bytes} bytes, got {actual_bytes}"
+            )
+
+        # Load binary data into RAM (fast lookups, higher memory).
         with open(data_path, "rb") as f:
             raw = np.frombuffer(f.read(), dtype=np.uint16)
 

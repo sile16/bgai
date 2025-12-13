@@ -42,6 +42,7 @@ class EvalType(Enum):
     GNUBG = "gnubg"           # Against GNU Backgammon
     RANDOM = "random"         # Against random policy
     GREEDY = "greedy"         # Against greedy policy (no MCTS)
+    SELF_PLAY = "self_play"   # Current model vs itself (baseline)
 
 
 @dataclass
@@ -287,6 +288,21 @@ class EvalWorker(BaseWorker):
             branching_factor=self._env.num_actions,
             action_selector=PUCTSelector(),
             temperature=0.1,  # Lower temperature for evaluation (less exploration)
+        )
+
+    def _make_self_play_opponent_evaluator(self) -> StochasticMCTS:
+        if self._nn_model is None:
+            self._setup_neural_network()
+
+        eval_fn = make_nn_eval_fn(self._nn_model, self._state_to_nn_input_fn)
+        return StochasticMCTS(
+            eval_fn=eval_fn,
+            stochastic_action_probs=self._env.stochastic_action_probs,
+            num_iterations=self.num_simulations,
+            max_nodes=self.max_nodes,
+            branching_factor=self._env.num_actions,
+            action_selector=PUCTSelector(),
+            temperature=0.1,
         )
 
     def _setup_gnubg_evaluator(self) -> None:
@@ -634,6 +650,8 @@ class EvalWorker(BaseWorker):
                 self._nn_params = deserialize_weights(weights_bytes)
                 self.current_model_version = version
 
+        eval_type_normalized = eval_type.replace("-", "_").strip().lower()
+
         # Route to appropriate evaluation method based on eval_type
         if eval_type == EvalType.GNUBG.value:
             if self._gnubg_evaluator is None:
@@ -641,9 +659,12 @@ class EvalWorker(BaseWorker):
                 return None
             # GNUBG uses pure_callback, not JIT-compatible with two_player_game
             results = self._run_gnubg_eval()
-        elif eval_type == EvalType.RANDOM.value:
+        elif eval_type_normalized == EvalType.RANDOM.value:
             # Use TurboZero's two_player_game (JIT-compatible)
             results = self._run_two_player_eval(self._random_evaluator, None)
+        elif eval_type_normalized == EvalType.SELF_PLAY.value:
+            opponent = self._make_self_play_opponent_evaluator()
+            results = self._run_two_player_eval(opponent, self._nn_params)
         else:
             print(f"Worker {self.worker_id}: Unknown eval type: {eval_type}")
             return None

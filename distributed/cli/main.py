@@ -65,6 +65,57 @@ def configure_gpu_fraction(num_gpus: float) -> None:
         print(f"GPU memory fraction set to {num_gpus}")
 
 
+def _get_visible_gpu_total_memory_gb() -> float:
+    """Return total memory (GB) of the first visible NVIDIA GPU."""
+    import subprocess
+
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("nvidia-smi not found; cannot compute GPU memory fraction") from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("nvidia-smi failed; cannot compute GPU memory fraction") from e
+
+    line = out.strip().splitlines()[0].strip()
+    total_mib = float(line)
+    return total_mib / 1024.0
+
+
+def configure_gpu_memory(num_gpus: float, gpu_mem_gb: Optional[float]) -> None:
+    """Configure JAX GPU allocation using either a fixed GB cap or a fraction."""
+    if num_gpus == 0:
+        configure_gpu_fraction(0)
+        return
+
+    if gpu_mem_gb is None:
+        configure_gpu_fraction(num_gpus)
+        return
+
+    if gpu_mem_gb <= 0:
+        raise ValueError("--gpu-mem-gb must be > 0")
+
+    total_gb = _get_visible_gpu_total_memory_gb()
+    fraction = gpu_mem_gb / total_gb
+    if fraction <= 0 or fraction > 1.0:
+        raise ValueError(
+            f"--gpu-mem-gb={gpu_mem_gb} exceeds visible GPU total {total_gb:.2f} GB"
+        )
+
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(fraction)
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    print(
+        f"GPU memory cap set to {gpu_mem_gb:.2f} GB "
+        f"({fraction:.3f} of {total_gb:.2f} GB total)"
+    )
+
+
 def start_coordinator(args):
     """Start the coordinator (head node)."""
     from ..coordinator.head_node import Coordinator
@@ -108,7 +159,7 @@ def start_coordinator(args):
 def start_game_worker(args):
     """Start a game generation worker."""
     # Configure GPU fraction BEFORE importing JAX-dependent modules
-    configure_gpu_fraction(args.num_gpus)
+    configure_gpu_memory(args.num_gpus, args.gpu_mem_gb)
 
     from ..workers.game_worker import GameWorker
 
@@ -160,7 +211,7 @@ def start_game_worker(args):
 def start_training_worker(args):
     """Start a training worker."""
     # Configure GPU fraction BEFORE importing JAX-dependent modules
-    configure_gpu_fraction(args.num_gpus)
+    configure_gpu_memory(args.num_gpus, args.gpu_mem_gb)
 
     from ..workers.training_worker import TrainingWorker
 
@@ -225,7 +276,7 @@ def start_training_worker(args):
 def start_eval_worker(args):
     """Start an evaluation worker."""
     # Configure GPU fraction BEFORE importing JAX-dependent modules
-    configure_gpu_fraction(args.num_gpus)
+    configure_gpu_memory(args.num_gpus, args.gpu_mem_gb)
 
     from ..workers.eval_worker import EvalWorker
 
@@ -285,6 +336,7 @@ def show_status(args):
     import urllib.parse
     import urllib.request
 
+    from ..buffer.redis_buffer import RedisReplayBuffer
     from ..coordinator.redis_state import create_state_manager
 
     # Load configuration from file
@@ -307,6 +359,28 @@ def show_status(args):
 
     status = state.get_cluster_status()
     workers = status['workers']
+
+    buffer_totals = None
+    try:
+        redis_cfg = yaml_config.get("redis", {}) or {}
+        buffer = RedisReplayBuffer(
+            host=config["redis_host"],
+            port=config["redis_port"],
+            password=config["redis_password"],
+            capacity=int(redis_cfg.get("buffer_capacity", 100000)),
+            episode_capacity=int(redis_cfg.get("episode_capacity", 5000)),
+        )
+        total_games = buffer.redis.get(buffer.TOTAL_GAMES_KEY)
+        buffer_totals = {
+            "total_games_counter": int(total_games) if total_games else 0,
+            "episodes": int(buffer.redis.llen(buffer.EPISODE_LIST)),
+            "experiences": int(buffer.redis.llen(buffer.EXPERIENCE_LIST)),
+            "surprise_entries": int(buffer.redis.zcard(buffer.SURPRISE_SORTED_SET)),
+            "capacity": int(buffer.capacity),
+            "episode_capacity": int(buffer.episode_capacity),
+        }
+    except Exception:
+        buffer_totals = None
 
     def _prom_query(prom_base_url: str, query: str) -> list[dict]:
         url = prom_base_url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
@@ -381,8 +455,20 @@ def show_status(args):
     print(f"Model version: {status['model_version']}")
     print(f"Run ID: {status['run_id'] or 'None'}")
     print(f"Run status: {status['run_status']}")
-    print(f"Total games generated: {status['total_games_generated']}")
+    print(f"Total games generated (workers): {status['total_games_generated']}")
     print(f"Total training steps: {status['total_training_steps']}")
+    print(f"Collection paused: {bool(state.is_collection_paused())}")
+
+    if buffer_totals is not None:
+        print("\n=== Buffer ===")
+        print(
+            f"Episodes: {buffer_totals['episodes']}/{buffer_totals['episode_capacity']} "
+            f"(total_games_counter={buffer_totals['total_games_counter']})"
+        )
+        print(
+            f"Experiences: {buffer_totals['experiences']}/{buffer_totals['capacity']} "
+            f"(surprise_entries={buffer_totals['surprise_entries']})"
+        )
 
     print(f"\n=== Workers ===")
     print(f"Game workers: {workers['game']}")
@@ -635,7 +721,13 @@ def main():
         '--num-gpus',
         type=float,
         default=1.0,
-        help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
+        help='GPU fraction to use (default: 1.0). Prefer --gpu-mem-gb for fixed allocation.'
+    )
+    game_parser.add_argument(
+        '--gpu-mem-gb',
+        type=float,
+        default=None,
+        help='Fixed GPU memory cap in GB (preferred). Uses nvidia-smi to compute fraction.'
     )
     game_parser.add_argument(
         '--head-ip',
@@ -731,6 +823,12 @@ def main():
         help='Redis password (default: None)'
     )
     train_parser.add_argument(
+        '--gpu-mem-gb',
+        type=float,
+        default=None,
+        help='Fixed GPU memory cap in GB (preferred). Uses nvidia-smi to compute fraction.'
+    )
+    train_parser.add_argument(
         '--metrics-port',
         type=int,
         default=9200,
@@ -758,7 +856,7 @@ def main():
         '--num-gpus',
         type=float,
         default=1.0,
-        help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
+        help='GPU fraction to use (default: 1.0). Prefer --gpu-mem-gb for fixed allocation.'
     )
     train_parser.add_argument(
         '--head-ip',
@@ -851,7 +949,13 @@ def main():
         '--num-gpus',
         type=float,
         default=1.0,
-        help='GPU fraction to use (default: 1.0, use 0.5 to share GPU)'
+        help='GPU fraction to use (default: 1.0). Prefer --gpu-mem-gb for fixed allocation.'
+    )
+    eval_parser.add_argument(
+        '--gpu-mem-gb',
+        type=float,
+        default=None,
+        help='Fixed GPU memory cap in GB (preferred). Uses nvidia-smi to compute fraction.'
     )
     eval_parser.add_argument(
         '--head-ip',

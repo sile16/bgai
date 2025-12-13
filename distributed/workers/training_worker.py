@@ -32,12 +32,10 @@ from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
 from bgai.endgame.packed_table import V4BearoffLookup, load_v4_bearoff
-from core.training.loss_fns import reward_to_value_targets
 from core.evaluators.mcts.equity import value_outputs_to_equity
 
 # Bearoff table for perfect endgame values (imports lazy-loaded in methods)
-# 4-way value functions (reward_to_value_targets, value_outputs_to_equity)
-# are imported from TurboZero core.training.loss_fns and core.evaluators.mcts.equity
+# 4-way value/equity helpers are imported from TurboZero.
 
 
 def weighted_az_loss_fn(
@@ -48,6 +46,7 @@ def weighted_az_loss_fn(
     value_masks: jnp.ndarray,
     value_sample_weights: jnp.ndarray,
     policy_sample_weights: jnp.ndarray,
+    is_bearoff_mask: jnp.ndarray,
     l2_reg_lambda: float = 0.0001,
 ) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
     """AlphaZero loss function with per-sample weighting and 4-way conditional value head.
@@ -64,6 +63,7 @@ def weighted_az_loss_fn(
         value_masks: Masks for which targets are valid
         value_sample_weights: Per-sample weights for value loss (e.g., higher for bearoff)
         policy_sample_weights: Per-sample weights for policy loss
+        is_bearoff_mask: Boolean mask indicating bearoff positions
         l2_reg_lambda: L2 regularization weight
 
     Returns:
@@ -111,6 +111,19 @@ def weighted_az_loss_fn(
     # Total loss
     loss = policy_loss + value_loss + l2_reg
 
+    # Bearoff/non-bearoff split metrics without extra forward passes
+    bearoff_mask_f = is_bearoff_mask.astype(jnp.float32)
+    bearoff_count = jnp.sum(bearoff_mask_f)
+    total_count = bearoff_mask_f.shape[0]
+    non_bearoff_count = total_count - bearoff_count
+
+    bearoff_value_loss = jnp.sum(value_loss_per_sample * bearoff_mask_f) / jnp.maximum(bearoff_count, 1.0)
+    bearoff_policy_loss = jnp.sum(policy_loss_per_sample * bearoff_mask_f) / jnp.maximum(bearoff_count, 1.0)
+
+    non_bearoff_mask_f = 1.0 - bearoff_mask_f
+    non_bearoff_value_loss = jnp.sum(value_loss_per_sample * non_bearoff_mask_f) / jnp.maximum(non_bearoff_count, 1.0)
+    non_bearoff_policy_loss = jnp.sum(policy_loss_per_sample * non_bearoff_mask_f) / jnp.maximum(non_bearoff_count, 1.0)
+
     # Compute metrics (unweighted for interpretability)
     pred_policy_probs = jax.nn.softmax(pred_policy_logits, axis=-1)
     pred_top1 = jnp.argmax(pred_policy_probs, axis=-1)
@@ -149,6 +162,10 @@ def weighted_az_loss_fn(
         'l2_reg': l2_reg,
         'policy_accuracy': policy_accuracy,
         'value_accuracy': value_accuracy,
+        'bearoff_value_loss': bearoff_value_loss,
+        'bearoff_policy_loss': bearoff_policy_loss,
+        'non_bearoff_value_loss': non_bearoff_value_loss,
+        'non_bearoff_policy_loss': non_bearoff_policy_loss,
         # Per-output value losses (4-way)
         'value_loss_win': value_loss_win,
         'value_loss_gam_win_cond': value_loss_gam_win_cond,
@@ -173,8 +190,8 @@ from .base_worker import BaseWorker, WorkerStats
 from ..serialization import (
     serialize_weights,
     deserialize_weights,
-    batch_experiences_to_jax,
     serialize_warm_tree,
+    experiences_to_numpy_batch,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
 from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
@@ -281,11 +298,30 @@ class TrainingWorker(BaseWorker):
         # 0 = uniform sampling, 1 = fully surprise-weighted
         self.surprise_weight = self.config.get('surprise_weight', 0.5)
 
+        # CPU pipeline tuning: how many threads to use for msgpack decode + stacking.
+        # 0/1 disables parallel decode.
+        self.decode_threads = int(self.config.get('decode_threads', 0))
+
+        # Run multiple gradient steps on the same sampled batch to increase GPU
+        # utilization when CPU-side deserialization is the bottleneck.
+        self.batch_reuse_steps = int(self.config.get('batch_reuse_steps', 1))
+        if self.batch_reuse_steps < 1:
+            self.batch_reuse_steps = 1
+        self._reuse_steps_remaining: int = 0
+        self._reuse_prepared: Optional[Dict[str, Any]] = None
+
         # Prefetch batches in a background thread to overlap Redis I/O with GPU compute.
         # This is a best-effort throughput optimization; set to 0 to disable.
         self.prefetch_batches = int(self.config.get('prefetch_batches', 2))
-        self._prefetch_queue: Optional["queue.Queue[list]"] = None
+        # Prefetch queue holds CPU numpy batches (already deserialized/stacked)
+        # to overlap Redis I/O + deserialization with GPU compute.
+        self._prefetch_queue: Optional["queue.Queue[Dict[str, np.ndarray]]"] = None
         self._prefetch_thread: Optional[threading.Thread] = None
+
+        # Prometheus discovery registration needs periodic refresh while training
+        # (long training batches can outlive the discovery TTL).
+        self._metrics_port_bound: Optional[int] = None
+        self._metrics_last_registration_time: float = 0.0
 
         # Bearoff/endgame table configuration
         self.bearoff_enabled = self.config.get('bearoff_enabled', False)
@@ -299,29 +335,15 @@ class TrainingWorker(BaseWorker):
         # Keep table on CPU (too large for GPU). Stored as [win, gammon_win, loss, gammon_loss].
         self._bearoff_table_np = None
         self._bearoff_lookup: Optional[V4BearoffLookup] = None
-        bearoff_table_path = self.config.get('bearoff_table_path')
-        if bearoff_table_path is None:
+        self._bearoff_table_path = self.config.get('bearoff_table_path')
+        if self._bearoff_table_path is None:
             # Default path
             default_path = Path(__file__).parent.parent.parent / 'data' / 'bearoff_15.npy'
             if default_path.exists():
-                bearoff_table_path = str(default_path)
+                self._bearoff_table_path = str(default_path)
 
-        if bearoff_table_path and self.bearoff_enabled:
-            try:
-                # Load table but DON'T convert to JAX array (too large for GPU)
-                # We'll use numpy lookups instead. Supports legacy (n, n) win-prob
-                # tables by expanding to the new (n, n, 4) format or packed upper.
-                self._bearoff_lookup, self._bearoff_table_np = self._load_bearoff_table(bearoff_table_path)
-                self._bearoff_table = True  # Flag indicating table is loaded
-                shape_str = self._bearoff_table_np.shape
-                size_gb = self._bearoff_table_np.nbytes / 1e9
-                print(f"Worker {self.worker_id}: Loaded bearoff table from {bearoff_table_path}")
-                print(f"Worker {self.worker_id}: Table shape: {shape_str}, size: {size_gb:.2f} GB")
-            except Exception as e:
-                print(f"Worker {self.worker_id}: Failed to load bearoff table: {e}")
-                self._bearoff_table = None
-                self._bearoff_table_np = None
-                self._bearoff_lookup = None
+        # NOTE: bearoff table is loaded lazily after acquiring the training lock,
+        # to avoid multiple trainers OOM-ing the host by loading ~35GB each.
 
         # Warm tree configuration
         # Number of MCTS simulations for warm tree (0 to disable)
@@ -342,6 +364,14 @@ class TrainingWorker(BaseWorker):
             password=redis_password,
             worker_id=self.worker_id,
         )
+
+        # Single-trainer lock (cluster-wide): prevents multiple trainers from
+        # simultaneously loading the bearoff table and/or fighting for the same GPU.
+        self._training_lock_key = "bgai:training:lock"
+        self._training_lock_ttl_seconds = int(self.config.get("training_lock_ttl_seconds", 90))
+        self._training_lock_refresh_seconds = max(5, int(self._training_lock_ttl_seconds // 3))
+        self._training_lock_held = False
+        self._training_lock_thread: Optional[threading.Thread] = None
 
         # MLflow configuration
         self.mlflow_tracking_uri = self.config.get('mlflow_tracking_uri')
@@ -364,6 +394,135 @@ class TrainingWorker(BaseWorker):
         self._last_progress_time = time.time()
         self._last_progress_steps = 0
 
+    def _acquire_training_lock(self) -> None:
+        """Ensure only one training worker runs at a time (cluster-wide)."""
+        ttl = int(self._training_lock_ttl_seconds)
+        if ttl <= 0:
+            raise ValueError("training_lock_ttl_seconds must be > 0")
+
+        ok = self.buffer.redis.set(
+            self._training_lock_key,
+            self.worker_id,
+            nx=True,
+            ex=ttl,
+        )
+        if not ok:
+            holder = self.buffer.redis.get(self._training_lock_key)
+            holder_str = holder.decode() if isinstance(holder, bytes) else str(holder)
+            raise RuntimeError(
+                f"Another training worker is already running (lock={self._training_lock_key}, holder={holder_str})"
+            )
+
+        self._training_lock_held = True
+
+        def refresher():
+            while self.running and self._training_lock_held:
+                try:
+                    current = self.buffer.redis.get(self._training_lock_key)
+                    current_str = current.decode() if isinstance(current, bytes) else current
+                    if current_str != self.worker_id:
+                        # Someone else stole/overwrote the lock; stop training.
+                        print(
+                            f"Worker {self.worker_id}: Training lock lost to {current_str}, stopping..."
+                        )
+                        self.stop()
+                        return
+                    self.buffer.redis.expire(self._training_lock_key, ttl)
+                except Exception:
+                    pass
+                time.sleep(self._training_lock_refresh_seconds)
+
+        self._training_lock_thread = threading.Thread(
+            target=refresher,
+            name=f"{self.worker_id}-training-lock",
+            daemon=True,
+        )
+        self._training_lock_thread.start()
+
+    def _release_training_lock(self) -> None:
+        if not self._training_lock_held:
+            return
+
+        self._training_lock_held = False
+        try:
+            # Delete only if we still own it.
+            self.buffer.redis.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                self._training_lock_key,
+                self.worker_id,
+            )
+        except Exception:
+            pass
+
+    def _maybe_load_bearoff_table(self) -> None:
+        if not (self._bearoff_table_path and self.bearoff_enabled):
+            return
+        if self._bearoff_table_np is not None and self._bearoff_lookup is not None:
+            return
+
+        bin_path = Path(self._bearoff_table_path + '.bin') if not str(self._bearoff_table_path).endswith('.bin') else Path(self._bearoff_table_path)
+        required_bytes = bin_path.stat().st_size
+
+        # Fail fast if the host doesn't have enough free RAM to safely load the bearoff table.
+        # Loading uses `f.read()` which materializes the full byte buffer in memory.
+        safety_bytes = int(2 * 1024**3)  # 2 GiB headroom for process/allocator overhead
+        mem_available = self._get_mem_available_bytes()
+        mem_total = self._get_mem_total_bytes()
+        required_gb = required_bytes / 1e9
+        avail_gb = mem_available / 1e9
+        total_gb = mem_total / 1e9
+
+        print(
+            f"Worker {self.worker_id}: Bearoff table load requires ~{required_gb:.2f} GB "
+            f"(+{safety_bytes/1e9:.2f} GB headroom); MemAvailable={avail_gb:.2f} GB, MemTotal={total_gb:.2f} GB"
+        )
+        if mem_available < required_bytes + safety_bytes:
+            raise RuntimeError(
+                f"Insufficient RAM to load bearoff table: need ~{(required_bytes + safety_bytes)/1e9:.2f} GB "
+                f"available, have {avail_gb:.2f} GB (path={bin_path})"
+            )
+
+        try:
+            self._bearoff_lookup, self._bearoff_table_np = self._load_bearoff_table(self._bearoff_table_path)
+            self._bearoff_table = True
+            shape_str = self._bearoff_table_np.shape
+            size_gb = self._bearoff_table_np.nbytes / 1e9
+            print(f"Worker {self.worker_id}: Loaded bearoff table from {self._bearoff_table_path}")
+            print(f"Worker {self.worker_id}: Table shape: {shape_str}, size: {size_gb:.2f} GB")
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Failed to load bearoff table: {e}")
+            self._bearoff_table = None
+            self._bearoff_table_np = None
+            self._bearoff_lookup = None
+
+    @staticmethod
+    def _get_mem_available_bytes() -> int:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) < 2:
+                        break
+                    return int(parts[1]) * 1024
+        raise RuntimeError("Could not read MemAvailable from /proc/meminfo")
+
+    @staticmethod
+    def _get_mem_total_bytes() -> int:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) < 2:
+                        break
+                    return int(parts[1]) * 1024
+        raise RuntimeError("Could not read MemTotal from /proc/meminfo")
+
+    def stop(self) -> None:
+        """Stop the worker gracefully and release the training lock."""
+        self._release_training_lock()
+        super().stop()
+
     @property
     def worker_type(self) -> str:
         return 'training'
@@ -371,6 +530,28 @@ class TrainingWorker(BaseWorker):
     # =========================================================================
     # Bearoff/Endgame Value Methods
     # =========================================================================
+
+    @staticmethod
+    def _reward_to_value_targets_np(reward: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Numpy implementation of `reward_to_value_targets` for batched rewards."""
+        reward = reward.astype(np.float32, copy=False)
+        did_win = reward > 0
+        was_gammon = np.abs(reward) >= 2
+        was_bg = np.abs(reward) >= 3
+
+        win_target = np.where(did_win, 1.0, 0.0).astype(np.float32)
+        gam_win_cond_target = np.where(was_gammon & did_win, 1.0, 0.0).astype(np.float32)
+        gam_loss_cond_target = np.where(was_gammon & ~did_win, 1.0, 0.0).astype(np.float32)
+        bg_rate_target = np.where(was_bg, 1.0, 0.0).astype(np.float32)
+        targets = np.stack([win_target, gam_win_cond_target, gam_loss_cond_target, bg_rate_target], axis=-1)
+
+        win_mask = np.ones_like(reward, dtype=np.float32)
+        gam_win_mask = np.where(did_win, 1.0, 0.0).astype(np.float32)
+        gam_loss_mask = np.where(~did_win, 1.0, 0.0).astype(np.float32)
+        bg_mask = np.where(was_gammon, 1.0, 0.0).astype(np.float32)
+        masks = np.stack([win_mask, gam_win_mask, gam_loss_mask, bg_mask], axis=-1)
+
+        return targets, masks
 
     def _load_bearoff_table(self, path: str) -> Tuple[V4BearoffLookup, np.ndarray]:
         """Load bearoff table (V4 format only).
@@ -441,163 +622,109 @@ class TrainingWorker(BaseWorker):
             return np.zeros(4, dtype=np.float32)
         return self._bearoff_lookup.get_4way_values(x_idx, o_idx)
 
-    def _apply_bearoff_values_to_batch(
+    def _apply_bearoff_values_to_numpy_batch(
         self,
-        batch: BaseExperience,
-    ) -> Tuple[BaseExperience, Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Replace rewards with perfect bearoff values where applicable.
+        observation_nn: np.ndarray,
+        cur_player_id: np.ndarray,
+        rewards: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+        """Compute value targets/masks/weights and (optionally) override rewards for bearoff positions.
 
-        Uses numpy for bearoff detection and table lookup (table is too large for GPU),
-        then converts results back to JAX arrays.
-
-        OPTIMIZED: Fully vectorized - no Python for-loops over batch.
-
-        Args:
-            batch: Batch of experiences
-
-        Returns:
-            Tuple of (modified_batch, bearoff_metrics, value_targets, value_masks, value_sample_weights)
-            bearoff_metrics includes:
-                - bearoff_count: number of bearoff positions
-                - total_count: total batch size
-                - is_bearoff_mask: JAX array boolean mask (True for bearoff positions)
+        This intentionally stays on CPU (numpy) to avoid device->host transfers which
+        can dominate training time at large batch sizes.
         """
-        if self._bearoff_table_np is None or not self.bearoff_enabled:
-            batch_size = batch.reward.shape[0]
-            target_reward = batch.reward[jnp.arange(batch_size), batch.cur_player_id]
-            targets, masks = jax.vmap(reward_to_value_targets)(target_reward)
-            return (
-                batch,
-                {
-                    'bearoff_count': jnp.array(0),
-                    'total_count': jnp.array(batch_size),
-                    'is_bearoff_mask': jnp.zeros(batch_size, dtype=jnp.bool_),
-                    'bearoff_avg_gam_win_cond': jnp.array(0.0, dtype=jnp.float32),
-                },
-                targets,
-                masks,
-                jnp.ones(batch_size, dtype=jnp.float32),
-            )
+        batch_size = observation_nn.shape[0]
+        cur_player_id = cur_player_id.astype(np.int32, copy=False)
+        rewards = rewards.astype(np.float32, copy=False)
 
-        batch_size = batch.observation_nn.shape[0]
+        target_reward = rewards[np.arange(batch_size), cur_player_id]
+        value_targets_np, value_masks_np = self._reward_to_value_targets_np(target_reward)
 
-        # Convert batch data to numpy for processing
-        obs_np = np.array(batch.observation_nn)
-        cur_player_np = np.array(batch.cur_player_id)
-        rewards_np = np.array(batch.reward)
-        from bgai.endgame.indexing import position_to_index_fast
+        is_bearoff = np.zeros(batch_size, dtype=bool)
+        bearoff_avg_gam_win_cond = np.array(0.0, dtype=np.float32)
 
-        # Decode observations to boards (batch_size, 28)
-        boards = np.round(obs_np[:, :28] * 15).astype(np.int8)
+        if self._bearoff_table_np is not None and self.bearoff_enabled:
+            boards = np.round(observation_nn[:, :28] * 15).astype(np.int16, copy=False)
 
-        # Process each experience for target probs (uses BearoffLookup)
-        target_probs_list = []
+            bar_empty = (boards[:, 24] == 0) & (boards[:, 25] == 0)
+            cur_outside = np.any(boards[:, 0:18] > 0, axis=1)
+            opp_outside = np.any(boards[:, 6:24] < 0, axis=1)
+            is_bearoff = bar_empty & ~cur_outside & ~opp_outside
 
-        # =========================================================================
-        # Vectorized bearoff detection
-        # =========================================================================
-        # Board layout (pgx): [0-23]=points 0-23, [24]=cur_bar, [25]=opp_bar, [26]=cur_borne, [27]=opp_borne
-        # Current player pieces are positive, opponent pieces are negative
-        # Current player home = points 18-23, opponent home = points 0-5
-        # For bearoff: both bars empty, cur player only in home (18-23), opp only in home (0-5)
+            bearoff_idx = np.flatnonzero(is_bearoff)
+            if bearoff_idx.size:
+                from bgai.endgame.indexing import position_to_index_lut
 
-        # Check bars empty (vectorized)
-        bar_empty = (boards[:, 24] == 0) & (boards[:, 25] == 0)
+                bearoff_boards = boards[bearoff_idx]
+                cur_home = np.maximum(0, bearoff_boards[:, 23:17:-1]).astype(np.int32, copy=False)
+                opp_home = np.maximum(0, -bearoff_boards[:, 0:6]).astype(np.int32, copy=False)
 
-        # Current player (positive) outside home if pieces on points 0-17
-        cur_outside = np.any(boards[:, 0:18] > 0, axis=1)
+                x_idx = position_to_index_lut(cur_home)
+                o_idx = position_to_index_lut(opp_home)
 
-        # Opponent (negative) outside home if pieces on points 6-23
-        opp_outside = np.any(boards[:, 6:24] < 0, axis=1)
+                if self._bearoff_lookup is None:
+                    raise ValueError("Bearoff lookup not initialized")
+                n = int(self._bearoff_lookup.n)
 
-        # Bearoff position mask
-        is_bearoff = bar_empty & ~cur_outside & ~opp_outside
+                i = np.minimum(x_idx, o_idx).astype(np.int64, copy=False)
+                j = np.maximum(x_idx, o_idx).astype(np.int64, copy=False)
+                flat_idx = i * n - (i * (i - 1)) // 2 + (j - i)
 
-        # =========================================================================
-        # Bearoff value lookup using V4 bearoff table
-        # =========================================================================
-        bearoff_count = int(np.sum(is_bearoff))
+                raw = self._bearoff_lookup.data[flat_idx]
+                perspective0 = (x_idx <= o_idx)
 
-        # Precompute default targets/masks from discrete rewards
-        target_reward_np = rewards_np[np.arange(batch_size), cur_player_np]
-        default_targets, default_masks = reward_to_value_targets(jnp.array(target_reward_np))
-        value_targets_np = np.array(default_targets)
-        value_masks_np = np.array(default_masks)
+                gam_win_cond_u16 = np.where(perspective0, raw[:, 0], raw[:, 6]).astype(np.float32)
+                gam_loss_cond_u16 = np.where(perspective0, raw[:, 1], raw[:, 7]).astype(np.float32)
+                eq_cl_u16 = np.where(perspective0, raw[:, 2], raw[:, 8]).astype(np.float32)
 
-        # Collect 4-way conditional targets for bearoff positions and override targets/masks
-        for i in range(batch_size):
-            if is_bearoff[i]:
-                board = boards[i]
-                cur_player = int(cur_player_np[i])
+                gam_win_cond = gam_win_cond_u16 / 65535.0
+                gam_loss_cond = gam_loss_cond_u16 / 65535.0
+                eq_cl = (eq_cl_u16 / 65535.0) * 2.0 - 1.0
+                win = (eq_cl + 1.0) / 2.0
 
-                # Index positions for lookup
-                cur_home = np.maximum(0, board[23:17:-1])   # current player point 1..6
-                opp_home = np.maximum(0, -board[0:6])       # opponent point 1..6
-                x_pos = cur_home
-                o_pos = opp_home
-                x_idx = position_to_index_fast(x_pos)
-                o_idx = position_to_index_fast(o_pos)
+                bearoff_targets = np.stack(
+                    [win, gam_win_cond, gam_loss_cond, np.zeros_like(win, dtype=np.float32)],
+                    axis=-1,
+                ).astype(np.float32)
+                value_targets_np[bearoff_idx] = bearoff_targets
 
-                # Observation is already from current player's perspective; lookup uses that orientation.
-                bearoff_targets = self._get_bearoff_target_probs(x_idx, o_idx)
-                target_probs_list.append(bearoff_targets)
+                has_win = win > 0.0
+                has_loss = (1.0 - win) > 0.0
+                has_gammon = (gam_win_cond > 0.0) | (gam_loss_cond > 0.0)
+                value_masks_np[bearoff_idx] = np.stack(
+                    [
+                        np.ones_like(win, dtype=np.float32),
+                        has_win.astype(np.float32),
+                        has_loss.astype(np.float32),
+                        has_gammon.astype(np.float32),
+                    ],
+                    axis=-1,
+                )
 
-                # Override targets/masks with perfect bearoff values
-                value_targets_np[i] = bearoff_targets
-                win_prob, gam_win_cond, gam_loss_cond, _ = bearoff_targets
-                has_win = win_prob > 0.0
-                has_loss = (1.0 - win_prob) > 0.0
-                has_gammon = (gam_win_cond > 0.0) or (gam_loss_cond > 0.0)
-                value_masks_np[i] = np.array([
-                    1.0,
-                    1.0 if has_win else 0.0,
-                    1.0 if has_loss else 0.0,
-                    1.0 if has_gammon else 0.0,
-                ], dtype=np.float32)
-            else:
-                target_probs_list.append(None)
+                p_gammon_win = win * gam_win_cond
+                p_gammon_loss = (1.0 - win) * gam_loss_cond
+                equity = (2.0 * win - 1.0) + (p_gammon_win - p_gammon_loss)
 
-        # Update rewards for bearoff positions
-        new_rewards = rewards_np.copy()
-        for i in range(batch_size):
-            if is_bearoff[i]:
-                cur_p = int(cur_player_np[i])
+                new_rewards = rewards.copy()
+                cur_p = cur_player_id[bearoff_idx]
                 opp_p = 1 - cur_p
-                board = boards[i]
-                # Get equity from bearoff table
-                perfect_val = self._get_bearoff_value_np(board)
-                # Equity from current player's perspective; zero-sum for opponent
-                new_rewards[i, cur_p] = perfect_val
-                new_rewards[i, opp_p] = -perfect_val
+                new_rewards[bearoff_idx, cur_p] = equity
+                new_rewards[bearoff_idx, opp_p] = -equity
+                rewards = new_rewards
 
-        # Convert back to JAX and create new batch
-        new_rewards_jax = jnp.array(new_rewards)
-        modified_batch = batch.replace(reward=new_rewards_jax)
+                bearoff_avg_gam_win_cond = np.array(float(np.mean(gam_win_cond)), dtype=np.float32)
 
-        # Prepare value targets/masks/weights
-        value_targets = jnp.array(value_targets_np, dtype=jnp.float32)
-        value_masks = jnp.array(value_masks_np, dtype=jnp.float32)
-        value_sample_weights = jnp.where(
-            jnp.array(is_bearoff),
-            jnp.array(self.bearoff_value_weight, dtype=jnp.float32),
-            jnp.ones(batch_size, dtype=jnp.float32),
-        )
+        value_sample_weights = np.ones(batch_size, dtype=np.float32)
+        if is_bearoff.any():
+            value_sample_weights[is_bearoff] = float(self.bearoff_value_weight)
 
-        # Metrics - include mask for separate loss tracking
-        is_bearoff_jax = jnp.array(is_bearoff)
         metrics = {
-            'bearoff_count': jnp.array(bearoff_count),
-            'total_count': jnp.array(batch_size),
-            'is_bearoff_mask': is_bearoff_jax,
-            'bearoff_avg_gam_win_cond': jnp.array(0.0, dtype=jnp.float32),
+            'bearoff_count': np.array(int(np.sum(is_bearoff)), dtype=np.int32),
+            'total_count': np.array(batch_size, dtype=np.int32),
+            'is_bearoff_mask': is_bearoff,
+            'bearoff_avg_gam_win_cond': bearoff_avg_gam_win_cond,
         }
-        valid_targets = [tp for tp in target_probs_list if tp is not None]
-        if valid_targets:
-            stacked = np.stack(valid_targets)
-            # Index 1 is gam_win_cond (conditional P(gammon | win))
-            metrics['bearoff_avg_gam_win_cond'] = jnp.array(float(np.mean(stacked[:, 1])))
-
-        return modified_batch, metrics, value_targets, value_masks, value_sample_weights
+        return rewards, metrics, value_targets_np, value_masks_np, value_sample_weights
 
     def _setup_mlflow(self) -> None:
         """Set up MLflow tracking if configured."""
@@ -1050,6 +1177,7 @@ class TrainingWorker(BaseWorker):
         value_masks: jnp.ndarray,
         value_sample_weights: jnp.ndarray,
         policy_sample_weights: jnp.ndarray,
+        is_bearoff_mask: jnp.ndarray,
     ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
         """Perform a single training step with per-sample weights.
 
@@ -1063,6 +1191,7 @@ class TrainingWorker(BaseWorker):
             value_masks: Masks indicating which value targets are active.
             value_sample_weights: Per-sample weights for value loss (e.g., bearoff_value_weight).
             policy_sample_weights: Per-sample weights for policy loss.
+            is_bearoff_mask: Boolean mask indicating bearoff positions.
 
         Returns:
             Tuple of (updated_train_state, metrics_dict).
@@ -1077,6 +1206,7 @@ class TrainingWorker(BaseWorker):
             value_masks,
             value_sample_weights,
             policy_sample_weights,
+            is_bearoff_mask,
         )
 
         # Apply gradients
@@ -1105,26 +1235,64 @@ class TrainingWorker(BaseWorker):
         if buffer_size < self.min_buffer_size:
             return None
 
-        batch_data = self._get_next_batch_data()
-
-        if len(batch_data) < self.train_batch_size:
-            return None
-
-        # Convert to JAX arrays (returns BaseExperience dataclass)
-        try:
-            jax_batch = batch_experiences_to_jax(batch_data)
-            if jax_batch is None:
-                print(f"Worker {self.worker_id}: Empty batch after conversion")
+        prepared = None
+        if self._reuse_steps_remaining > 0 and self._reuse_prepared is not None:
+            prepared = self._reuse_prepared
+            self._reuse_steps_remaining -= 1
+        else:
+            np_batch = self._get_next_np_batch()
+            if not np_batch:
                 return None
-        except Exception as e:
-            print(f"Worker {self.worker_id}: Error converting batch: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
 
-        # Apply perfect bearoff values and build value targets/masks/weights
-        # Fail fast: bearoff processing must not silently degrade training targets.
-        jax_batch, bearoff_metrics, value_targets, value_masks, value_sample_weights = self._apply_bearoff_values_to_batch(jax_batch)
+            required_keys = ('observation_nn', 'policy_weights', 'policy_mask', 'cur_player_id', 'reward')
+            missing = [k for k in required_keys if k not in np_batch]
+            if missing:
+                print(f"Worker {self.worker_id}: Missing batch keys after conversion: {missing}")
+                return None
+
+            rewards_np, bearoff_metrics, value_targets_np, value_masks_np, value_sample_weights_np = (
+                self._apply_bearoff_values_to_numpy_batch(
+                    observation_nn=np_batch['observation_nn'],
+                    cur_player_id=np_batch['cur_player_id'],
+                    rewards=np_batch['reward'],
+                )
+            )
+
+            jax_batch = BaseExperience(
+                observation_nn=jnp.array(np_batch['observation_nn']),
+                policy_weights=jnp.array(np_batch['policy_weights']),
+                policy_mask=jnp.array(np_batch['policy_mask']),
+                cur_player_id=jnp.array(np_batch['cur_player_id']),
+                reward=jnp.array(rewards_np),
+            )
+
+            value_targets = jnp.array(value_targets_np, dtype=jnp.float32)
+            value_masks = jnp.array(value_masks_np, dtype=jnp.float32)
+            value_sample_weights = jnp.array(value_sample_weights_np, dtype=jnp.float32)
+            is_bearoff_mask = jnp.array(bearoff_metrics['is_bearoff_mask'], dtype=jnp.bool_)
+
+            prepared = {
+                'jax_batch': jax_batch,
+                'value_targets': value_targets,
+                'value_masks': value_masks,
+                'value_sample_weights': value_sample_weights,
+                'is_bearoff_mask': is_bearoff_mask,
+                'bearoff_metrics': bearoff_metrics,
+            }
+
+            if self.batch_reuse_steps > 1:
+                self._reuse_prepared = prepared
+                self._reuse_steps_remaining = self.batch_reuse_steps - 1
+            else:
+                self._reuse_prepared = None
+                self._reuse_steps_remaining = 0
+
+        jax_batch = prepared['jax_batch']
+        value_targets = prepared['value_targets']
+        value_masks = prepared['value_masks']
+        value_sample_weights = prepared['value_sample_weights']
+        is_bearoff_mask = prepared['is_bearoff_mask']
+        bearoff_metrics = prepared['bearoff_metrics']
 
         # Keep policy samples unweighted; bearoff logits come from self-play
         policy_sample_weights = jnp.ones_like(value_sample_weights)
@@ -1137,6 +1305,7 @@ class TrainingWorker(BaseWorker):
             value_masks,
             value_sample_weights,
             policy_sample_weights,
+            is_bearoff_mask,
         )
 
         # Convert metrics to Python floats
@@ -1149,73 +1318,18 @@ class TrainingWorker(BaseWorker):
         metrics['bearoff_pct'] = 100.0 * bearoff_count / max(total_count, 1)
         metrics['bearoff_avg_gam_win_cond'] = float(bearoff_metrics['bearoff_avg_gam_win_cond'])
 
-        # Compute separate losses for bearoff vs non-bearoff positions
-        is_bearoff_mask = bearoff_metrics['is_bearoff_mask']
+        # Split losses come from the jitted loss function (no extra forward passes).
+        non_bearoff_count = total_count - bearoff_count
         if bearoff_count > 0:
-            # Get predictions for the batch (no grad computation)
-            pred_policy_logits, pred_value_logits = self._train_state.apply_fn(
-                {'params': self._train_state.params},
-                x=jax_batch.observation_nn,
-            )
-
-            # Mask invalid actions in policy for softmax
-            pred_policy_logits = jnp.where(
-                jax_batch.policy_mask,
-                pred_policy_logits,
-                jnp.finfo(jnp.float32).min
-            )
-
-            # Compute per-sample 4-way masked BCE value loss
-            # Numerically stable sigmoid cross-entropy per element
-            bce = jnp.maximum(pred_value_logits, 0) - pred_value_logits * value_targets + jnp.log1p(jnp.exp(-jnp.abs(pred_value_logits)))
-            masked_bce = bce * value_masks
-            # Per-sample loss = sum over 4 outputs / count of active masks
-            per_sample_mask_count = jnp.sum(value_masks, axis=-1)
-            value_ce = jnp.sum(masked_bce, axis=-1) / jnp.maximum(per_sample_mask_count, 1.0)
-
-            # Compute per-sample policy cross-entropy
-            policy_ce = optax.softmax_cross_entropy(pred_policy_logits, jax_batch.policy_weights)
-
-            bearoff_mask_float = is_bearoff_mask.astype(jnp.float32)
-            non_bearoff_count = total_count - bearoff_count
-            non_bearoff_mask_float = (1.0 - bearoff_mask_float)
-
-            # Bearoff value loss (cross-entropy for bearoff positions only)
-            bearoff_value_loss = jnp.sum(value_ce * bearoff_mask_float) / max(bearoff_count, 1)
-            metrics['bearoff_value_loss'] = float(bearoff_value_loss)
-
-            # Bearoff policy loss (cross-entropy for bearoff positions only)
-            bearoff_policy_loss = jnp.sum(policy_ce * bearoff_mask_float) / max(bearoff_count, 1)
-            metrics['bearoff_policy_loss'] = float(bearoff_policy_loss)
-
-            # Non-bearoff value loss
-            if non_bearoff_count > 0:
-                non_bearoff_value_loss = jnp.sum(value_ce * non_bearoff_mask_float) / non_bearoff_count
-                metrics['non_bearoff_value_loss'] = float(non_bearoff_value_loss)
-                # Non-bearoff policy loss
-                non_bearoff_policy_loss = jnp.sum(policy_ce * non_bearoff_mask_float) / non_bearoff_count
-                metrics['non_bearoff_policy_loss'] = float(non_bearoff_policy_loss)
-            else:
-                metrics['non_bearoff_value_loss'] = 0.0
-                metrics['non_bearoff_policy_loss'] = 0.0
-
-            # Update cumulative stats
-            self._training_stats.cumulative_bearoff_value_loss += float(bearoff_value_loss) * bearoff_count
+            self._training_stats.cumulative_bearoff_value_loss += metrics.get('bearoff_value_loss', 0.0) * bearoff_count
             self._training_stats.bearoff_value_loss_count += bearoff_count
-        else:
-            # No bearoff positions - all are non-bearoff
-            metrics['bearoff_value_loss'] = 0.0
-            metrics['bearoff_policy_loss'] = 0.0
-            metrics['non_bearoff_value_loss'] = metrics.get('value_loss', 0.0)
-            metrics['non_bearoff_policy_loss'] = metrics.get('policy_loss', 0.0)
+        if non_bearoff_count > 0:
+            self._training_stats.cumulative_non_bearoff_value_loss += metrics.get('non_bearoff_value_loss', 0.0) * non_bearoff_count
+            self._training_stats.non_bearoff_value_loss_count += non_bearoff_count
 
         # Update experience counts
         self._training_stats.bearoff_experiences += bearoff_count
-        non_bearoff_count = total_count - bearoff_count
         self._training_stats.non_bearoff_experiences += non_bearoff_count
-        if non_bearoff_count > 0:
-            self._training_stats.cumulative_non_bearoff_value_loss += metrics.get('value_loss', 0.0) * non_bearoff_count
-            self._training_stats.non_bearoff_value_loss_count += non_bearoff_count
 
         self._total_steps += 1
         self.stats.training_steps += 1
@@ -1256,10 +1370,29 @@ class TrainingWorker(BaseWorker):
                         time.sleep(0.05)
                         continue
 
+                    np_batch = experiences_to_numpy_batch(
+                        batch_data,
+                        decode_threads=self.decode_threads,
+                    )
+                    if not np_batch:
+                        time.sleep(0.05)
+                        continue
+
+                    required_keys = (
+                        'observation_nn',
+                        'policy_weights',
+                        'policy_mask',
+                        'cur_player_id',
+                        'reward',
+                    )
+                    if any(k not in np_batch for k in required_keys):
+                        time.sleep(0.05)
+                        continue
+
                     # Best-effort: drop if queue is full.
                     assert self._prefetch_queue is not None
                     try:
-                        self._prefetch_queue.put(batch_data, timeout=0.1)
+                        self._prefetch_queue.put(np_batch, timeout=0.1)
                     except queue.Full:
                         pass
                 except Exception:
@@ -1272,7 +1405,7 @@ class TrainingWorker(BaseWorker):
         )
         self._prefetch_thread.start()
 
-    def _get_next_batch_data(self):
+    def _get_next_np_batch(self) -> Optional[Dict[str, np.ndarray]]:
         if self._prefetch_queue is not None:
             try:
                 return self._prefetch_queue.get_nowait()
@@ -1282,16 +1415,48 @@ class TrainingWorker(BaseWorker):
         # Fallback to synchronous sampling.
         min_version = max(0, self.current_model_version - 10)  # Allow slightly old experiences
         if self.surprise_weight > 0:
-            return self.buffer.sample_batch_surprise_weighted(
+            batch_data = self.buffer.sample_batch_surprise_weighted(
                 self.train_batch_size,
                 surprise_weight=self.surprise_weight,
                 min_model_version=min_version,
             )
-        return self.buffer.sample_batch(
-            self.train_batch_size,
-            min_model_version=min_version,
-            require_rewards=True,
+        else:
+            batch_data = self.buffer.sample_batch(
+                self.train_batch_size,
+                min_model_version=min_version,
+                require_rewards=True,
+            )
+
+        if len(batch_data) < self.train_batch_size:
+            return None
+
+        np_batch = experiences_to_numpy_batch(
+            batch_data,
+            decode_threads=self.decode_threads,
         )
+        return np_batch or None
+
+    def _maybe_refresh_metrics_registration(
+        self,
+        ttl_seconds: int = 300,
+        min_interval_seconds: float = 60.0,
+    ) -> None:
+        if self._metrics_port_bound is None:
+            return
+        now = time.time()
+        if (now - self._metrics_last_registration_time) < min_interval_seconds:
+            return
+        try:
+            register_metrics_endpoint(
+                self.buffer.redis,
+                worker_id=self.worker_id,
+                worker_type='training',
+                port=int(self._metrics_port_bound),
+                ttl_seconds=int(ttl_seconds),
+            )
+            self._metrics_last_registration_time = now
+        except Exception:
+            pass
 
     def _get_current_games_count(self) -> int:
         """Get total number of completed games ever added (monotonic).
@@ -1313,6 +1478,7 @@ class TrainingWorker(BaseWorker):
         batch_start = time.time()
         batch_metrics = []
         steps_done = 0
+        last_stdout_time = batch_start
 
         self._training_stats.current_batch_start_time = batch_start
         self._training_stats.current_batch_steps = 0
@@ -1320,6 +1486,9 @@ class TrainingWorker(BaseWorker):
         prom_metrics = get_metrics()
 
         while steps_done < target_steps and self.running:
+            # Keep Prometheus discovery alive during long training batches.
+            self._maybe_refresh_metrics_registration()
+
             step_metrics = self._sample_and_train()
 
             if step_metrics is None:
@@ -1345,6 +1514,20 @@ class TrainingWorker(BaseWorker):
                     ).set(live_steps_per_sec)
                     self._last_progress_time = now
                     self._last_progress_steps = self._total_steps
+
+            now = time.time()
+            if now - last_stdout_time >= 30.0:
+                elapsed = now - batch_start
+                steps_per_sec = steps_done / max(elapsed, 0.001)
+                avg_loss = (
+                    self._training_stats.cumulative_loss / max(self._training_stats.loss_count, 1)
+                )
+                print(
+                    f"Worker {self.worker_id}: Training progress "
+                    f"{steps_done}/{target_steps} steps "
+                    f"(total_steps={self._total_steps}, {steps_per_sec:.2f} steps/s, avg_loss={avg_loss:.4f})"
+                )
+                last_stdout_time = now
 
         batch_duration = time.time() - batch_start
 
@@ -1401,6 +1584,12 @@ class TrainingWorker(BaseWorker):
         self._setup_neural_network()
         self._initialize_train_state()
 
+        # Ensure only one training worker is active cluster-wide (prevents RAM OOM).
+        self._acquire_training_lock()
+
+        # Now that we own the training lock, load large resources (bearoff table).
+        self._maybe_load_bearoff_table()
+
         # Ensure collection is not paused from a previous crash
         self.state.set_collection_paused(False)
         print(f"Worker {self.worker_id}: Cleared collection pause state")
@@ -1416,6 +1605,8 @@ class TrainingWorker(BaseWorker):
             metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
+        self._metrics_port_bound = int(metrics_port)
+        self._metrics_last_registration_time = 0.0
         last_metrics_refresh = time.time()
 
         # Register metrics endpoint for dynamic discovery (use actual bound port)
@@ -1427,6 +1618,7 @@ class TrainingWorker(BaseWorker):
                 port=metrics_port,
                 ttl_seconds=300,
             )
+            self._metrics_last_registration_time = time.time()
             print(f"Worker {self.worker_id}: Registered metrics endpoint on port {metrics_port}")
         except Exception as e:
             print(f"Worker {self.worker_id}: Failed to register metrics endpoint: {e}")
@@ -1447,7 +1639,12 @@ class TrainingWorker(BaseWorker):
         )
         min_backlog_steps = int(self.config.get('min_backlog_steps', 1))
         max_train_steps_per_batch = int(self.config.get('max_train_steps_per_batch', self.steps_per_epoch))
-        pause_collection_during_training = bool(self.config.get('pause_collection_during_training', False))
+        # Only pause collection when training uses a GPU; CPU training does not contend
+        # with GPU collection workers.
+        pause_collection_during_training = (
+            bool(self.config.get('pause_collection_during_training', False))
+            and self.device_info.is_gpu
+        )
 
         print(f"Worker {self.worker_id}: Game-ratio-gated training mode")
         print(
@@ -1542,6 +1739,7 @@ class TrainingWorker(BaseWorker):
                             port=metrics_port,
                             ttl_seconds=300,
                         )
+                        self._metrics_last_registration_time = current_time
                     except Exception:
                         pass
                     metrics.training_steps_per_second.labels(
@@ -1588,27 +1786,30 @@ class TrainingWorker(BaseWorker):
                 f"new_games={new_games})"
             )
 
-            if pause_collection_during_training:
-                # Pause game collection for exclusive GPU access during training
-                self.state.set_collection_paused(True)
-                print(f"Worker {self.worker_id}: Paused game collection for training")
+            paused_collection = False
+            try:
+                if pause_collection_during_training:
+                    # Pause game collection for exclusive GPU access during training
+                    self.state.set_collection_paused(True)
+                    paused_collection = True
+                    print(f"Worker {self.worker_id}: Paused game collection for training")
 
-            # Set training phase
-            set_phase(WorkerPhase.TRAINING)
+                # Set training phase
+                set_phase(WorkerPhase.TRAINING)
 
-            # Run training epoch (game collection is paused)
-            batch_metrics = self._run_training_batch(target_steps)
+                # Run training epoch (game collection is paused)
+                batch_metrics = self._run_training_batch(target_steps)
 
-            # Push updated weights to Redis
-            self._push_weights_to_redis()
+                # Push updated weights to Redis
+                self._push_weights_to_redis()
 
-            # Back to idle after training completes
-            set_phase(WorkerPhase.IDLE)
+            finally:
+                # Back to idle even if training fails (prevents deadlocked collection pause).
+                set_phase(WorkerPhase.IDLE)
 
-            if pause_collection_during_training:
-                # Resume game collection
-                self.state.set_collection_paused(False)
-                print(f"Worker {self.worker_id}: Resumed game collection")
+                if paused_collection:
+                    self.state.set_collection_paused(False)
+                    print(f"Worker {self.worker_id}: Resumed game collection")
 
             # Update tracking
             self._training_stats.games_at_last_train = current_games

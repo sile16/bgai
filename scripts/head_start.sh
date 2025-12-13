@@ -14,7 +14,7 @@
 #   ./scripts/head_start.sh --config-file path/to.yaml
 #
 # Env overrides:
-#   TRAIN_MEM_FRACTION, GAME_MEM_FRACTION, EVAL_JAX_PLATFORMS
+#   TRAIN_MEM_GB, GAME_MEM_GB, EVAL_JAX_PLATFORMS
 
 set -e
 
@@ -130,11 +130,12 @@ fi
 export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="
-export XLA_PYTHON_CLIENT_MEM_FRACTION="${HEAD_MEM_FRACTION:-0.45}"
 
-TRAIN_MEM_FRACTION="${TRAIN_MEM_FRACTION:-0.30}"
-GAME_MEM_FRACTION="${GAME_MEM_FRACTION:-0.15}"
 EVAL_JAX_PLATFORMS="${EVAL_JAX_PLATFORMS:-cpu}"
+
+# Prefer fixed GPU memory caps from config; can override via env.
+TRAIN_MEM_GB="${TRAIN_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['train_gpu_memory_gb'])")}"
+GAME_MEM_GB="${GAME_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['game_gpu_memory_gb'])")}"
 
 # Optional per-head batch overrides.
 HEAD_TRAIN_BATCH_SIZE="${HEAD_TRAIN_BATCH_SIZE:-}"
@@ -245,18 +246,19 @@ fi
 # Workers on head
 # =============================================================================
 echo "[6/7] Starting training worker..."
-XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRACTION" python -m distributed.cli.main training-worker \
+# Use fixed GPU memory caps (GB) so allocation is stable across GPUs.
+python -m distributed.cli.main training-worker \
     --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --num-gpus 1.0 \
+    --gpu-mem-gb "$TRAIN_MEM_GB" \
     ${HEAD_TRAIN_BATCH_SIZE:+--batch-size $HEAD_TRAIN_BATCH_SIZE} \
     > "$LOG_DIR/training_$TIMESTAMP.log" 2>&1 &
 TRAIN_PID=$!
 
 echo "       Starting game worker..."
-XLA_PYTHON_CLIENT_MEM_FRACTION="$GAME_MEM_FRACTION" python -m distributed.cli.main game-worker \
+python -m distributed.cli.main game-worker \
     --config-file "$CONFIG_FILE" \
-    --num-gpus 1.0 \
+    --gpu-mem-gb "$GAME_MEM_GB" \
     ${HEAD_GAME_BATCH_SIZE:+--batch-size $HEAD_GAME_BATCH_SIZE} \
     > "$LOG_DIR/game_gpu_$TIMESTAMP.log" 2>&1 &
 GAME_PID=$!

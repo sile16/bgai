@@ -32,12 +32,14 @@ mcts:
   # Values: [1.0, 0.5, 0.1] for first [1e5, 2e5, 3e5] steps, then 0.0 (greedy)
   temperature_schedule_values: [1.0, 0.5, 0.1, 0.0]
   temperature_schedule_steps: [100000, 200000, 300000]
-  discount: -1.0               # -1 for two-player zero-sum games
+  #discount: -1.0               # -1 for two-player zero-sum games
 
 training:
   batch_size: 128              # Base training batch size (overridden by device_configs)
   steps_per_epoch: 20000           # Training steps run once games_per_epoch new games are collected
   learning_rate: 0.0003            # Adam learning rate
+  decode_threads: 8                # CPU threads for msgpack decode/stack (0=off)
+  batch_reuse_steps: 4             # Run N updates per sampled batch to reduce CPU bottleneck
   # When training and GPU collection share the same GPU (head node), pause GPU collection
   # during training to avoid severe contention and keep training throughput stable.
   pause_collection_during_training: true
@@ -121,14 +123,15 @@ device_configs:
     # With mutually exclusive training/collection, each gets full GPU compute
     # Memory is split 45%/45% but compute alternates for 100% utilization
     # batch_size=128 with max_nodes=2000 fits in 11GB with ~62% GPU util
-    # NOTE: 200 frequently OOMs on RTX 4090 with current MCTS settings (200 sims, 2000 max_nodes).
     # Keep this conservative so the head GPU game worker stays alive.
     game_batch_size: 64
-    game_gpu_memory_fraction: 0.3
+    # Fixed per-process GPU memory caps (GB). Prefer these over fractions.
+    # Keep sums below total VRAM so multiple JAX processes can coexist.
+    game_gpu_memory_gb: 15.0
     train_batch_size: 4096
-    train_gpu_memory_fraction: 0.3
+    train_gpu_memory_gb: 6.0
     eval_batch_size: 32
-    eval_gpu_memory_fraction: 0.1
+    eval_gpu_memory_gb: 2.0
 
   metal:
     # Apple Silicon (M1, M2, M3)

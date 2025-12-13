@@ -28,8 +28,8 @@ mkdir -p "$GRAFANA_DIR/data"
 mkdir -p "$GRAFANA_DIR/conf/provisioning/datasources"
 mkdir -p "$GRAFANA_DIR/conf/provisioning/dashboards"
 
-# BGAI dashboard location
-BGAI_DASHBOARDS_DIR="$PROJECT_DIR/tools"
+# BGAI dashboard location (keep this directory dedicated to dashboards only)
+BGAI_DASHBOARDS_DIR="$PROJECT_DIR/tools/dashboards"
 
 echo "Using BGAI dashboards from: $BGAI_DASHBOARDS_DIR"
 
@@ -56,6 +56,7 @@ providers:
     disableDeletion: false
     editable: true
     updateIntervalSeconds: 30
+    allowUiUpdates: false
     options:
       path: $BGAI_DASHBOARDS_DIR
       foldersFromFilesStructure: false
@@ -70,7 +71,7 @@ root_url = http://localhost:3000
 [auth.anonymous]
 enabled = true
 org_name = Main Org.
-org_role = Viewer
+org_role = Editor
 
 [security]
 allow_embedding = true

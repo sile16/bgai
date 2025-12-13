@@ -19,6 +19,9 @@ import numpy as np
 _msgpack = None
 _jax = None
 _jnp = None
+_decode_executor = None
+_decode_executor_workers = 0
+_decode_executor_lock = None
 
 
 def _get_msgpack():
@@ -41,6 +44,28 @@ def _get_jax():
         _jax = jax
         _jnp = jnp
     return _jax, _jnp
+
+
+def _get_decode_executor(max_workers: int):
+    """Return a shared ThreadPoolExecutor for decode-heavy CPU work."""
+    global _decode_executor, _decode_executor_workers, _decode_executor_lock
+    if max_workers <= 1:
+        return None
+
+    if _decode_executor_lock is None:
+        import threading
+        _decode_executor_lock = threading.Lock()
+
+    with _decode_executor_lock:
+        if _decode_executor is not None and _decode_executor_workers == max_workers:
+            return _decode_executor
+
+        # Replace the existing executor if the worker count changes.
+        # We don't aggressively shutdown the old pool to keep this safe for long-running processes.
+        from concurrent.futures import ThreadPoolExecutor
+        _decode_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bgai-decode")
+        _decode_executor_workers = max_workers
+        return _decode_executor
 
 
 # =============================================================================
@@ -304,20 +329,25 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]):
     )
 
 
-def experiences_to_numpy_batch(experiences: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+def experiences_to_numpy_batch(
+    experiences: List[Dict[str, Any]],
+    decode_threads: int = 0,
+) -> Dict[str, np.ndarray]:
     """Convert experiences to batched numpy arrays (no JAX conversion).
 
     Useful when you want to stay on CPU or defer JAX conversion.
 
     Args:
         experiences: List of experience dicts with serialized data.
+        decode_threads: If >1, decode experiences in a shared thread pool.
 
     Returns:
         Dict with batched numpy arrays.
     """
-    # Deserialize all experiences
-    deserialized = []
-    for exp in experiences:
+    # Ensure msgpack_numpy patch is applied before any parallel decode.
+    _get_msgpack()
+
+    def _decode_one(exp: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(exp.get('data'), bytes):
             exp_data = deserialize_experience(exp['data'])
         else:
@@ -346,7 +376,17 @@ def experiences_to_numpy_batch(experiences: List[Dict[str, Any]]) -> Dict[str, n
 
             exp_data['reward'] = rewards
 
-        deserialized.append(exp_data)
+        return exp_data
+
+    # Deserialize all experiences
+    if decode_threads and decode_threads > 1 and len(experiences) >= 256:
+        executor = _get_decode_executor(int(decode_threads))
+        if executor is None:
+            deserialized = [_decode_one(exp) for exp in experiences]
+        else:
+            deserialized = list(executor.map(_decode_one, experiences))
+    else:
+        deserialized = [_decode_one(exp) for exp in experiences]
 
     if not deserialized:
         return {}

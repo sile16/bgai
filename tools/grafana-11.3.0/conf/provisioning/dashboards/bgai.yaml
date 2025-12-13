@@ -7,5 +7,7 @@ providers:
     disableDeletion: false
     editable: true
     updateIntervalSeconds: 30
+    allowUiUpdates: false
     options:
-      path: /home/sile/github/bgai/tools
+      path: /home/sile/github/bgai/tools/dashboards
+      foldersFromFilesStructure: false

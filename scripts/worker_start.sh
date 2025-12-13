@@ -78,11 +78,7 @@ detect_platform() {
     elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         PLATFORM="cuda"
         DEVICE_TYPE="cuda"
-        # Set memory fraction based on actual JAX memory usage analysis
-        # Game worker: 2.51 GB peak → 5 GB (0.21), Eval: ~1 GB → 2 GB (0.09)
-        # This will be overridden per-worker if needed
-        export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.21}"
-        echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION"
+        # GPU memory is configured per-worker via --gpu-mem-gb.
     else
         PLATFORM="cpu"
         DEVICE_TYPE="cpu"
@@ -183,7 +179,7 @@ apply_force_device() {
             PLATFORM="cuda"
             DEVICE_TYPE="cuda"
             export JAX_PLATFORMS=cuda
-            export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.21}"
+            unset XLA_PYTHON_CLIENT_MEM_FRACTION 2>/dev/null || true
             ;;
         tpu)
             PLATFORM="tpu"
@@ -381,6 +377,10 @@ start_game_worker() {
     local cmd="python -m distributed.cli.main game-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --head-ip $HEAD_IP"
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        local gpu_mem_gb="${GAME_GPU_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['game_gpu_memory_gb'])")}"
+        cmd="$cmd --gpu-mem-gb $gpu_mem_gb"
+    fi
 
     if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_GAME_BATCH"
@@ -443,6 +443,10 @@ start_eval_worker() {
     local cmd="python -m distributed.cli.main eval-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --head-ip $HEAD_IP"
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        local gpu_mem_gb="${EVAL_GPU_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['eval_gpu_memory_gb'])")}"
+        cmd="$cmd --gpu-mem-gb $gpu_mem_gb"
+    fi
 
     if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_EVAL_BATCH"
