@@ -40,6 +40,7 @@ from prometheus_client import (
     start_http_server,
     REGISTRY,
 )
+from prometheus_client.exposition import push_to_gateway, delete_from_gateway
 
 # Optional imports for system metrics
 try:
@@ -640,6 +641,9 @@ _metrics_lock = threading.Lock()
 _server_started = False
 _server_port: Optional[int] = None
 
+# Optional Pushgateway pusher (per-process)
+_pushgateway_pusher = None
+
 
 def get_metrics() -> BGAIMetrics:
     """Get the global metrics instance.
@@ -697,6 +701,96 @@ def reset_metrics():
         _metrics = None
         _server_started = False
         _server_port = None
+
+
+class PushgatewayPusher(threading.Thread):
+    def __init__(
+        self,
+        url: str,
+        job: str,
+        grouping_key: Dict[str, str],
+        interval_seconds: float = 10.0,
+        registry: CollectorRegistry = REGISTRY,
+    ):
+        super().__init__(daemon=True)
+        self.url = url
+        self.job = job
+        self.grouping_key = grouping_key
+        self.interval_seconds = interval_seconds
+        self.registry = registry
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                push_to_gateway(
+                    self.url,
+                    job=self.job,
+                    registry=self.registry,
+                    grouping_key=self.grouping_key,
+                )
+            except Exception as e:
+                print(f"Pushgateway push failed ({self.url}): {e}")
+            self._stop_event.wait(self.interval_seconds)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def delete(self) -> None:
+        try:
+            delete_from_gateway(
+                self.url,
+                job=self.job,
+                grouping_key=self.grouping_key,
+            )
+        except Exception as e:
+            print(f"Pushgateway delete failed ({self.url}): {e}")
+
+
+def start_pushgateway_pusher(
+    url: str,
+    worker_id: str,
+    worker_type: str,
+    interval_seconds: float = 10.0,
+    job: str = "bgai_pushed_workers",
+) -> Optional[PushgatewayPusher]:
+    global _pushgateway_pusher
+    if _pushgateway_pusher is not None and _pushgateway_pusher.is_alive():
+        return _pushgateway_pusher
+
+    grouping_key = {
+        # Avoid collisions with existing metric labels (many metrics already
+        # have worker_id/worker_type labels).
+        "pushed_worker_id": worker_id,
+        "pushed_worker_type": worker_type,
+    }
+
+    pusher = PushgatewayPusher(
+        url=url,
+        job=job,
+        grouping_key=grouping_key,
+        interval_seconds=interval_seconds,
+        registry=get_metrics().registry,
+    )
+    _pushgateway_pusher = pusher
+    pusher.start()
+    print(f"Pushgateway pusher started for {worker_id} -> {url}")
+    return pusher
+
+
+def stop_pushgateway_pusher(delete: bool = True) -> None:
+    global _pushgateway_pusher
+    pusher = _pushgateway_pusher
+    _pushgateway_pusher = None
+    if pusher is None:
+        return
+
+    try:
+        pusher.stop()
+        pusher.join(timeout=5)
+    finally:
+        if delete:
+            pusher.delete()
 
 
 # =============================================================================

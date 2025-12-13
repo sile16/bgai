@@ -26,7 +26,13 @@ from ..coordinator.redis_state import (
     WORKER_TTL,
 )
 from ..device import detect_device, get_device_config, DeviceInfo
-from ..metrics import get_metrics, start_system_metrics_collector, stop_system_metrics_collector
+from ..metrics import (
+    get_metrics,
+    start_pushgateway_pusher,
+    stop_pushgateway_pusher,
+    start_system_metrics_collector,
+    stop_system_metrics_collector,
+)
 
 try:
     import psutil
@@ -372,6 +378,17 @@ class BaseWorker(ABC):
         # Start system metrics collector (CPU, RAM, GPU monitoring)
         start_system_metrics_collector(self.worker_id)
 
+        # Optional Pushgateway support for environments that cannot be scraped
+        # (e.g. Google Colab notebooks behind NAT).
+        pushgateway_url = self.config.get('pushgateway_url')
+        if pushgateway_url:
+            start_pushgateway_pusher(
+                url=pushgateway_url,
+                worker_id=self.worker_id,
+                worker_type=self.worker_type,
+                interval_seconds=float(self.config.get('pushgateway_interval_seconds', 10.0)),
+            )
+
         try:
             # Run the main loop
             result = self._run_loop(num_iterations)
@@ -393,6 +410,7 @@ class BaseWorker(ABC):
         self.running = False
         self._stop_heartbeat()
         stop_system_metrics_collector()
+        stop_pushgateway_pusher(delete=True)
         self.deregister()
 
     # =========================================================================

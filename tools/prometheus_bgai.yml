@@ -15,3 +15,8 @@ scrape_configs:
   - files:
     - 'bgai_prometheus_targets.json'
     refresh_interval: 15s
+
+# Scrape Pushgateway (for workers that cannot be scraped, e.g. Colab)
+- job_name: 'pushgateway'
+  static_configs:
+  - targets: ['127.0.0.1:9091']

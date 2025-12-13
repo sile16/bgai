@@ -6,6 +6,7 @@
 #   - Training worker (GPU)
 #   - Game worker (GPU)
 #   - Eval worker (CPU)
+#   - Pushgateway (optional; for Colab metrics)
 #
 # Usage:
 #   ./scripts/head_start.sh            # restart/continue existing run
@@ -180,8 +181,29 @@ else
         --web.enable-lifecycle \
         > "$LOG_DIR/prometheus_$TIMESTAMP.log" 2>&1 &
     PROMETHEUS_PID=$!
-    echo "       Prometheus PID: $PROMETHEUS_PID"
-    sleep 2
+	    echo "       Prometheus PID: $PROMETHEUS_PID"
+	    sleep 2
+	fi
+
+# =============================================================================
+# Start Pushgateway (optional)
+# =============================================================================
+echo "       Starting Pushgateway..."
+PUSHGW_DIR="$PROJECT_DIR/tools/pushgateway"
+PUSHGW_BIN="$PUSHGW_DIR/pushgateway"
+PUSHGW_PORT="${PUSHGATEWAY_PORT:-9091}"
+
+if [[ ! -x "$PUSHGW_BIN" ]]; then
+    echo "       WARNING: Pushgateway not installed. Run ./scripts/pushgateway_setup.sh first"
+    PUSHGATEWAY_PID=""
+else
+    pkill -f "$PUSHGW_BIN" 2>/dev/null || true
+    "$PUSHGW_BIN" \
+        --web.listen-address="0.0.0.0:${PUSHGW_PORT}" \
+        > "$LOG_DIR/pushgateway_$TIMESTAMP.log" 2>&1 &
+    PUSHGATEWAY_PID=$!
+    echo "       Pushgateway PID: $PUSHGATEWAY_PID"
+    sleep 1
 fi
 
 # =============================================================================
@@ -280,9 +302,10 @@ echo ""
 echo "=============================================="
 echo "  All services started!"
 echo "=============================================="
-echo "PIDs: MLflow=$MLFLOW_PID Prometheus=$PROMETHEUS_PID Grafana=$GRAFANA_PID Discovery=$DISCOVERY_PID Coord=$COORD_PID Train=$TRAIN_PID Game=$GAME_PID Eval=$EVAL_PID"
+echo "PIDs: MLflow=$MLFLOW_PID Prometheus=$PROMETHEUS_PID Pushgateway=$PUSHGATEWAY_PID Grafana=$GRAFANA_PID Discovery=$DISCOVERY_PID Coord=$COORD_PID Train=$TRAIN_PID Game=$GAME_PID Eval=$EVAL_PID"
 echo "Grafana:    http://$HEAD_IP:3000"
 echo "Prometheus: http://$HEAD_IP:9090"
+echo "Pushgateway: http://$HEAD_IP:${PUSHGW_PORT}"
 echo "MLflow:     http://$HEAD_IP:5000"
 echo ""
 echo "Check status: ./scripts/status.sh"

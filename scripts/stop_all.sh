@@ -13,6 +13,9 @@ pkill -f -- "--config=$PROJECT_DIR/tools/grafana-" 2>/dev/null || true
 echo "Stopping Prometheus..."
 pkill -f "prometheus" 2>/dev/null || true
 
+echo "Stopping Pushgateway..."
+pkill -f "pushgateway" 2>/dev/null || true
+
 echo "Stopping MLFlow..."
 pkill -f "mlflow server" 2>/dev/null || true
 pkill -f "uvicorn.*mlflow" 2>/dev/null || true

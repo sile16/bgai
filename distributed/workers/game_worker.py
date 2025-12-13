@@ -690,18 +690,22 @@ class GameWorker(BaseWorker):
             metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
-        # Register metrics endpoint for dynamic discovery (use actual bound port)
-        try:
-            register_metrics_endpoint(
-                self.buffer.redis,
-                worker_id=self.worker_id,
-                worker_type='game',
-                port=metrics_port,
-                ttl_seconds=300,
-            )
-            print(f"Worker {self.worker_id}: Registered metrics endpoint on port {metrics_port}")
-        except Exception as e:
-            print(f"Worker {self.worker_id}: Failed to register metrics endpoint: {e}")
+        # Register metrics endpoint for dynamic discovery (use actual bound port).
+        # If Pushgateway is enabled, don't register an unreachable scrape target.
+        if not self.config.get('pushgateway_url'):
+            try:
+                register_metrics_endpoint(
+                    self.buffer.redis,
+                    worker_id=self.worker_id,
+                    worker_type='game',
+                    port=metrics_port,
+                    ttl_seconds=300,
+                )
+                print(f"Worker {self.worker_id}: Registered metrics endpoint on port {metrics_port}")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Failed to register metrics endpoint: {e}")
+        else:
+            print(f"Worker {self.worker_id}: Pushgateway enabled; skipping scrape endpoint registration")
 
         # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
@@ -755,9 +759,8 @@ class GameWorker(BaseWorker):
             if num_iterations >= 0 and iteration >= num_iterations:
                 break
 
-            # Keep this worker visible in Prometheus discovery even if collection is paused.
             now = time.time()
-            if now - last_metrics_refresh >= 60.0:
+            if (not self.config.get('pushgateway_url')) and (now - last_metrics_refresh >= 60.0):
                 try:
                     register_metrics_endpoint(
                         self.buffer.redis,
@@ -820,17 +823,17 @@ class GameWorker(BaseWorker):
                     worker_id=self.worker_id
                 ).set(self._current_temperature)
 
-                # Refresh metrics registration
-                try:
-                    register_metrics_endpoint(
-                        self.buffer.redis,
-                        worker_id=self.worker_id,
-                        worker_type='game',
-                        port=metrics_port,
-                        ttl_seconds=300,
-                    )
-                except Exception:
-                    pass
+                if not self.config.get('pushgateway_url'):
+                    try:
+                        register_metrics_endpoint(
+                            self.buffer.redis,
+                            worker_id=self.worker_id,
+                            worker_type='game',
+                            port=metrics_port,
+                            ttl_seconds=300,
+                        )
+                    except Exception:
+                        pass
 
                 temp_str = f", temp={self._current_temperature:.2f}"
 

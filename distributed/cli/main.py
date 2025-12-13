@@ -188,6 +188,8 @@ def start_game_worker(args):
         config['max_episode_steps'] = args.max_episode_steps
     if args.metrics_port != 9100:
         config['metrics_port'] = args.metrics_port
+    if args.pushgateway_url:
+        config['pushgateway_url'] = args.pushgateway_url
 
     # Print config summary
     print_config_summary(yaml_config, device_type)
@@ -249,6 +251,8 @@ def start_training_worker(args):
         config['checkpoint_dir'] = args.checkpoint_dir
     if args.metrics_port != 9200:
         config['metrics_port'] = args.metrics_port
+    if args.pushgateway_url:
+        config['pushgateway_url'] = args.pushgateway_url
     if args.mlflow_uri:
         config['mlflow_tracking_uri'] = args.mlflow_uri
     if args.mlflow_experiment:
@@ -302,6 +306,8 @@ def start_eval_worker(args):
         config['max_nodes'] = args.mcts_max_nodes
     if args.metrics_port != 9300:
         config['metrics_port'] = args.metrics_port
+    if args.pushgateway_url:
+        config['pushgateway_url'] = args.pushgateway_url
 
     # Eval-specific settings
     config['eval_games'] = args.eval_games
@@ -712,6 +718,12 @@ def main():
         help='Prometheus metrics port (default: 9100)'
     )
     game_parser.add_argument(
+        '--pushgateway-url',
+        type=str,
+        default='',
+        help='Prometheus Pushgateway URL (e.g. http://<head-ip>:9091) for non-scrapable environments'
+    )
+    game_parser.add_argument(
         '--num-iterations',
         type=int,
         default=-1,
@@ -835,6 +847,12 @@ def main():
         help='Prometheus metrics port (default: 9200)'
     )
     train_parser.add_argument(
+        '--pushgateway-url',
+        type=str,
+        default='',
+        help='Prometheus Pushgateway URL (e.g. http://<head-ip>:9091) for non-scrapable environments'
+    )
+    train_parser.add_argument(
         '--mlflow-uri',
         type=str,
         default=None,
@@ -938,6 +956,12 @@ def main():
         type=int,
         default=9300,
         help='Prometheus metrics port (default: 9300)'
+    )
+    eval_parser.add_argument(
+        '--pushgateway-url',
+        type=str,
+        default='',
+        help='Prometheus Pushgateway URL (e.g. http://<head-ip>:9091) for non-scrapable environments'
     )
     eval_parser.add_argument(
         '--num-iterations',
