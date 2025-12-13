@@ -244,9 +244,30 @@ def batch_experiences_to_jax(experiences: List[Dict[str, Any]]):
         final_rewards = exp.get('final_rewards')
         if final_rewards is not None:
             if isinstance(final_rewards, bytes):
-                exp_data['reward'] = deserialize_rewards(final_rewards)
-            elif isinstance(final_rewards, np.ndarray) or hasattr(final_rewards, '__len__'):
-                exp_data['reward'] = final_rewards
+                rewards = deserialize_rewards(final_rewards)
+            elif isinstance(final_rewards, (np.ndarray, np.generic, int, float)) or hasattr(final_rewards, '__len__'):
+                rewards = final_rewards
+            else:
+                raise TypeError(f"Unsupported final_rewards type: {type(final_rewards)}")
+
+            rewards = np.asarray(rewards)
+            if rewards.shape == ():
+                # Scalar reward is assumed to be player-0 perspective.
+                r0 = float(rewards)
+                rewards = np.array([r0, -r0], dtype=np.float32)
+            elif rewards.ndim == 1 and rewards.shape[0] == 2:
+                rewards = rewards.astype(np.float32, copy=False)
+                # We expect zero-sum terminal rewards so cur_player selection is correct.
+                if not np.isfinite(rewards).all():
+                    raise ValueError(f"Non-finite terminal rewards: {rewards!r}")
+                if abs(float(rewards[0] + rewards[1])) > 1e-4:
+                    raise ValueError(
+                        f"Expected zero-sum terminal rewards [r0, r1] with r0==-r1, got {rewards!r}"
+                    )
+            else:
+                raise ValueError(f"Unexpected terminal rewards shape: {rewards.shape!r}")
+
+            exp_data['reward'] = rewards
 
         deserialized.append(exp_data)
 
@@ -304,9 +325,26 @@ def experiences_to_numpy_batch(experiences: List[Dict[str, Any]]) -> Dict[str, n
 
         if exp.get('final_rewards'):
             if isinstance(exp['final_rewards'], bytes):
-                exp_data['reward'] = deserialize_rewards(exp['final_rewards'])
+                rewards = deserialize_rewards(exp['final_rewards'])
             else:
-                exp_data['reward'] = exp['final_rewards']
+                rewards = exp['final_rewards']
+
+            rewards = np.asarray(rewards)
+            if rewards.shape == ():
+                r0 = float(rewards)
+                rewards = np.array([r0, -r0], dtype=np.float32)
+            elif rewards.ndim == 1 and rewards.shape[0] == 2:
+                rewards = rewards.astype(np.float32, copy=False)
+                if not np.isfinite(rewards).all():
+                    raise ValueError(f"Non-finite terminal rewards: {rewards!r}")
+                if abs(float(rewards[0] + rewards[1])) > 1e-4:
+                    raise ValueError(
+                        f"Expected zero-sum terminal rewards [r0, r1] with r0==-r1, got {rewards!r}"
+                    )
+            else:
+                raise ValueError(f"Unexpected terminal rewards shape: {rewards.shape!r}")
+
+            exp_data['reward'] = rewards
 
         deserialized.append(exp_data)
 

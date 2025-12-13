@@ -97,6 +97,13 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.games_truncated_total = Counter(
+            'bgai_games_truncated_total',
+            'Total games truncated/discarded (e.g. max episode steps)',
+            ['worker_id', 'worker_type', 'reason'],
+            registry=self.registry,
+        )
+
         self.experiences_total = Counter(
             'bgai_experiences_total',
             'Total experiences collected',

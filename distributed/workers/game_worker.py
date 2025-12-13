@@ -560,6 +560,24 @@ class GameWorker(BaseWorker):
             truncated = truncateds[i]
 
             if terminated or truncated:
+                # Track episode length for both terminated and truncated episodes.
+                # Episode steps are incremented when an experience is appended.
+                try:
+                    episode_len = len(state['episode_experiences'][i])
+                    if episode_len > 0:
+                        metrics.episode_length.labels(worker_id=self.worker_id).observe(episode_len)
+                except Exception:
+                    pass
+
+                if truncated and len(state['episode_experiences'][i]) > 0:
+                    # Truncated episodes are discarded (no terminal outcome),
+                    # but we track them so max_episode_steps issues are visible.
+                    metrics.games_truncated_total.labels(
+                        worker_id=self.worker_id,
+                        worker_type='game',
+                        reason='max_episode_steps',
+                    ).inc()
+
                 if terminated and not truncated and len(state['episode_experiences'][i]) > 0:
                     send_start = time.perf_counter()
                     self._send_episode_to_buffer(
@@ -735,6 +753,14 @@ class GameWorker(BaseWorker):
         metrics.worker_phase.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(WorkerPhase.COLLECTING)
+
+        # Pre-initialize truncated counter series so Grafana panels don't disappear
+        # when there are zero truncations.
+        metrics.games_truncated_total.labels(
+            worker_id=self.worker_id,
+            worker_type='game',
+            reason='max_episode_steps',
+        ).inc(0)
 
         print(f"Worker {self.worker_id}: Starting game collection loop...")
 
