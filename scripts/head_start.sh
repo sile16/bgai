@@ -264,7 +264,11 @@ python -m distributed.cli.main game-worker \
 GAME_PID=$!
 
 echo "[7/7] Starting eval worker (CPU)..."
-JAX_PLATFORMS="$EVAL_JAX_PLATFORMS" python -m distributed.cli.main eval-worker \
+# Use platform allocator to prevent XLA memory pool from holding onto memory
+JAX_PLATFORMS="$EVAL_JAX_PLATFORMS" \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+python -m distributed.cli.main eval-worker \
     --config-file "$CONFIG_FILE" \
     --eval-games 50 \
     --eval-types "random,self_play" \

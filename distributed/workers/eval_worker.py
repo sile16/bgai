@@ -13,6 +13,7 @@ Eval types:
 No Ray dependency - uses Redis for all coordination.
 """
 
+import gc
 import time
 from enum import Enum
 from functools import partial
@@ -158,6 +159,7 @@ class EvalWorker(BaseWorker):
         self._mcts_evaluator = None
         self._gnubg_evaluator = None
         self._random_evaluator = None
+        self._self_play_opponent_evaluator = None  # Reused for self-play evals
 
         # Track last evaluated version
         self._last_evaluated_version = 0
@@ -317,22 +319,31 @@ class EvalWorker(BaseWorker):
             branching_factor=self._env.num_actions,
             action_selector=PUCTSelector(),
             temperature=0.1,  # Lower temperature for evaluation (less exploration)
+            persist_tree=False,  # Don't persist tree between games to prevent memory growth
         )
 
-    def _make_self_play_opponent_evaluator(self) -> StochasticMCTS:
-        if self._nn_model is None:
-            self._setup_neural_network()
+    def _get_self_play_opponent_evaluator(self) -> StochasticMCTS:
+        """Get (or create) the self-play opponent evaluator.
 
-        eval_fn = make_nn_eval_fn(self._nn_model, self._state_to_nn_input_fn)
-        return StochasticMCTS(
-            eval_fn=eval_fn,
-            stochastic_action_probs=self._env.stochastic_action_probs,
-            num_iterations=self.num_simulations,
-            max_nodes=self.max_nodes,
-            branching_factor=self._env.num_actions,
-            action_selector=PUCTSelector(),
-            temperature=0.1,
-        )
+        Reuses a single evaluator instance to avoid memory leaks from
+        creating new JIT-compiled functions on each evaluation run.
+        """
+        if self._self_play_opponent_evaluator is None:
+            if self._nn_model is None:
+                self._setup_neural_network()
+
+            eval_fn = make_nn_eval_fn(self._nn_model, self._state_to_nn_input_fn)
+            self._self_play_opponent_evaluator = StochasticMCTS(
+                eval_fn=eval_fn,
+                stochastic_action_probs=self._env.stochastic_action_probs,
+                num_iterations=self.num_simulations,
+                max_nodes=self.max_nodes,
+                branching_factor=self._env.num_actions,
+                action_selector=PUCTSelector(),
+                temperature=0.1,
+                persist_tree=False,  # Don't persist tree between games to prevent memory growth
+            )
+        return self._self_play_opponent_evaluator
 
     def _setup_gnubg_evaluator(self) -> None:
         """Set up the GNUBG evaluator with configurable settings."""
@@ -692,7 +703,7 @@ class EvalWorker(BaseWorker):
             # Use TurboZero's two_player_game (JIT-compatible)
             results = self._run_two_player_eval(self._random_evaluator, None)
         elif eval_type_normalized == EvalType.SELF_PLAY.value:
-            opponent = self._make_self_play_opponent_evaluator()
+            opponent = self._get_self_play_opponent_evaluator()
             results = self._run_two_player_eval(opponent, self._nn_params)
         else:
             print(f"Worker {self.worker_id}: Unknown eval type: {eval_type}")
@@ -725,6 +736,35 @@ class EvalWorker(BaseWorker):
             timestamp=time.time(),
         )
 
+    def _get_jitted_game_fn(self, opponent_evaluator):
+        """Get a JIT-compiled game function for the given opponent.
+
+        Caches compilation per opponent type to prevent memory leaks from
+        repeated JIT tracing.
+        """
+        opponent_type = type(opponent_evaluator).__name__
+
+        if not hasattr(self, '_jitted_game_fns'):
+            self._jitted_game_fns = {}
+
+        if opponent_type not in self._jitted_game_fns:
+            # Create a JIT-compiled version of two_player_game for this opponent type
+            @jax.jit
+            def play_game(key, params_1, params_2):
+                return two_player_game(
+                    key=key,
+                    evaluator_1=self._mcts_evaluator,
+                    evaluator_2=opponent_evaluator,
+                    params_1=params_1,
+                    params_2=params_2,
+                    env_step_fn=self._env_step_fn,
+                    env_init_fn=self._env_init_fn,
+                    max_steps=500,
+                )
+            self._jitted_game_fns[opponent_type] = play_game
+
+        return self._jitted_game_fns[opponent_type]
+
     def _run_two_player_eval(
         self,
         opponent_evaluator,
@@ -746,7 +786,9 @@ class EvalWorker(BaseWorker):
         total_game_length = 0
         total_points = 0.0
 
-        max_steps = 500
+        # Get JIT-compiled game function for this opponent type
+        play_game = self._get_jitted_game_fn(opponent_evaluator)
+        params_2 = opponent_params if opponent_params is not None else self._nn_params
 
         # Run games one at a time (two_player_game handles single games)
         for game_idx in range(self.eval_games):
@@ -756,23 +798,16 @@ class EvalWorker(BaseWorker):
 
             key, self._rng_key = jax.random.split(self._rng_key)
 
-            # Run a single game using TurboZero's two_player_game
-            # Our MCTS evaluator is player 1, opponent is player 2
-            outcomes, frames, p_ids = two_player_game(
-                key=key,
-                evaluator_1=self._mcts_evaluator,
-                evaluator_2=opponent_evaluator,
-                params_1=self._nn_params,
-                params_2=opponent_params if opponent_params is not None else self._nn_params,
-                env_step_fn=self._env_step_fn,
-                env_init_fn=self._env_init_fn,
-                max_steps=max_steps,
-            )
+            # Run a single game using cached JIT-compiled function
+            outcomes, frames, p_ids = play_game(key, self._nn_params, params_2)
 
             # outcomes[0] is evaluator_1's outcome, outcomes[1] is evaluator_2's
             # p_ids tells us which player ID each evaluator got assigned
             our_outcome = float(outcomes[0])
             game_length = int(jnp.sum(~frames.completed))
+
+            # Explicitly delete large objects to free memory
+            del frames, p_ids, outcomes, key
 
             if our_outcome > 0:
                 wins += 1
@@ -783,6 +818,9 @@ class EvalWorker(BaseWorker):
 
             total_game_length += game_length
             total_points += our_outcome
+
+        # Force garbage collection after evaluation batch to prevent memory buildup
+        gc.collect()
 
         return {
             'wins': wins,
@@ -890,6 +928,12 @@ class EvalWorker(BaseWorker):
 
             total_game_length += game_length
             total_points += our_reward
+
+            # Explicitly delete large objects to free memory
+            del our_eval_state, opp_eval_state, env_state, metadata, output
+
+        # Force garbage collection after evaluation batch to prevent memory buildup
+        gc.collect()
 
         return {
             'wins': wins,
