@@ -209,6 +209,116 @@ fi
 WORKER_TAG_BASE="${HOSTNAME_SHORT}-${DEVICE_TYPE}"
 
 # =============================================================================
+# Process helpers (one worker type per device)
+# =============================================================================
+parse_arg_value() {
+    local arg_name="$1"
+    shift
+    local prev=""
+    for token in "$@"; do
+        if [[ "$prev" == "$arg_name" ]]; then
+            echo "$token"
+            return 0
+        fi
+        case "$token" in
+            "$arg_name="*)
+                echo "${token#*=}"
+                return 0
+                ;;
+        esac
+        prev="$token"
+    done
+    return 1
+}
+
+describe_worker_process() {
+    local pid="$1"
+    local worker_kind="$2" # game|eval
+    local cmd rss_kb rss_mb gpu_mem_mib batch_size
+
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ -z "$cmd" ]]; then
+        echo "PID $pid (exited)"
+        return 0
+    fi
+
+    # Extract batch size if present in CLI.
+    read -r -a tokens <<<"$cmd"
+    batch_size="$(parse_arg_value --batch-size "${tokens[@]}" || true)"
+    batch_size="${batch_size:-<from config>}"
+
+    rss_kb="$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "$rss_kb" ]]; then
+        rss_mb=$((rss_kb / 1024))
+    else
+        rss_mb="?"
+    fi
+
+    gpu_mem_mib=""
+    if command -v nvidia-smi &>/dev/null; then
+        gpu_mem_mib="$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | awk -F',' -v p="$pid" '$1+0==p {gsub(/ /,"",$2); print $2; exit}')"
+    fi
+    if [[ -n "$gpu_mem_mib" ]]; then
+        echo "Current ${WORKER_TAG_BASE}-${worker_kind}: batch_size=${batch_size}, rss=${rss_mb}MB, gpu_mem=${gpu_mem_mib}MiB"
+    else
+        echo "Current ${WORKER_TAG_BASE}-${worker_kind}: batch_size=${batch_size}, rss=${rss_mb}MB"
+    fi
+}
+
+find_existing_worker_pid() {
+    local pid_file="$1"
+    local worker_subcommand="$2" # game-worker|eval-worker
+
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid="$(cat "$pid_file" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+
+    # Best-effort fallback: find a matching worker started with this script
+    # (it includes both --config-file and --head-ip flags).
+    if command -v pgrep &>/dev/null; then
+        local pid
+        pid="$(pgrep -f "python -m distributed\\.cli\\.main ${worker_subcommand}.*--config-file ${CONFIG_FILE}.*--head-ip ${HEAD_IP}" | head -n 1 || true)"
+        if [[ -n "$pid" ]]; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+stop_existing_worker() {
+    local pid="$1"
+    local stop_file="$2"
+    local pid_file="$3"
+
+    touch "$stop_file"
+
+    local deadline=$((SECONDS + 20))
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ $SECONDS -ge $deadline ]]; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 0.5
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$stop_file" "$pid_file"
+}
+
+# =============================================================================
 # Display configuration
 # =============================================================================
 echo "=============================================="
@@ -253,6 +363,14 @@ start_game_worker() {
     local log_file="$LOG_DIR/game_${worker_tag}_${TIMESTAMP}.log"
     local stop_file="$LOG_DIR/game_${worker_tag}.stop"
     local pid_file="$LOG_DIR/game_${worker_tag}.pid"
+
+    local existing_pid=""
+    existing_pid="$(find_existing_worker_pid "$pid_file" "game-worker" || true)"
+    if [[ -n "$existing_pid" ]]; then
+        describe_worker_process "$existing_pid" "game"
+        echo "Restarting ${worker_tag} with new params..."
+        stop_existing_worker "$existing_pid" "$stop_file" "$pid_file"
+    fi
 
     rm -f "$stop_file"
 
@@ -306,6 +424,14 @@ start_eval_worker() {
     local stop_file="$LOG_DIR/eval_${worker_tag}.stop"
     local pid_file="$LOG_DIR/eval_${worker_tag}.pid"
     local eval_types=$(get_eval_types)
+
+    local existing_pid=""
+    existing_pid="$(find_existing_worker_pid "$pid_file" "eval-worker" || true)"
+    if [[ -n "$existing_pid" ]]; then
+        describe_worker_process "$existing_pid" "eval"
+        echo "Restarting ${worker_tag} with new params..."
+        stop_existing_worker "$existing_pid" "$stop_file" "$pid_file"
+    fi
 
     rm -f "$stop_file"
 
