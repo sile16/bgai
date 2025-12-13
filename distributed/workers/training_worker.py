@@ -745,23 +745,23 @@ class TrainingWorker(BaseWorker):
             if run_id:
                 # Try to resume existing run
                 try:
-                    self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
-                    print(f"Worker {self.worker_id}: Resumed MLflow run {run_id} (system metrics enabled)")
+                    self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=False)
+                    print(f"Worker {self.worker_id}: Resumed MLflow run {run_id}")
                 except Exception as resume_error:
                     # Run doesn't exist (e.g., MLFlow DB was reset), create new one
                     print(f"Worker {self.worker_id}: MLflow run {run_id} not found, creating new run")
-                    self._mlflow_run = mlflow.start_run(log_system_metrics=True)
+                    self._mlflow_run = mlflow.start_run(log_system_metrics=False)
                     new_run_id = self._mlflow_run.info.run_id
                     self.state.set_run_id(new_run_id)
-                    print(f"Worker {self.worker_id}: Started new MLflow run {new_run_id} (system metrics enabled)")
+                    print(f"Worker {self.worker_id}: Started new MLflow run {new_run_id}")
                     run_id = new_run_id
                     is_new_run = True
             else:
                 # Start new run
-                self._mlflow_run = mlflow.start_run(log_system_metrics=True)
+                self._mlflow_run = mlflow.start_run(log_system_metrics=False)
                 run_id = self._mlflow_run.info.run_id
                 self.state.set_run_id(run_id)
-                print(f"Worker {self.worker_id}: Started MLflow run {run_id} (system metrics enabled)")
+                print(f"Worker {self.worker_id}: Started MLflow run {run_id}")
                 is_new_run = True
 
             # Log ALL configuration parameters for new runs

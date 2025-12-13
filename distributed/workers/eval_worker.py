@@ -441,8 +441,8 @@ class EvalWorker(BaseWorker):
                 if run_id:
                     # Try to attach to existing run
                     try:
-                        self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=True)
-                        print(f"Worker {self.worker_id}: Attached to MLflow run {run_id} (system metrics enabled)")
+                        self._mlflow_run = mlflow.start_run(run_id=run_id, log_system_metrics=False)
+                        print(f"Worker {self.worker_id}: Attached to MLflow run {run_id}")
                         return  # Success
                     except Exception as resume_error:
                         if 'RESOURCE_DOES_NOT_EXIST' in str(resume_error):
