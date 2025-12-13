@@ -81,8 +81,8 @@ detect_platform() {
         # Set memory fraction based on actual JAX memory usage analysis
         # Game worker: 2.51 GB peak → 5 GB (0.21), Eval: ~1 GB → 2 GB (0.09)
         # This will be overridden per-worker if needed
-        export XLA_PYTHON_CLIENT_MEM_FRACTION=0.21
-        echo "JAX memory fraction: 0.21 (5 GB for game worker)"
+        export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.21}"
+        echo "JAX memory fraction: $XLA_PYTHON_CLIENT_MEM_FRACTION"
     else
         PLATFORM="cpu"
         DEVICE_TYPE="cpu"
