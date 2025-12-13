@@ -1396,6 +1396,7 @@ class TrainingWorker(BaseWorker):
 
         start_time = time.time()
         last_log_time = start_time
+        last_mlflow_heartbeat_time = start_time
         phase_start_time = start_time
         current_phase = WorkerPhase.IDLE
 
@@ -1488,6 +1489,20 @@ class TrainingWorker(BaseWorker):
                         f"version={self.current_model_version}"
                     )
                     last_log_time = current_time
+
+                # MLflow heartbeat: enables plotting overall progress vs wall time.
+                if current_time - last_mlflow_heartbeat_time >= 30.0:
+                    self._log_mlflow_metrics(
+                        {
+                            'progress_total_train_steps': float(self._total_steps),
+                            'progress_total_games': float(current_games),
+                            'progress_buffer_size': float(buffer_size),
+                            'progress_new_games_since_train': float(new_games),
+                            'progress_train_steps_per_sec': 0.0,
+                        },
+                        step=int(current_time),
+                    )
+                    last_mlflow_heartbeat_time = current_time
                 continue
 
             # Calculate how many steps to train
