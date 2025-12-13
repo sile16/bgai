@@ -245,14 +245,14 @@ fi
 # =============================================================================
 # Workers on head
 # =============================================================================
-echo "[6/7] Starting training worker..."
-# Use fixed GPU memory caps (GB) so allocation is stable across GPUs.
-python -m distributed.cli.main training-worker \
+echo "[6/7] Starting training worker (CPU)..."
+# Training runs on CPU because bearoff table lookups are faster with direct
+# memory access than GPU-to-host round trips. The 35GB bearoff table stays in RAM.
+JAX_PLATFORMS=cpu python -m distributed.cli.main training-worker \
     --config-file "$CONFIG_FILE" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --gpu-mem-gb "$TRAIN_MEM_GB" \
     ${HEAD_TRAIN_BATCH_SIZE:+--batch-size $HEAD_TRAIN_BATCH_SIZE} \
-    > "$LOG_DIR/training_$TIMESTAMP.log" 2>&1 &
+    > "$LOG_DIR/training_cpu_$TIMESTAMP.log" 2>&1 &
 TRAIN_PID=$!
 
 echo "       Starting game worker..."
