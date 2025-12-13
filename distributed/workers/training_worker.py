@@ -31,7 +31,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
-from bgai.endgame.packed_table import BearoffLookup, V4BearoffLookup, load_v4_bearoff, pack_upper, solve_size_to_n
+from bgai.endgame.packed_table import V4BearoffLookup, load_v4_bearoff
 from core.training.loss_fns import reward_to_value_targets
 from core.evaluators.mcts.equity import value_outputs_to_equity
 
@@ -298,7 +298,7 @@ class TrainingWorker(BaseWorker):
         self._bearoff_table = None
         # Keep table on CPU (too large for GPU). Stored as [win, gammon_win, loss, gammon_loss].
         self._bearoff_table_np = None
-        self._bearoff_lookup: Optional[BearoffLookup] = None
+        self._bearoff_lookup: Optional[V4BearoffLookup] = None
         bearoff_table_path = self.config.get('bearoff_table_path')
         if bearoff_table_path is None:
             # Default path
@@ -372,75 +372,32 @@ class TrainingWorker(BaseWorker):
     # Bearoff/Endgame Value Methods
     # =========================================================================
 
-    def _load_bearoff_table(self, path: str) -> Tuple[BearoffLookup, np.ndarray]:
-        """Load bearoff table in V4, packed, or legacy format.
+    def _load_bearoff_table(self, path: str) -> Tuple[V4BearoffLookup, np.ndarray]:
+        """Load bearoff table (V4 format only).
 
-        Supports:
-        - V4 format: path without extension, loads {path}.bin and {path}.json
-        - Packed numpy: (entries, 4) or (entries, 7) float arrays
-        - Legacy numpy: (n, n) win probability arrays
-        - Full numpy: (n, n, 4) or (n, n, 7) probability arrays
-
-        Returns both the lookup wrapper and underlying array (for size logging).
+        This project is single-user; we fail fast instead of supporting legacy table formats.
+        V4 uses a `{path}.bin` + `{path}.json` pair and stores conditional gammon
+        probabilities matching the NN value head semantics.
         """
         # Check for V4 format (path without extension, with .bin and .json files)
         bin_path = Path(path + '.bin') if not path.endswith('.bin') else Path(path)
         json_path = Path(path + '.json') if not path.endswith('.json') else Path(path.replace('.bin', '.json'))
 
-        if bin_path.exists() and json_path.exists():
-            # V4 format
-            lookup = load_v4_bearoff(str(bin_path), str(json_path))
-            # Return the data array for size logging
-            return lookup, lookup.data
+        if not (bin_path.exists() and json_path.exists()):
+            raise FileNotFoundError(
+                f"Bearoff V4 table not found: expected {bin_path} and {json_path}"
+            )
 
-        # Fall back to numpy formats
-        if not path.endswith('.npy'):
-            path = path + '.npy'
+        lookup = load_v4_bearoff(str(bin_path), str(json_path))
+        return lookup, lookup.data
 
-        table = np.load(path, mmap_mode='r')
-        packed = False
-        n = None
-
-        if table.ndim == 1:
-            raise ValueError(f"Unexpected 1D bearoff table shape {table.shape}")
-
-        if table.ndim == 2 and table.shape[1] in (4, 7) and table.shape[0] != table.shape[1]:
-            # Packed upper: (entries, 4 or 7)
-            packed = True
-            n = solve_size_to_n(table.shape[0])
-            table = table.astype(np.float32, copy=False)
-            lookup = BearoffLookup(table, packed=True, n=n)
-            return lookup, table
-
-        if table.ndim == 2:
-            # Legacy file storing P(win) only
-            win = table.astype(np.float32, copy=False)
-            loss = 1.0 - win
-            zeros = np.zeros_like(win, dtype=np.float32)
-            equity = (2.0 * win - 1.0)
-            full = np.stack([win, zeros, loss, zeros, equity, equity, -equity], axis=-1)
-            n = full.shape[0]
-            lookup = BearoffLookup(full, packed=False, n=n)
-            return lookup, full
-
-        if table.ndim == 3 and table.shape[-1] in (4, 7):
-            n = table.shape[0]
-            lookup = BearoffLookup(table.astype(np.float32, copy=False), packed=False, n=n)
-            return lookup, table
-
-        raise ValueError(
-            f"Unexpected bearoff table shape {table.shape}; expected V4 (.bin+.json), packed (entries,4|7), legacy (n,n), or full (n,n,4|7)"
-        )
-
-    def _get_bearoff_value_np(self, board: np.ndarray, cur_player: int) -> float:
+    def _get_bearoff_value_np(self, board: np.ndarray) -> float:
         """Get perfect bearoff equity from the table (numpy version).
 
         Equity is scaled to [-1, 1] using cubeless points (no cube).
 
         Args:
             board: Board array of shape (28,)
-            cur_player: Current player (0 for X, 1 for O)
-
         Returns:
             Equity from current player's perspective.
         """
@@ -458,31 +415,19 @@ class TrainingWorker(BaseWorker):
         x_idx = position_to_index_fast(cur_home)
         o_idx = position_to_index_fast(opp_home)
 
-        # Use V4's native 4-way conditional format when available.
-        if isinstance(self._bearoff_lookup, V4BearoffLookup):
-            win, gam_win_cond, gam_loss_cond, _ = self._bearoff_lookup.get_4way_values(x_idx, o_idx)
-            p_gammon_win = win * gam_win_cond
-            p_gammon_loss = (1.0 - win) * gam_loss_cond
-            p_win = win
-        else:
-            # Legacy tables return unconditional gammons: [win, gam_win, loss, gam_loss, ...]
-            probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player=0)
-            p_win = float(probs[0])
-            p_gammon_win = float(probs[1])
-            p_gammon_loss = float(probs[3])
+        if self._bearoff_lookup is None:
+            return 0.0
+
+        win, gam_win_cond, gam_loss_cond, _ = self._bearoff_lookup.get_4way_values(x_idx, o_idx)
+        p_gammon_win = win * gam_win_cond
+        p_gammon_loss = (1.0 - win) * gam_loss_cond
+        p_win = win
 
         # Cubeless equity with gammons valued at 2 points
         equity = (2.0 * p_win - 1.0) + (p_gammon_win - p_gammon_loss)
         return float(equity)
 
-    def _get_bearoff_prob_vector(self, x_idx: int, o_idx: int, cur_player: int) -> np.ndarray:
-        """Return legacy-format probs for compatibility: [win, gam_win, loss, gam_loss, ...]."""
-        if self._bearoff_lookup is None:
-            return np.zeros(4, dtype=np.float32)
-
-        return self._bearoff_lookup.probs_for_player(x_idx, o_idx, cur_player)
-
-    def _get_bearoff_target_probs(self, x_idx: int, o_idx: int, cur_player: int) -> np.ndarray:
+    def _get_bearoff_target_probs(self, x_idx: int, o_idx: int) -> np.ndarray:
         """Get 4-way conditional probability targets for bearoff position.
 
         Returns:
@@ -492,18 +437,9 @@ class TrainingWorker(BaseWorker):
             - gam_loss_cond: P(gammon | loss) - conditional probability
             - bg_rate: P(backgammon | gammon) - always 0 for bearoff
         """
-        # V4 tables natively store the NN's expected 4-way conditional values.
-        if isinstance(self._bearoff_lookup, V4BearoffLookup):
-            return self._bearoff_lookup.get_4way_values(x_idx, o_idx)
-
-        # Legacy tables expose unconditional gammons: [win, gam_win, loss, gam_loss, ...]
-        probs = self._get_bearoff_prob_vector(x_idx, o_idx, cur_player)
-        win, gam_win_uncond, loss, gam_loss_uncond = float(probs[0]), float(probs[1]), float(probs[2]), float(probs[3])
-
-        gam_win_cond = gam_win_uncond / max(win, 1e-8) if win > 0 else 0.0
-        gam_loss_cond = gam_loss_uncond / max(loss, 1e-8) if loss > 0 else 0.0
-
-        return np.array([win, gam_win_cond, gam_loss_cond, 0.0], dtype=np.float32)
+        if self._bearoff_lookup is None:
+            return np.zeros(4, dtype=np.float32)
+        return self._bearoff_lookup.get_4way_values(x_idx, o_idx)
 
     def _apply_bearoff_values_to_batch(
         self,
@@ -578,7 +514,7 @@ class TrainingWorker(BaseWorker):
         is_bearoff = bar_empty & ~cur_outside & ~opp_outside
 
         # =========================================================================
-        # Bearoff value lookup using BearoffLookup
+        # Bearoff value lookup using V4 bearoff table
         # =========================================================================
         bearoff_count = int(np.sum(is_bearoff))
 
@@ -588,7 +524,7 @@ class TrainingWorker(BaseWorker):
         value_targets_np = np.array(default_targets)
         value_masks_np = np.array(default_masks)
 
-        # Collect target probs for bearoff positions and override targets/masks
+        # Collect 4-way conditional targets for bearoff positions and override targets/masks
         for i in range(batch_size):
             if is_bearoff[i]:
                 board = boards[i]
@@ -603,7 +539,7 @@ class TrainingWorker(BaseWorker):
                 o_idx = position_to_index_fast(o_pos)
 
                 # Observation is already from current player's perspective; lookup uses that orientation.
-                bearoff_targets = self._get_bearoff_target_probs(x_idx, o_idx, cur_player=0)
+                bearoff_targets = self._get_bearoff_target_probs(x_idx, o_idx)
                 target_probs_list.append(bearoff_targets)
 
                 # Override targets/masks with perfect bearoff values
@@ -629,7 +565,7 @@ class TrainingWorker(BaseWorker):
                 opp_p = 1 - cur_p
                 board = boards[i]
                 # Get equity from bearoff table
-                perfect_val = self._get_bearoff_value_np(board, cur_p)
+                perfect_val = self._get_bearoff_value_np(board)
                 # Equity from current player's perspective; zero-sum for opponent
                 new_rewards[i, cur_p] = perfect_val
                 new_rewards[i, opp_p] = -perfect_val
