@@ -6,8 +6,10 @@ Backgammon AI using AlphaZero-style training with JAX and distributed self-play.
 
 This is a **single-user ML research project**. The codebase and all hosts are fully controlled by one developer. This means:
 - **No backward compatibility required** - config keys and APIs can change freely
-- **No fallback code** - assume correct configuration; fail fast on errors
+- **NO FALLBACK CODE** - assume correct configuration; fail fast on errors
+- **NO FALLBACK FUNCTIONS** - do not use alternate approach for missing values, fail fast
 - **No multi-tenancy concerns** - optimize for the single deployment environment
+
 
 ## Directory Structure
 
