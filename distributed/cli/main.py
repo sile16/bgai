@@ -347,6 +347,7 @@ def show_status(args):
     phase_by_worker: dict[str, int] = {}
     collection_sps_by_worker: dict[str, float] = {}
     training_sps_by_worker: dict[str, float] = {}
+    training_backlog_by_worker: dict[str, float] = {}
     eval_games_per_s_by_worker: dict[str, float] = {}
 
     if prom_base_url:
@@ -354,6 +355,7 @@ def show_status(args):
             phase_by_worker = _prom_worker_map(prom_base_url, "bgai_worker_phase", value_parser=lambda v: int(float(v)))
             collection_sps_by_worker = _prom_worker_map(prom_base_url, "bgai_collection_steps_per_second")
             training_sps_by_worker = _prom_worker_map(prom_base_url, "bgai_training_steps_per_second")
+            training_backlog_by_worker = _prom_worker_map(prom_base_url, "bgai_training_backlog_steps")
             eval_games_per_s_by_worker = _prom_worker_map(
                 prom_base_url,
                 "sum by (worker_id) (rate(bgai_eval_games_total[5m]))",
@@ -403,8 +405,11 @@ def show_status(args):
                     rate_str = f", steps/s={sps:.1f}"
             elif worker_id and worker_type == "training":
                 tps = training_sps_by_worker.get(worker_id)
+                backlog = training_backlog_by_worker.get(worker_id)
                 if tps is not None:
                     rate_str = f", train_steps/s={tps:.1f}"
+                if backlog is not None:
+                    rate_str = f"{rate_str}, backlog={backlog:.0f}"
             elif worker_id and worker_type == "eval":
                 eps = eval_games_per_s_by_worker.get(worker_id)
                 if eps is not None:

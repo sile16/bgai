@@ -202,6 +202,20 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.training_target_steps_total = Gauge(
+            'bgai_training_target_steps_total',
+            'Target total training steps based on collected games',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
+        self.training_backlog_steps = Gauge(
+            'bgai_training_backlog_steps',
+            'Training backlog (target_steps_total - training_steps_total)',
+            ['worker_id'],
+            registry=self.registry,
+        )
+
         self.training_batch_duration = Histogram(
             'bgai_training_batch_duration_seconds',
             'Duration of training batches',

@@ -1412,9 +1412,22 @@ class TrainingWorker(BaseWorker):
             worker_id=self.worker_id, worker_type='training'
         ).set(1)
 
-        print(f"Worker {self.worker_id}: Collection-gated training mode")
-        print(f"Worker {self.worker_id}: Will train {self.steps_per_epoch} steps "
-              f"for every {self.games_per_epoch} games collected")
+        steps_per_game_target = self.config.get(
+            'steps_per_game',
+            self.steps_per_epoch / max(self.games_per_epoch, 1),
+        )
+        min_backlog_steps = int(self.config.get('min_backlog_steps', 1))
+        max_train_steps_per_batch = int(self.config.get('max_train_steps_per_batch', self.steps_per_epoch))
+
+        print(f"Worker {self.worker_id}: Game-ratio-gated training mode")
+        print(
+            f"Worker {self.worker_id}: Target {steps_per_game_target:.3f} train steps/game "
+            f"(steps_per_epoch={self.steps_per_epoch}, games_per_epoch={self.games_per_epoch})"
+        )
+        print(
+            f"Worker {self.worker_id}: Will train when backlog >= {min_backlog_steps} "
+            f"(max per batch: {max_train_steps_per_batch})"
+        )
 
         start_time = time.time()
         last_log_time = start_time
@@ -1470,18 +1483,19 @@ class TrainingWorker(BaseWorker):
                 time.sleep(2.0)
                 continue
 
-            # Check for new games
+            # Determine training target based on collected games, and train to catch up.
             current_games = self._get_current_games_count()
+            target_total_steps = int(math.floor(current_games * steps_per_game_target))
+            backlog_steps = target_total_steps - self._total_steps
             new_games = current_games - self._training_stats.games_at_last_train
 
-            if new_games < self.games_per_epoch:
-                # Not enough new games, wait
-                time.sleep(1.0)
+            metrics.training_target_steps_total.labels(worker_id=self.worker_id).set(target_total_steps)
+            metrics.training_backlog_steps.labels(worker_id=self.worker_id).set(backlog_steps)
+            metrics.games_since_last_train.labels(worker_id=self.worker_id).set(max(new_games, 0))
 
-                # Update games since last train metric
-                metrics.games_since_last_train.labels(
-                    worker_id=self.worker_id
-                ).set(new_games)
+            if backlog_steps < min_backlog_steps:
+                # Caught up (or very small backlog), wait briefly.
+                time.sleep(1.0)
 
                 # Keep training visible in Prometheus discovery even while idle.
                 current_time = time.time()
@@ -1504,8 +1518,9 @@ class TrainingWorker(BaseWorker):
                 # Periodic status log while waiting
                 if current_time - last_log_time >= 30.0:
                     print(
-                        f"Worker {self.worker_id}: Waiting for games "
-                        f"({new_games}/{self.games_per_epoch} new games), "
+                        f"Worker {self.worker_id}: Waiting (backlog={backlog_steps}, "
+                        f"target_steps={target_total_steps}, "
+                        f"new_games={new_games}), "
                         f"total_games={current_games}, "
                         f"buffer={buffer_size}, "
                         f"version={self.current_model_version}"
@@ -1520,6 +1535,8 @@ class TrainingWorker(BaseWorker):
                             'progress_total_games': float(current_games),
                             'progress_buffer_size': float(buffer_size),
                             'progress_new_games_since_train': float(new_games),
+                            'progress_target_train_steps': float(target_total_steps),
+                            'progress_training_backlog_steps': float(backlog_steps),
                             'progress_train_steps_per_sec': 0.0,
                         },
                         step=int(current_time),
@@ -1527,15 +1544,14 @@ class TrainingWorker(BaseWorker):
                     last_mlflow_heartbeat_time = current_time
                 continue
 
-            # Calculate how many steps to train
-            # Train proportionally to games collected, catching up if behind
-            epoch_scale = new_games / max(self.games_per_epoch, 1)
-            target_steps = math.ceil(epoch_scale * self.steps_per_epoch)
+            # Train a bounded chunk of the backlog.
+            target_steps = min(max_train_steps_per_batch, max(backlog_steps, 0))
 
             print(
-                f"Worker {self.worker_id}: Training epoch triggered! "
-                f"{new_games} new games -> {target_steps} training steps "
-                f"({epoch_scale:.2f} epochs)"
+                f"Worker {self.worker_id}: Training batch triggered! "
+                f"backlog={backlog_steps} -> {target_steps} training steps "
+                f"(target_total_steps={target_total_steps}, current_steps={self._total_steps}, "
+                f"new_games={new_games})"
             )
 
             # Pause game collection for exclusive GPU access during training
