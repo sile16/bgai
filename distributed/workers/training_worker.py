@@ -719,6 +719,10 @@ class TrainingWorker(BaseWorker):
                     'gnubg_move_filters': str(gnubg_config.get('move_filters', [8, 4, 2, 2])),
                 })
 
+                # Publish config to Redis so remote workers can fetch it
+                self.state.set_config(self.config)
+                print(f"Worker {self.worker_id}: Published config to Redis")
+
         except Exception as e:
             print(f"Worker {self.worker_id}: MLflow setup error: {e}")
             self._mlflow_run = None

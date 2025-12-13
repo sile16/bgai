@@ -224,6 +224,29 @@ class RedisStateManager:
         return None
 
     # =========================================================================
+    # Training Config
+    # =========================================================================
+
+    def get_config(self) -> Optional[Dict[str, Any]]:
+        """Get training configuration from Redis.
+
+        Returns:
+            Configuration dictionary, or None if not set.
+        """
+        data = self.redis.get(KEY_MODEL_CONFIG)
+        if data:
+            return json.loads(data.decode())
+        return None
+
+    def set_config(self, config: Dict[str, Any]) -> None:
+        """Store training configuration in Redis.
+
+        Args:
+            config: Configuration dictionary to store.
+        """
+        self.redis.set(KEY_MODEL_CONFIG, json.dumps(config))
+
+    # =========================================================================
     # Warm Tree (pre-computed MCTS state)
     # =========================================================================
 
