@@ -333,7 +333,7 @@ class BGAIMetrics:
         self.eval_win_rate = Gauge(
             'bgai_eval_win_rate',
             'Win rate from most recent evaluation',
-            ['eval_type', 'model_version'],
+            ['eval_type'],
             registry=self.registry,
         )
 
@@ -362,7 +362,7 @@ class BGAIMetrics:
         self.eval_avg_game_length = Gauge(
             'bgai_eval_avg_game_length',
             'Average game length in most recent evaluation',
-            ['eval_type', 'model_version'],
+            ['eval_type'],
             registry=self.registry,
         )
 

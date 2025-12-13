@@ -879,14 +879,9 @@ class EvalWorker(BaseWorker):
 
         # Pre-initialize evaluation metrics so Grafana shows series
         # even before the first evaluation completes.
-        current_version_str = str(self.current_model_version)
         for eval_type in self.enabled_eval_types:
-            metrics.eval_win_rate.labels(
-                eval_type=eval_type, model_version=current_version_str
-            ).set(0.0)
-            metrics.eval_avg_game_length.labels(
-                eval_type=eval_type, model_version=current_version_str
-            ).set(0.0)
+            metrics.eval_win_rate.labels(eval_type=eval_type).set(0.0)
+            metrics.eval_avg_game_length.labels(eval_type=eval_type).set(0.0)
             metrics.eval_games_total.labels(
                 worker_id=self.worker_id, eval_type=eval_type
             ).inc(0)
@@ -1039,17 +1034,13 @@ class EvalWorker(BaseWorker):
             worker_id=self.worker_id, eval_type=result.eval_type
         ).inc(result.losses)
 
-        metrics.eval_win_rate.labels(
-            eval_type=result.eval_type, model_version=str(result.model_version)
-        ).set(result.win_rate)
+        metrics.eval_win_rate.labels(eval_type=result.eval_type).set(result.win_rate)
 
         metrics.eval_duration.labels(
             worker_id=self.worker_id, eval_type=result.eval_type
         ).observe(result.duration_seconds)
 
-        metrics.eval_avg_game_length.labels(
-            eval_type=result.eval_type, model_version=str(result.model_version)
-        ).set(result.avg_game_length)
+        metrics.eval_avg_game_length.labels(eval_type=result.eval_type).set(result.avg_game_length)
 
         metrics.eval_runs_total.labels(
             worker_id=self.worker_id, eval_type=result.eval_type
