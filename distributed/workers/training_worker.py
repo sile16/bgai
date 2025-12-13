@@ -1408,10 +1408,14 @@ class TrainingWorker(BaseWorker):
 
         # Compute averaged metrics
         if batch_metrics:
-            avg_metrics = {
-                k: sum(m[k] for m in batch_metrics) / len(batch_metrics)
-                for k in batch_metrics[0].keys()
-            }
+            metric_sums: Dict[str, float] = {}
+            metric_counts: Dict[str, int] = {}
+            for metric_dict in batch_metrics:
+                for key, value in metric_dict.items():
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+                    metric_counts[key] = metric_counts.get(key, 0) + 1
+
+            avg_metrics = {k: metric_sums[k] / metric_counts[k] for k in metric_sums}
             avg_metrics['batch_duration'] = batch_duration
             avg_metrics['batch_steps'] = steps_done
             avg_metrics['steps_per_sec'] = steps_done / max(batch_duration, 0.001)
