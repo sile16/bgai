@@ -54,6 +54,18 @@ class Coordinator:
         # Configuration
         self.status_interval = self.config.get('status_interval', 10.0)
 
+        # Temperature schedule (Stochastic MuZero paper style)
+        # Default: linear decay 1.0 -> 0.2 over 50 epochs (legacy behavior approximation) if no schedule provided
+        self.temp_steps = self.config.get('temperature_schedule_steps')
+        self.temp_values = self.config.get('temperature_schedule_values')
+        
+        if not self.temp_steps or not self.temp_values:
+            # Fallback to simple static or linear decay if explicit schedule missing
+            # This ensures we always have *some* valid logic
+            print("Coordinator: No explicit temperature schedule found in config, using defaults.")
+            self.temp_steps = []
+            self.temp_values = [1.0]
+
         # Runtime state
         self.running = False
         self.start_time = time.time()
@@ -203,17 +215,46 @@ class Coordinator:
         """Get count of workers by type."""
         return self.state.get_worker_counts()
 
+    def _update_temperature(self) -> None:
+        """Update model temperature based on training steps."""
+        if not self.temp_steps or not self.temp_values:
+            return
+
+        steps = self.state.get_training_steps()
+        
+        # Default to first value
+        new_temp = self.temp_values[0]
+        
+        # Find correct bucket
+        for threshold, val in zip(self.temp_steps, self.temp_values):
+            if steps < threshold:
+                new_temp = val
+                break
+            # If steps >= threshold, we continue to next bucket
+            # If we run out of thresholds, we use the last value (handled by loop completion)
+            new_temp = val # Keep updating so if we exhaust loop we keep last val
+            
+        # Special case: The paper says "greedy selection thereafter" (temp=0)
+        # If we have more values than thresholds (e.g. 3 thresholds, 4 values),
+        # the last value is the "after" value.
+        if len(self.temp_values) > len(self.temp_steps) and steps >= self.temp_steps[-1]:
+             new_temp = self.temp_values[-1]
+
+        self.state.set_model_temperature(new_temp)
+
     def print_status(self) -> None:
         """Print current cluster status to stdout."""
         status = self.get_cluster_status()
         counts = status['workers']
+        temp = self.state.get_model_temperature()
 
         print(
             f"Status: model_v{status['model_version']}, "
             f"games: {counts['game']}, "
             f"training: {counts['training']}, "
             f"total_games: {status['total_games_generated']}, "
-            f"train_steps: {status['total_training_steps']}"
+            f"train_steps: {status['total_training_steps']}, "
+            f"temp: {temp:.2f}"
         )
 
     # =========================================================================
@@ -311,6 +352,9 @@ class Coordinator:
         """Main loop that prints status and cleans up stale workers."""
         while self.running:
             try:
+                # Update temperature based on schedule
+                self._update_temperature()
+
                 self.print_status()
 
                 # Cleanup stale workers periodically

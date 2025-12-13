@@ -28,15 +28,19 @@ mcts:
   warm_tree_simulations: 500   # MCTS sims for warm tree (0 = disabled)
   warm_tree_max_nodes: 10000   # Max nodes for warm tree expansion
   persist_tree: true           # Keep tree between moves
-  temperature_start: 0.8       # Initial exploration
-  temperature_end: 0.2         # End temperature.        
-  temperature_epochs:  50      # The number of epochs it takes to go from start to end, then we just stay at ending temp 
+  # Temperature schedule (Stochastic MuZero paper style)
+  # Values: [1.0, 0.5, 0.1] for first [1e5, 2e5, 3e5] steps, then 0.0 (greedy)
+  temperature_schedule_values: [1.0, 0.5, 0.1, 0.0]
+  temperature_schedule_steps: [100000, 200000, 300000]
   discount: -1.0               # -1 for two-player zero-sum games
 
 training:
   batch_size: 128              # Base training batch size (overridden by device_configs)
   steps_per_epoch: 20000           # Training steps run once games_per_epoch new games are collected
   learning_rate: 0.0003            # Adam learning rate
+  # When training and GPU collection share the same GPU (head node), pause GPU collection
+  # during training to avoid severe contention and keep training throughput stable.
+  pause_collection_during_training: true
   # Bearoff value weight: multiplier for loss on bearoff positions (known-perfect values)
   # Higher values emphasize learning accurate endgame values. Set to 1.0 to disable.
   bearoff_enabled: True           # disable bearoff DB completely
@@ -117,7 +121,9 @@ device_configs:
     # With mutually exclusive training/collection, each gets full GPU compute
     # Memory is split 45%/45% but compute alternates for 100% utilization
     # batch_size=128 with max_nodes=2000 fits in 11GB with ~62% GPU util
-    game_batch_size: 200
+    # NOTE: 200 frequently OOMs on RTX 4090 with current MCTS settings (200 sims, 2000 max_nodes).
+    # Keep this conservative so the head GPU game worker stays alive.
+    game_batch_size: 64
     game_gpu_memory_fraction: 0.3
     train_batch_size: 4096
     train_gpu_memory_fraction: 0.3

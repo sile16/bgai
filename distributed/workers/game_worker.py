@@ -75,20 +75,10 @@ class GameWorker(BaseWorker):
         self.max_nodes = self.config.get('max_nodes', 400)
         self.max_episode_steps = self.config.get('max_episode_steps', 500)
 
-        # Temperature schedule: start high (exploration) -> end low (exploitation)
-        # If temperature_start/end are defined, use epoch-based decay over training
-        self.temperature_start = self.config.get('temperature_start')
-        self.temperature_end = self.config.get('temperature_end')
-        self.temperature_epochs = self.config.get('temperature_epochs', 50)
+        # Temperature schedule is now managed by the Coordinator via Redis.
+        # We just fetch the current temperature when updating the model.
         self.temperature = self.config.get('temperature', 1.0)
-        self._use_temperature_schedule = (
-            self.temperature_start is not None and
-            self.temperature_end is not None
-        )
-        # Current temperature (updated based on model version / epoch)
-        self._current_temperature = (
-            self.temperature_start if self._use_temperature_schedule else self.temperature
-        )
+        self._current_temperature = self.temperature
 
         # Initialize Redis buffer (uses same connection info)
         redis_host = self.config.get('redis_host', 'localhost')
@@ -389,35 +379,28 @@ class GameWorker(BaseWorker):
 
         return jax.tree_util.tree_map(stack_leaves, warm_tree)
 
-    def _calculate_temperature(self) -> float:
-        """Calculate temperature based on training epochs (model version).
-
-        Uses linear decay from temperature_start to temperature_end over
-        temperature_epochs. This encourages exploration early in training
-        and exploitation (stronger play) as the model improves.
-
-        Returns:
-            Temperature value for MCTS action selection.
-        """
-        if not self._use_temperature_schedule:
-            return self.temperature
-
-        # Linear interpolation: start -> end over training epochs
-        # Use model version as proxy for epoch count
-        progress = min(1.0, self.current_model_version / max(1, self.temperature_epochs))
-        temperature = (
-            self.temperature_start * (1 - progress) +
-            self.temperature_end * progress
-        )
-        return float(temperature)
-
     def _check_and_update_model(self) -> None:
-        """Check for and apply model updates from Redis."""
+        """Check for and apply model updates from Redis.
+        
+        Also updates MCTS temperature from Redis if changed (only when model is updated).
+        """
         result = self.get_model_weights()
         if result is not None:
             weights_bytes, version = result
             self._nn_params = deserialize_weights(weights_bytes)
             print(f"Worker {self.worker_id}: Updated to model version {version}")
+
+            # Update Temperature (only when model weights are updated)
+            try:
+                new_temp = self.state.get_model_temperature()
+                if abs(new_temp - self._current_temperature) > 1e-4:
+                    print(f"Worker {self.worker_id}: Updating temperature {self._current_temperature:.2f} -> {new_temp:.2f} due to model update")
+                    self._current_temperature = new_temp
+                    self._evaluator.temperature = new_temp
+                    # Re-JIT the step function with new temperature constant
+                    self._setup_batched_step()
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Error updating temperature: {e}")
 
             # Also check for warm tree update
             self._check_and_update_warm_tree()
@@ -466,11 +449,6 @@ class GameWorker(BaseWorker):
         env_states = state['env_states']
         metadatas = state['metadatas']
         eval_states = state['eval_states']
-
-        # Update temperature based on training epochs (model version)
-        if self._use_temperature_schedule:
-            self._current_temperature = self._calculate_temperature()
-            self._evaluator.temperature = self._current_temperature
 
         # Step all environments
         step_keys = jax.random.split(key, self.batch_size)
@@ -701,11 +679,8 @@ class GameWorker(BaseWorker):
         print(f"Worker {self.worker_id}: JIT compiling batched step function...")
         self._setup_batched_step()
 
-        # Log temperature schedule info
-        if self._use_temperature_schedule:
-            print(f"Worker {self.worker_id}: Temperature schedule: {self.temperature_start:.2f} -> {self.temperature_end:.2f} over {self.temperature_epochs} epochs")
-        else:
-            print(f"Worker {self.worker_id}: Static temperature: {self.temperature:.2f}")
+        # Log temperature
+        print(f"Worker {self.worker_id}: Initial temperature: {self._current_temperature:.2f}")
 
         # Start Prometheus metrics server
         metrics_port_config = self.config.get('metrics_port', 9100)
@@ -795,8 +770,10 @@ class GameWorker(BaseWorker):
                     pass
                 last_metrics_refresh = now
 
-            # Check if collection is paused (during training epochs)
-            if self.state.is_collection_paused():
+            # Check if collection is paused (during training epochs).
+            # Only pause GPU collectors; CPU collectors can continue generating games while
+            # the trainer uses the head GPU.
+            if self.state.is_collection_paused() and jax.default_backend() == "gpu":
                 if time.time() - last_pause_log > 10:
                     print(f"Worker {self.worker_id}: Collection paused, waiting for training...")
                     last_pause_log = time.time()
@@ -855,7 +832,7 @@ class GameWorker(BaseWorker):
                 except Exception:
                     pass
 
-                temp_str = f", temp={self._current_temperature:.2f}" if self._use_temperature_schedule else ""
+                temp_str = f", temp={self._current_temperature:.2f}"
 
                 # Calculate GPU/CPU time breakdown
                 total_tracked = self._gpu_time_accum + self._cpu_time_accum
@@ -920,9 +897,6 @@ class GameWorker(BaseWorker):
             'num_simulations': self.num_simulations,
             'max_nodes': self.max_nodes,
             'temperature': self._current_temperature,
-            'temperature_schedule': self._use_temperature_schedule,
-            'temperature_start': self.temperature_start,
-            'temperature_end': self.temperature_end,
             'buffer_size': self.buffer.get_size() if self.buffer else 0,
         })
         return base_stats

@@ -43,6 +43,7 @@ KEY_WARM_TREE = f"{PREFIX}:model:warm_tree"
 KEY_WARM_TREE_VERSION = f"{PREFIX}:model:warm_tree_version"
 KEY_COLLECTION_PAUSED = f"{PREFIX}:collection:paused"
 KEY_TRAINING_STEPS = f"{PREFIX}:training:total_steps"
+KEY_MODEL_TEMPERATURE = f"{PREFIX}:model:temperature"
 
 # TTL values (seconds)
 WORKER_TTL = 60  # Workers expire after 60s without heartbeat
@@ -360,6 +361,23 @@ class RedisStateManager:
             New total steps count.
         """
         return self.redis.incrby(KEY_TRAINING_STEPS, delta)
+
+    def get_model_temperature(self) -> float:
+        """Get current model temperature.
+
+        Returns:
+            Current temperature (default 1.0).
+        """
+        temp = self.redis.get(KEY_MODEL_TEMPERATURE)
+        return float(temp) if temp else 1.0
+
+    def set_model_temperature(self, temp: float) -> None:
+        """Set model temperature.
+
+        Args:
+            temp: Temperature value.
+        """
+        self.redis.set(KEY_MODEL_TEMPERATURE, str(temp))
 
     # =========================================================================
     # Worker Registry
