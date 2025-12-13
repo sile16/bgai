@@ -360,6 +360,10 @@ class TrainingWorker(BaseWorker):
         # Collection-gated training stats
         self._training_stats = TrainingStats()
 
+        # Training progress tracking for live Prometheus updates during long batches.
+        self._last_progress_time = time.time()
+        self._last_progress_steps = 0
+
     @property
     def worker_type(self) -> str:
         return 'training'
@@ -857,6 +861,8 @@ class TrainingWorker(BaseWorker):
         self._total_steps = self.state.get_training_steps()
         if self._total_steps > 0:
             print(f"Worker {self.worker_id}: Restored step counter to {self._total_steps}")
+        self._last_progress_steps = self._total_steps
+        self._last_progress_time = time.time()
 
         # Create optimizer
         optimizer = optax.adam(self.learning_rate)
@@ -1376,23 +1382,34 @@ class TrainingWorker(BaseWorker):
         self._training_stats.current_batch_start_time = batch_start
         self._training_stats.current_batch_steps = 0
 
-        while steps_done < target_steps and self.running:
-            metrics = self._sample_and_train()
+        prom_metrics = get_metrics()
 
-            if metrics is None:
+        while steps_done < target_steps and self.running:
+            step_metrics = self._sample_and_train()
+
+            if step_metrics is None:
                 # Not enough valid experiences, wait briefly
                 time.sleep(0.1)
                 continue
 
-            batch_metrics.append(metrics)
+            batch_metrics.append(step_metrics)
             steps_done += 1
             self._training_stats.current_batch_steps = steps_done
-            self._training_stats.cumulative_loss += metrics.get('loss', 0)
+            self._training_stats.cumulative_loss += step_metrics.get('loss', 0)
             self._training_stats.loss_count += 1
 
             # Persist step counter to Redis periodically for recovery
             if self._total_steps % 100 == 0:
                 self.state.set_training_steps(self._total_steps)
+                now = time.time()
+                dt = now - self._last_progress_time
+                if dt > 0:
+                    live_steps_per_sec = (self._total_steps - self._last_progress_steps) / dt
+                    prom_metrics.training_steps_per_second.labels(
+                        worker_id=self.worker_id
+                    ).set(live_steps_per_sec)
+                    self._last_progress_time = now
+                    self._last_progress_steps = self._total_steps
 
         batch_duration = time.time() - batch_start
 
