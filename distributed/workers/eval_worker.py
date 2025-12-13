@@ -33,7 +33,7 @@ from core.types import StepMetadata
 from .base_worker import BaseWorker, WorkerStats
 from ..serialization import deserialize_weights
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
 from ..coordinator.redis_state import create_state_manager
 
 
@@ -918,6 +918,9 @@ class EvalWorker(BaseWorker):
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='eval'
         ).set(1)
+        metrics.worker_phase.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(WorkerPhase.IDLE)
 
         # Set configuration metrics (for correlating with memory usage)
         metrics.worker_batch_size.labels(
@@ -965,6 +968,9 @@ class EvalWorker(BaseWorker):
                     port=metrics_port,
                     ttl_seconds=60,
                 )
+                metrics.worker_phase.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(WorkerPhase.IDLE)
                 continue
 
             model_version, eval_type = task
@@ -972,6 +978,9 @@ class EvalWorker(BaseWorker):
                 f"Worker {self.worker_id}: Running {eval_type} evaluation "
                 f"for model v{model_version}"
             )
+            metrics.worker_phase.labels(
+                worker_id=self.worker_id, worker_type='eval'
+            ).set(WorkerPhase.EVALUATING)
 
             # Run the evaluation
             result = self._run_evaluation(model_version, eval_type)
@@ -990,11 +999,17 @@ class EvalWorker(BaseWorker):
                 # Failed, remove from in-progress
                 task_id = f"v{model_version}:{eval_type}"
                 self.buffer.redis.srem(self.EVAL_IN_PROGRESS, task_id)
+                metrics.worker_phase.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(WorkerPhase.IDLE)
 
         # Mark worker as stopped
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='eval'
         ).set(0)
+        metrics.worker_phase.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(WorkerPhase.IDLE)
 
         # End MLflow run (don't call end_run as we're sharing with training worker)
         # Just clear our reference

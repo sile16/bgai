@@ -281,6 +281,10 @@ def start_eval_worker(args):
 
 def show_status(args):
     """Show cluster status from Redis."""
+    import json
+    import urllib.parse
+    import urllib.request
+
     from ..coordinator.redis_state import create_state_manager
 
     # Load configuration from file
@@ -304,6 +308,73 @@ def show_status(args):
     status = state.get_cluster_status()
     workers = status['workers']
 
+    def _prom_query(prom_base_url: str, query: str) -> list[dict]:
+        url = prom_base_url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if payload.get("status") != "success":
+            return []
+        data = payload.get("data", {})
+        if data.get("resultType") != "vector":
+            return []
+        return data.get("result", []) or []
+
+    def _prom_worker_map(prom_base_url: str, query: str, value_parser=float) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for result in _prom_query(prom_base_url, query):
+            metric = result.get("metric", {}) or {}
+            worker_id = metric.get("worker_id")
+            if not worker_id:
+                continue
+            value = result.get("value", [None, None])[1]
+            if value is None:
+                continue
+            try:
+                out[worker_id] = value_parser(value)
+            except Exception:
+                continue
+        return out
+
+    prom_base_url = None
+    try:
+        head_host = yaml_config.get("head", {}).get("host") or config["redis_host"]
+        prom_port = int(yaml_config.get("prometheus", {}).get("port", 9090))
+        prom_base_url = f"http://{head_host}:{prom_port}"
+    except Exception:
+        prom_base_url = None
+
+    phase_by_worker: dict[str, int] = {}
+    collection_sps_by_worker: dict[str, float] = {}
+    training_sps_by_worker: dict[str, float] = {}
+    eval_games_per_s_by_worker: dict[str, float] = {}
+
+    if prom_base_url:
+        try:
+            phase_by_worker = _prom_worker_map(prom_base_url, "bgai_worker_phase", value_parser=lambda v: int(float(v)))
+            collection_sps_by_worker = _prom_worker_map(prom_base_url, "bgai_collection_steps_per_second")
+            training_sps_by_worker = _prom_worker_map(prom_base_url, "bgai_training_steps_per_second")
+            eval_games_per_s_by_worker = _prom_worker_map(
+                prom_base_url,
+                "sum by (worker_id) (rate(bgai_eval_games_total[5m]))",
+            )
+        except Exception:
+            # Status should still work even if Prometheus is down/unreachable.
+            pass
+
+    def _phase_label(phase: Optional[int]) -> str:
+        if phase is None:
+            return "unknown"
+        return {
+            0: "idle",
+            1: "collecting",
+            2: "training",
+            3: "warm_tree",
+            4: "checkpoint",
+            5: "sampling",
+            6: "evaluating",
+        }.get(phase, f"phase_{phase}")
+
     print("\n=== Cluster Status ===")
     print(f"Model version: {status['model_version']}")
     print(f"Run ID: {status['run_id'] or 'None'}")
@@ -320,10 +391,30 @@ def show_status(args):
     if status['active_workers']:
         print(f"\n=== Active Workers ===")
         for w in status['active_workers']:
+            worker_id = w.get("worker_id")
+            worker_type = w.get("worker_type")
+            phase_val = phase_by_worker.get(worker_id) if worker_id else None
+            phase_str = _phase_label(phase_val)
+
+            rate_str = ""
+            if worker_id and worker_type == "game":
+                sps = collection_sps_by_worker.get(worker_id)
+                if sps is not None:
+                    rate_str = f", steps/s={sps:.1f}"
+            elif worker_id and worker_type == "training":
+                tps = training_sps_by_worker.get(worker_id)
+                if tps is not None:
+                    rate_str = f", train_steps/s={tps:.1f}"
+            elif worker_id and worker_type == "eval":
+                eps = eval_games_per_s_by_worker.get(worker_id)
+                if eps is not None:
+                    rate_str = f", eval_games/s={eps:.3f}"
+
             print(
                 f"  {w['worker_id']}: type={w['worker_type']}, "
                 f"device={w['device_type']}, status={w['status']}, "
-                f"games={w['games_generated']}, model_v{w['model_version']}"
+                f"games={w['games_generated']}, model_v{w['model_version']}, "
+                f"phase={phase_str}{rate_str}"
             )
     else:
         print(f"\n(No active workers)")

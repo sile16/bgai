@@ -1365,6 +1365,8 @@ class TrainingWorker(BaseWorker):
             metrics_port = metrics_port_config  # Fallback for registration
         metrics = get_metrics()
 
+        last_metrics_refresh = time.time()
+
         # Register metrics endpoint for dynamic discovery (use actual bound port)
         try:
             register_metrics_endpoint(
@@ -1458,8 +1460,25 @@ class TrainingWorker(BaseWorker):
                     worker_id=self.worker_id
                 ).set(new_games)
 
-                # Periodic status log while waiting
+                # Keep training visible in Prometheus discovery even while idle.
                 current_time = time.time()
+                if current_time - last_metrics_refresh >= 60.0:
+                    try:
+                        register_metrics_endpoint(
+                            self.buffer.redis,
+                            worker_id=self.worker_id,
+                            worker_type='training',
+                            port=metrics_port,
+                            ttl_seconds=300,
+                        )
+                    except Exception:
+                        pass
+                    metrics.training_steps_per_second.labels(
+                        worker_id=self.worker_id
+                    ).set(0.0)
+                    last_metrics_refresh = current_time
+
+                # Periodic status log while waiting
                 if current_time - last_log_time >= 30.0:
                     print(
                         f"Worker {self.worker_id}: Waiting for games "

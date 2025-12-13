@@ -747,11 +747,27 @@ class GameWorker(BaseWorker):
         total_steps = 0
         start_time = time.time()
         last_model_check = start_time
+        last_metrics_refresh = start_time
         last_pause_log = 0
 
         while self.running:
             if num_iterations >= 0 and iteration >= num_iterations:
                 break
+
+            # Keep this worker visible in Prometheus discovery even if collection is paused.
+            now = time.time()
+            if now - last_metrics_refresh >= 60.0:
+                try:
+                    register_metrics_endpoint(
+                        self.buffer.redis,
+                        worker_id=self.worker_id,
+                        worker_type='game',
+                        port=metrics_port,
+                        ttl_seconds=300,
+                    )
+                except Exception:
+                    pass
+                last_metrics_refresh = now
 
             # Check if collection is paused (during training epochs)
             if self.state.is_collection_paused():

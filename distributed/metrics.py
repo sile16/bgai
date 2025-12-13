@@ -73,6 +73,7 @@ class WorkerPhase:
     WARM_TREE = 3      # Training worker: building warm tree with MCTS
     CHECKPOINT = 4     # Training worker: saving checkpoint
     SAMPLING = 5       # Training worker: sampling from replay buffer
+    EVALUATING = 6     # Eval worker: running evaluation games
 
 
 class BGAIMetrics:
@@ -369,10 +370,10 @@ class BGAIMetrics:
         )
 
         # Worker phase tracking for pipeline visibility
-        # Phase values: 0=idle, 1=collecting, 2=training, 3=warm_tree_building, 4=checkpointing
+        # Phase values: see `WorkerPhase`
         self.worker_phase = Gauge(
             'bgai_worker_phase',
-            'Current worker phase (0=idle, 1=collecting, 2=training, 3=warm_tree, 4=checkpoint)',
+            'Current worker phase (see WorkerPhase constants)',
             ['worker_id', 'worker_type'],
             registry=self.registry,
         )
