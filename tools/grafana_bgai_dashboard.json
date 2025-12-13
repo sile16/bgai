@@ -2085,7 +2085,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 83 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 83 },
       "id": 60,
       "options": {
         "cellHeight": "sm",
@@ -2108,6 +2108,63 @@
         { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true }, "indexByName": {}, "renameByName": { "Value": "Status", "worker_id": "Worker ID", "worker_type": "Type" } } }
       ],
       "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "rate",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 83 },
+      "id": 203,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "pluginVersion": "11.3.0",
+      "targets": [
+        {
+          "expr": "max by (worker_id) (bgai_collection_steps_per_second)",
+          "legendFormat": "collect {{worker_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "max by (worker_id) (bgai_training_steps_per_second)",
+          "legendFormat": "train {{worker_id}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (worker_id) (rate(bgai_eval_games_total[5m]))",
+          "legendFormat": "eval {{worker_id}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Worker Throughput (collection/train/eval)",
+      "type": "timeseries"
     },
     {
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
