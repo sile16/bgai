@@ -32,7 +32,7 @@ from core.common import two_player_game
 from core.types import StepMetadata
 
 from .base_worker import BaseWorker, WorkerStats
-from ..serialization import deserialize_weights
+from ..serialization import deserialize_weights, deserialize_warm_tree
 from ..buffer.redis_buffer import RedisReplayBuffer
 from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase, WorkerState
 from ..coordinator.redis_state import create_state_manager
@@ -177,6 +177,10 @@ class EvalWorker(BaseWorker):
         self._gnubg_evaluator = None
         self._random_evaluator = None
         self._self_play_opponent_evaluator = None  # Reused for self-play evals
+
+        # Warm tree state (pre-expanded MCTS tree for faster evaluation)
+        self._warm_tree = None
+        self._warm_tree_version = 0
 
         # Track last evaluated version
         self._last_evaluated_version = 0
@@ -584,6 +588,8 @@ class EvalWorker(BaseWorker):
             self._nn_params = params_dict
             self.current_model_version = version
             print(f"Worker {self.worker_id}: Loaded model version {version}")
+            # Also try to get warm tree on init
+            self._check_and_update_warm_tree()
         else:
             # Initialize random weights
             key = jax.random.PRNGKey(42)
@@ -604,8 +610,27 @@ class EvalWorker(BaseWorker):
             weights_bytes, version = result
             self._nn_params = deserialize_weights(weights_bytes)
             print(f"Worker {self.worker_id}: Updated to model version {version}")
+            # Also check for warm tree update when model changes
+            self._check_and_update_warm_tree()
             return True
         return False
+
+    def _check_and_update_warm_tree(self) -> None:
+        """Check for and fetch warm tree update from Redis.
+
+        The warm tree is a pre-expanded MCTS tree that gives evaluation
+        a head start, reducing the number of simulations needed for good moves.
+        """
+        result = self.state.get_warm_tree_if_newer(self._warm_tree_version)
+        if result is not None:
+            tree_bytes, version = result
+            try:
+                self._warm_tree = deserialize_warm_tree(tree_bytes)
+                self._warm_tree_version = version
+                print(f"Worker {self.worker_id}: Loaded warm tree version {version}")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Error loading warm tree: {e}")
+                self._warm_tree = None
 
     def _queue_eval_tasks(self, model_version: int) -> None:
         """Queue evaluation tasks for a new model version.
@@ -1092,8 +1117,11 @@ class EvalWorker(BaseWorker):
             key, init_key = jax.random.split(key)
             env_state, metadata = self._env_init_fn(init_key)
 
-            # Initialize evaluator states
-            our_eval_state = self._mcts_evaluator.init(template_embedding=env_state)
+            # Initialize evaluator states - use warm tree if available
+            if self._warm_tree is not None:
+                our_eval_state = self._warm_tree
+            else:
+                our_eval_state = self._mcts_evaluator.init(template_embedding=env_state)
             opp_eval_state = self._gnubg_evaluator.init(template_embedding=env_state)
 
             # Randomly assign which evaluator plays which color
