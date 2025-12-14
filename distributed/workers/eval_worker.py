@@ -106,6 +106,7 @@ class EvalWorker(BaseWorker):
     EVAL_QUEUE = "bgai:eval:queue"
     EVAL_RESULTS = "bgai:eval:results"
     EVAL_IN_PROGRESS = "bgai:eval:in_progress"
+    EVAL_PROGRESS = "bgai:eval:progress"  # Tracks games completed per (version, eval_type)
 
     def __init__(
         self,
@@ -627,6 +628,66 @@ class EvalWorker(BaseWorker):
             self.buffer.redis.rpush(self.EVAL_QUEUE, task_id)
             print(f"Worker {self.worker_id}: Queued eval task {task_id}")
 
+    def _get_eval_progress_key(self, model_version: int, eval_type: str) -> str:
+        """Get Redis key for tracking eval progress."""
+        return f"{self.EVAL_PROGRESS}:v{model_version}:{eval_type}"
+
+    def _claim_eval_batch(self, model_version: int, eval_type: str) -> Optional[int]:
+        """Atomically claim a batch of games to evaluate.
+
+        Uses Redis INCRBY to atomically increment the games counter.
+        Returns the number of games to run in this batch, or None if target reached.
+
+        Args:
+            model_version: Model version to evaluate.
+            eval_type: Type of evaluation (gnubg, random, etc).
+
+        Returns:
+            Number of games to run in this batch, or None if target already reached.
+        """
+        progress_key = self._get_eval_progress_key(model_version, eval_type)
+
+        # Atomically check and increment
+        # Using WATCH/MULTI/EXEC for atomic check-and-increment
+        pipe = self.buffer.redis.pipeline()
+        try:
+            pipe.watch(progress_key)
+            current = pipe.get(progress_key)
+            current_games = int(current) if current else 0
+
+            if current_games >= self.eval_games:
+                pipe.unwatch()
+                return None  # Target already reached
+
+            # Calculate batch size (don't exceed target)
+            remaining = self.eval_games - current_games
+            batch = min(self.batch_size, remaining)
+
+            # Atomically increment
+            pipe.multi()
+            pipe.incrby(progress_key, batch)
+            pipe.expire(progress_key, 3600)  # 1 hour TTL
+            pipe.execute()
+
+            return batch
+        except Exception as e:
+            print(f"Worker {self.worker_id}: Redis claim error: {e}", flush=True)
+            try:
+                pipe.unwatch()
+            except Exception:
+                pass
+            return None
+
+    def _get_eval_progress(self, model_version: int, eval_type: str) -> int:
+        """Get current global progress for an eval task.
+
+        Returns:
+            Number of games already completed/claimed globally.
+        """
+        progress_key = self._get_eval_progress_key(model_version, eval_type)
+        current = self.buffer.redis.get(progress_key)
+        return int(current) if current else 0
+
     def _claim_eval_task(self) -> Optional[Tuple[int, str]]:
         """Try to claim an evaluation task from the queue.
 
@@ -652,8 +713,73 @@ class EvalWorker(BaseWorker):
             print(f"Worker {self.worker_id}: Invalid task_id: {task_id}")
             return None
 
+    def _emit_batch_result(self, result: EvalResult, is_final: bool = False) -> None:
+        """Emit batch results immediately to Prometheus and optionally store in Redis.
+
+        Called after each batch completes. Prometheus counters aggregate across workers.
+
+        Args:
+            result: EvalResult from the batch.
+            is_final: Whether this completes the eval for this (version, eval_type).
+        """
+        task_id = f"v{result.model_version}:{result.eval_type}"
+
+        # Check global progress
+        global_progress = self._get_eval_progress(result.model_version, result.eval_type)
+
+        # Print batch completion
+        print(
+            f"Worker {self.worker_id}: Batch complete {result.eval_type} v{result.model_version}: "
+            f"{result.games_played} games, win_rate={result.win_rate:.2%}, points={result.total_points} "
+            f"(W:{result.wins_single}/{result.wins_gammon}/{result.wins_backgammon} "
+            f"L:{result.losses_single}/{result.losses_gammon}/{result.losses_backgammon}) "
+            f"[global: {global_progress}/{self.eval_games}]",
+            flush=True
+        )
+
+        # Always update Prometheus metrics immediately (they aggregate across workers)
+        # The _update_metrics call in _run_loop handles this
+
+        if is_final:
+            # Store aggregated result for this worker's contribution
+            result_key = f"{self.EVAL_RESULTS}:{task_id}:{self.worker_id}"
+            result_data = {
+                'eval_type': result.eval_type,
+                'model_version': result.model_version,
+                'games_played': result.games_played,
+                'wins': result.wins,
+                'losses': result.losses,
+                'draws': result.draws,
+                'wins_single': result.wins_single,
+                'wins_gammon': result.wins_gammon,
+                'wins_backgammon': result.wins_backgammon,
+                'losses_single': result.losses_single,
+                'losses_gammon': result.losses_gammon,
+                'losses_backgammon': result.losses_backgammon,
+                'win_rate': result.win_rate,
+                'avg_game_length': result.avg_game_length,
+                'avg_points_won': result.avg_points_won,
+                'total_points': result.total_points,
+                'duration_seconds': result.duration_seconds,
+                'timestamp': result.timestamp,
+                'worker_id': self.worker_id,
+            }
+            self.buffer.redis.hset(result_key, mapping={
+                k: str(v) for k, v in result_data.items()
+            })
+
+            # Store in sorted set for easy querying by version
+            self.buffer.redis.zadd(
+                f"{self.EVAL_RESULTS}:by_version:{result.eval_type}",
+                {f"{task_id}:{self.worker_id}": result.model_version}
+            )
+
     def _complete_eval_task(self, result: EvalResult) -> None:
-        """Mark an evaluation task as complete and store results."""
+        """Mark an evaluation task as complete and store results.
+
+        DEPRECATED: Use _emit_batch_result for new batch-based approach.
+        Kept for compatibility with legacy single-worker eval completion.
+        """
         task_id = f"v{result.model_version}:{result.eval_type}"
 
         # Store result
@@ -705,17 +831,20 @@ class EvalWorker(BaseWorker):
         self,
         model_version: int,
         eval_type: str,
+        num_games: Optional[int] = None,
     ) -> Optional[EvalResult]:
         """Run evaluation games against a specific opponent.
 
         Args:
             model_version: Model version to evaluate.
             eval_type: Type of evaluation to run.
+            num_games: Number of games to run (defaults to self.eval_games for legacy).
 
         Returns:
             EvalResult or None if evaluation failed.
         """
         start_time = time.time()
+        games_to_run = num_games if num_games is not None else self.eval_games
 
         # Ensure we have the right model version
         if self.current_model_version != model_version:
@@ -733,13 +862,13 @@ class EvalWorker(BaseWorker):
                 print(f"Worker {self.worker_id}: GNUBG not available, skipping")
                 return None
             # GNUBG uses pure_callback, not JIT-compatible with two_player_game
-            results = self._run_gnubg_eval()
+            results = self._run_gnubg_eval(num_games=games_to_run)
         elif eval_type_normalized == EvalType.RANDOM.value:
             # Use TurboZero's two_player_game (JIT-compatible)
-            results = self._run_two_player_eval(self._random_evaluator, None)
+            results = self._run_two_player_eval(self._random_evaluator, None, num_games=games_to_run)
         elif eval_type_normalized == EvalType.SELF_PLAY.value:
             opponent = self._get_self_play_opponent_evaluator()
-            results = self._run_two_player_eval(opponent, self._nn_params)
+            results = self._run_two_player_eval(opponent, self._nn_params, num_games=games_to_run)
         else:
             print(f"Worker {self.worker_id}: Unknown eval type: {eval_type}")
             return None
@@ -817,6 +946,7 @@ class EvalWorker(BaseWorker):
         self,
         opponent_evaluator,
         opponent_params: Optional[chex.ArrayTree],
+        num_games: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Run evaluation games using TurboZero's two_player_game.
 
@@ -826,6 +956,7 @@ class EvalWorker(BaseWorker):
         Args:
             opponent_evaluator: The opponent's evaluator.
             opponent_params: Parameters for opponent (None for random).
+            num_games: Number of games to run (defaults to self.eval_games).
 
         Returns:
             Dict with detailed win/loss breakdown by point value.
@@ -837,25 +968,26 @@ class EvalWorker(BaseWorker):
         total_points = 0.0
         start_time = time.time()
         opponent_name = type(opponent_evaluator).__name__
+        games_to_run = num_games if num_games is not None else self.eval_games
 
         # Get JIT-compiled game function for this opponent type
         play_game = self._get_jitted_game_fn(opponent_evaluator)
         params_2 = opponent_params if opponent_params is not None else self._nn_params
 
         # Run games one at a time (two_player_game handles single games)
-        for game_idx in range(self.eval_games):
+        for game_idx in range(games_to_run):
             if not self.running:
                 break
             self._refresh_metrics_registration()
 
-            # Progress logging every 10 games or every game if eval_games < 20
-            log_interval = max(1, self.eval_games // 10)
+            # Progress logging every 10 games or every game if games_to_run < 20
+            log_interval = max(1, games_to_run // 10)
             if game_idx > 0 and game_idx % log_interval == 0:
                 elapsed = time.time() - start_time
                 games_per_sec = game_idx / elapsed
-                eta = (self.eval_games - game_idx) / games_per_sec if games_per_sec > 0 else 0
+                eta = (games_to_run - game_idx) / games_per_sec if games_per_sec > 0 else 0
                 print(
-                    f"Worker {self.worker_id}: {opponent_name} progress {game_idx}/{self.eval_games} "
+                    f"Worker {self.worker_id}: {opponent_name} progress {game_idx}/{games_to_run} "
                     f"({wins}W/{losses}L, {elapsed:.0f}s elapsed, ETA {eta:.0f}s)",
                     flush=True
                 )
@@ -914,13 +1046,16 @@ class EvalWorker(BaseWorker):
             'total_points': total_points,
         }
 
-    def _run_gnubg_eval(self) -> Dict[str, Any]:
+    def _run_gnubg_eval(self, num_games: Optional[int] = None) -> Dict[str, Any]:
         """Run evaluation games against GNUBG.
 
         Uses a Python loop since GNUBG evaluator uses jax.pure_callback
         which is not compatible with jax.lax.scan in two_player_game.
 
         This method properly steps both evaluators after each action.
+
+        Args:
+            num_games: Number of games to run (defaults to self.eval_games).
 
         Returns:
             Dict with detailed win/loss breakdown by point value.
@@ -933,8 +1068,9 @@ class EvalWorker(BaseWorker):
 
         max_steps = 500
         start_time = time.time()
+        games_to_run = num_games if num_games is not None else self.eval_games
 
-        for game_idx in range(self.eval_games):
+        for game_idx in range(games_to_run):
             if not self.running:
                 break
             self._refresh_metrics_registration()
@@ -943,9 +1079,9 @@ class EvalWorker(BaseWorker):
             if game_idx > 0:
                 elapsed = time.time() - start_time
                 games_per_sec = game_idx / elapsed
-                eta = (self.eval_games - game_idx) / games_per_sec if games_per_sec > 0 else 0
+                eta = (games_to_run - game_idx) / games_per_sec if games_per_sec > 0 else 0
                 print(
-                    f"Worker {self.worker_id}: GNUBG progress {game_idx}/{self.eval_games} "
+                    f"Worker {self.worker_id}: GNUBG progress {game_idx}/{games_to_run} "
                     f"({wins}W/{losses}L, {elapsed:.0f}s elapsed, ETA {eta:.0f}s)",
                     flush=True
                 )
@@ -1089,7 +1225,7 @@ class EvalWorker(BaseWorker):
             'eval_games': str(self.eval_games),
             'eval_types': ','.join(self.enabled_eval_types),
             'batch_size': str(self.batch_size),
-            'device': 'gpu' if self.device_info.is_gpu else 'cpu',
+            'device_type': 'cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu',
             'device_kind': str(self.device_info.device_kind),
         })
         metrics.worker_status.labels(
@@ -1161,6 +1297,10 @@ class EvalWorker(BaseWorker):
         eval_count = 0
         last_check_version = 0
 
+        # Track cumulative results per (version, eval_type) for this worker
+        # Used for final aggregation when done with a version
+        worker_cumulative: Dict[str, Dict[str, Any]] = {}
+
         while self.running:
             if num_iterations >= 0 and eval_count >= num_iterations:
                 break
@@ -1173,11 +1313,97 @@ class EvalWorker(BaseWorker):
                 self._queue_eval_tasks(current_version)
                 last_check_version = current_version
 
-            # Try to claim an eval task
-            task = self._claim_eval_task()
+            # Find an eval type with work remaining
+            batch_claimed = False
+            for eval_type in self.enabled_eval_types:
+                # Check global progress
+                global_progress = self._get_eval_progress(current_version, eval_type)
+                if global_progress >= self.eval_games:
+                    continue  # Target reached for this eval type
 
-            if task is None:
-                # No tasks available, wait and check for model updates
+                # Try to claim a batch
+                batch_size = self._claim_eval_batch(current_version, eval_type)
+                if batch_size is None or batch_size <= 0:
+                    continue  # No batch available or target just reached
+
+                batch_claimed = True
+                task_key = f"v{current_version}:{eval_type}"
+
+                print(
+                    f"Worker {self.worker_id}: Running {eval_type} v{current_version} "
+                    f"batch of {batch_size} games ({self.num_simulations} sims) "
+                    f"[global: {global_progress}/{self.eval_games}]",
+                    flush=True
+                )
+                self._refresh_metrics_registration(force=True)
+                metrics.worker_phase.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(WorkerPhase.EVALUATING)
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(WorkerState.RUNNING)
+
+                # Run the batch evaluation
+                result = self._run_evaluation(current_version, eval_type, num_games=batch_size)
+
+                if result is not None:
+                    # Update metrics immediately (Prometheus aggregates across workers)
+                    self._update_metrics(result, metrics)
+                    eval_count += 1
+
+                    if result.duration_seconds > 0:
+                        metrics.worker_steps_per_second.labels(
+                            worker_id=self.worker_id, worker_type='eval'
+                        ).set(result.games_played / result.duration_seconds)
+
+                    # Accumulate results for this worker
+                    if task_key not in worker_cumulative:
+                        worker_cumulative[task_key] = {
+                            'games_played': 0, 'wins': 0, 'losses': 0, 'draws': 0,
+                            'wins_single': 0, 'wins_gammon': 0, 'wins_backgammon': 0,
+                            'losses_single': 0, 'losses_gammon': 0, 'losses_backgammon': 0,
+                            'total_length': 0, 'total_points': 0.0, 'duration': 0.0,
+                        }
+                    cum = worker_cumulative[task_key]
+                    cum['games_played'] += result.games_played
+                    cum['wins'] += result.wins
+                    cum['losses'] += result.losses
+                    cum['draws'] += result.draws
+                    cum['wins_single'] += result.wins_single
+                    cum['wins_gammon'] += result.wins_gammon
+                    cum['wins_backgammon'] += result.wins_backgammon
+                    cum['losses_single'] += result.losses_single
+                    cum['losses_gammon'] += result.losses_gammon
+                    cum['losses_backgammon'] += result.losses_backgammon
+                    cum['total_length'] += result.avg_game_length * result.games_played
+                    cum['total_points'] += result.total_points
+                    cum['duration'] += result.duration_seconds
+
+                    # Check if global target reached after our batch
+                    new_global_progress = self._get_eval_progress(current_version, eval_type)
+                    is_final = new_global_progress >= self.eval_games
+
+                    # Emit batch result (print + optional Redis store)
+                    self._emit_batch_result(result, is_final=is_final)
+
+                    # Log to MLflow after each batch
+                    self._log_mlflow_eval_metrics(result)
+                    self._refresh_metrics_registration(force=True)
+
+                    # If this was the last batch for this eval type, clear cumulative
+                    if is_final:
+                        print(
+                            f"Worker {self.worker_id}: Eval target reached for {eval_type} v{current_version} "
+                            f"(this worker contributed {cum['games_played']} games)",
+                            flush=True
+                        )
+                        del worker_cumulative[task_key]
+
+                # After running a batch, break to re-check for new model versions
+                break
+
+            if not batch_claimed:
+                # No work available for any eval type, wait and check for model updates
                 self._check_and_update_model()
                 metrics.worker_state.labels(
                     worker_id=self.worker_id, worker_type='eval'
@@ -1192,51 +1418,6 @@ class EvalWorker(BaseWorker):
                 metrics.worker_phase.labels(
                     worker_id=self.worker_id, worker_type='eval'
                 ).set(WorkerPhase.IDLE)
-                continue
-
-            model_version, eval_type = task
-            print(
-                f"Worker {self.worker_id}: Running {eval_type} evaluation "
-                f"for model v{model_version} ({self.eval_games} games, {self.num_simulations} sims)",
-                flush=True
-            )
-            self._refresh_metrics_registration(force=True)
-            metrics.worker_phase.labels(
-                worker_id=self.worker_id, worker_type='eval'
-            ).set(WorkerPhase.EVALUATING)
-            metrics.worker_state.labels(
-                worker_id=self.worker_id, worker_type='eval'
-            ).set(WorkerState.RUNNING)
-
-            # Run the evaluation
-            result = self._run_evaluation(model_version, eval_type)
-
-            if result is not None:
-                # Store result
-                self._complete_eval_task(result)
-                eval_count += 1
-
-                if result.duration_seconds > 0:
-                    metrics.worker_steps_per_second.labels(
-                        worker_id=self.worker_id, worker_type='eval'
-                    ).set(result.games_played / result.duration_seconds)
-
-                # Update metrics
-                self._update_metrics(result, metrics)
-
-                # Log to MLflow
-                self._log_mlflow_eval_metrics(result)
-                self._refresh_metrics_registration(force=True)
-            else:
-                # Failed, remove from in-progress
-                task_id = f"v{model_version}:{eval_type}"
-                self.buffer.redis.srem(self.EVAL_IN_PROGRESS, task_id)
-                metrics.worker_phase.labels(
-                    worker_id=self.worker_id, worker_type='eval'
-                ).set(WorkerPhase.IDLE)
-                metrics.worker_state.labels(
-                    worker_id=self.worker_id, worker_type='eval'
-                ).set(WorkerState.WAITING)
 
         # Mark worker as stopped
         metrics.worker_status.labels(
