@@ -373,8 +373,8 @@ start_game_worker() {
     echo "Starting game worker: $worker_tag"
     echo "  Log: $log_file"
 
-    # Build command
-    local cmd="python -m distributed.cli.main game-worker"
+    # Build command (use -u for unbuffered output to ensure logs appear immediately)
+    local cmd="python -u -m distributed.cli.main game-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --head-ip $HEAD_IP"
     if [[ "$DEVICE_TYPE" == "cuda" ]]; then
@@ -439,8 +439,8 @@ start_eval_worker() {
     echo "  Eval types: $eval_types"
     echo "  Log: $log_file"
 
-    # Build command
-    local cmd="python -m distributed.cli.main eval-worker"
+    # Build command (use -u for unbuffered output to ensure logs appear immediately)
+    local cmd="python -u -m distributed.cli.main eval-worker"
     cmd="$cmd --config-file $CONFIG_FILE"
     cmd="$cmd --head-ip $HEAD_IP"
     if [[ "$DEVICE_TYPE" == "cuda" ]]; then
