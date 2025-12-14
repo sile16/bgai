@@ -51,7 +51,7 @@ training:
   lookup_enabled: False            # disables the lookup positions.
   lookup_learning_weight: 1.5      # this is for future if we have specific anchor positions with value AND policy
   l2_reg_lambda: 0.0001            # L2 regularization
-  games_per_epoch: 600               # New games before training step (~30 min with 3 workers) 
+  games_per_epoch: 100               # Reduced for faster training iteration 
   surprise_weight: 0.2             # Blend of uniform (0) vs surprise-weighted (1) sampling
   checkpoint_epoch_interval: 5     # number of epochs berfore we write checkpoint to disk
   max_checkpoints: 5
