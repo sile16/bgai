@@ -313,6 +313,16 @@ class GameWorker(BaseWorker):
             self._nn_params = params_dict
             print(f"Worker {self.worker_id}: Loaded model version {version}")
 
+            # Read temperature from Redis (set by coordinator)
+            try:
+                redis_temp = self.state.get_model_temperature()
+                if redis_temp is not None and redis_temp > 0:
+                    self._current_temperature = redis_temp
+                    self.temperature = redis_temp
+                    print(f"Worker {self.worker_id}: Loaded temperature {redis_temp:.2f} from Redis")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Could not read temperature from Redis: {e}")
+
             # Also try to get warm tree
             self._check_and_update_warm_tree()
         else:
