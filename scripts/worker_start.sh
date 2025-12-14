@@ -13,10 +13,13 @@
 #   ./scripts/worker_start.sh game --game-batch-size 32    # Override game batch size
 #   ./scripts/worker_start.sh eval --eval-batch-size 16    # Override eval batch size
 #   ./scripts/worker_start.sh game eval -g 32 -e 16        # Both with overrides
+#   ./scripts/worker_start.sh eval --eval-types random     # Only random eval
+#   ./scripts/worker_start.sh eval --eval-types gnubg,random  # Multiple eval types
 #
 # Environment:
 #   GAME_BATCH_SIZE - Override game batch size
 #   EVAL_BATCH_SIZE - Override eval batch size
+#   EVAL_TYPES      - Override eval types (comma-separated: gnubg,random,self_play)
 
 set -e
 
@@ -103,6 +106,7 @@ WORKER_TYPES=()
 EXTRA_ARGS=""
 CUSTOM_GAME_BATCH="${GAME_BATCH_SIZE:-}"
 CUSTOM_EVAL_BATCH="${EVAL_BATCH_SIZE:-}"
+CUSTOM_EVAL_TYPES="${EVAL_TYPES:-}"
 FORCE_DEVICE=""
 
 while [[ $# -gt 0 ]]; do
@@ -131,6 +135,10 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_EVAL_BATCH="$2"
             shift 2
             ;;
+        -t|--eval-types)
+            CUSTOM_EVAL_TYPES="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [game] [eval] [options]"
             echo ""
@@ -139,11 +147,12 @@ while [[ $# -gt 0 ]]; do
             echo "  eval    Start evaluation worker"
             echo ""
             echo "Options:"
-            echo "      --cpu                Force CPU worker (JAX_PLATFORMS=cpu)"
-            echo "      --gpu                Force GPU worker (JAX_PLATFORMS=cuda)"
-            echo "      --tpu                Force TPU worker (JAX_PLATFORMS=tpu)"
+            echo "      --cpu                 Force CPU worker (JAX_PLATFORMS=cpu)"
+            echo "      --gpu                 Force GPU worker (JAX_PLATFORMS=cuda)"
+            echo "      --tpu                 Force TPU worker (JAX_PLATFORMS=tpu)"
             echo "  -g, --game-batch-size N   Override game batch size"
             echo "  -e, --eval-batch-size N   Override eval batch size"
+            echo "  -t, --eval-types TYPES    Eval types (comma-separated: gnubg,random,self_play)"
             echo "  -h, --help                Show this help"
             exit 0
             ;;
@@ -332,13 +341,23 @@ fi
 if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
     echo "Eval batch:   $CUSTOM_EVAL_BATCH (override)"
 fi
+if [[ -n "$CUSTOM_EVAL_TYPES" ]]; then
+    echo "Eval types:   $CUSTOM_EVAL_TYPES (override)"
+fi
 echo "gnubg:        $(if $GNUBG_AVAILABLE; then echo "available"; else echo "not found"; fi)"
 echo ""
 
 # =============================================================================
-# Build eval types based on platform
+# Build eval types based on platform (or use custom override)
 # =============================================================================
 get_eval_types() {
+    # Use custom eval types if specified
+    if [[ -n "$CUSTOM_EVAL_TYPES" ]]; then
+        echo "$CUSTOM_EVAL_TYPES"
+        return
+    fi
+
+    # Otherwise auto-detect based on available tools
     local types="random,self_play"
 
     if $GNUBG_AVAILABLE; then
@@ -451,6 +470,9 @@ start_eval_worker() {
     if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
         cmd="$cmd --batch-size $CUSTOM_EVAL_BATCH"
     fi
+
+    # Add eval types
+    cmd="$cmd --eval-types $eval_types"
 
     # Run with auto-restart loop
     (
