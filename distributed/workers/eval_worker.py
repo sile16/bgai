@@ -34,7 +34,7 @@ from core.types import StepMetadata
 from .base_worker import BaseWorker, WorkerStats
 from ..serialization import deserialize_weights
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase, WorkerState
 from ..coordinator.redis_state import create_state_manager
 
 
@@ -697,7 +697,8 @@ class EvalWorker(BaseWorker):
             f"Worker {self.worker_id}: Completed {result.eval_type} v{result.model_version}: "
             f"win_rate={result.win_rate:.2%}, points={result.total_points} "
             f"(W:{result.wins_single}/{result.wins_gammon}/{result.wins_backgammon} "
-            f"L:{result.losses_single}/{result.losses_gammon}/{result.losses_backgammon})"
+            f"L:{result.losses_single}/{result.losses_gammon}/{result.losses_backgammon})",
+            flush=True
         )
 
     def _run_evaluation(
@@ -834,6 +835,8 @@ class EvalWorker(BaseWorker):
         losses_single, losses_gammon, losses_backgammon = 0, 0, 0
         total_game_length = 0
         total_points = 0.0
+        start_time = time.time()
+        opponent_name = type(opponent_evaluator).__name__
 
         # Get JIT-compiled game function for this opponent type
         play_game = self._get_jitted_game_fn(opponent_evaluator)
@@ -844,6 +847,18 @@ class EvalWorker(BaseWorker):
             if not self.running:
                 break
             self._refresh_metrics_registration()
+
+            # Progress logging every 10 games or every game if eval_games < 20
+            log_interval = max(1, self.eval_games // 10)
+            if game_idx > 0 and game_idx % log_interval == 0:
+                elapsed = time.time() - start_time
+                games_per_sec = game_idx / elapsed
+                eta = (self.eval_games - game_idx) / games_per_sec if games_per_sec > 0 else 0
+                print(
+                    f"Worker {self.worker_id}: {opponent_name} progress {game_idx}/{self.eval_games} "
+                    f"({wins}W/{losses}L, {elapsed:.0f}s elapsed, ETA {eta:.0f}s)",
+                    flush=True
+                )
 
             key, self._rng_key = jax.random.split(self._rng_key)
 
@@ -917,11 +932,23 @@ class EvalWorker(BaseWorker):
         total_points = 0.0
 
         max_steps = 500
+        start_time = time.time()
 
         for game_idx in range(self.eval_games):
             if not self.running:
                 break
             self._refresh_metrics_registration()
+
+            # Progress logging every game for gnubg (it's slow)
+            if game_idx > 0:
+                elapsed = time.time() - start_time
+                games_per_sec = game_idx / elapsed
+                eta = (self.eval_games - game_idx) / games_per_sec if games_per_sec > 0 else 0
+                print(
+                    f"Worker {self.worker_id}: GNUBG progress {game_idx}/{self.eval_games} "
+                    f"({wins}W/{losses}L, {elapsed:.0f}s elapsed, ETA {eta:.0f}s)",
+                    flush=True
+                )
 
             key, self._rng_key = jax.random.split(self._rng_key)
 
@@ -1045,6 +1072,50 @@ class EvalWorker(BaseWorker):
         Returns:
             Dict with results/statistics from the run.
         """
+        # Start Prometheus metrics server early so the dashboard can show startup/compile state.
+        metrics_port_config = self.config.get('metrics_port', 9300)
+        metrics_port = start_metrics_server(metrics_port_config)
+        if metrics_port is None:
+            print(f"Worker {self.worker_id}: Failed to start metrics server")
+            metrics_port = metrics_port_config  # Fallback for registration
+        metrics = get_metrics()
+        self._metrics_port = metrics_port
+
+        # Register metrics endpoint (use actual bound port)
+        self._refresh_metrics_registration(force=True)
+
+        metrics.worker_info.labels(worker_id=self.worker_id).info({
+            'type': 'eval',
+            'eval_games': str(self.eval_games),
+            'eval_types': ','.join(self.enabled_eval_types),
+            'batch_size': str(self.batch_size),
+            'device': 'gpu' if self.device_info.is_gpu else 'cpu',
+            'device_kind': str(self.device_info.device_kind),
+        })
+        metrics.worker_status.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(1)
+        metrics.worker_phase.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(WorkerPhase.IDLE)
+        metrics.worker_state.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(WorkerState.COMPILING)
+        metrics.worker_steps_per_second.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(0.0)
+
+        # Set configuration metrics (for correlating with memory usage)
+        metrics.worker_batch_size.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(self.batch_size)
+        metrics.worker_num_simulations.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(self.num_simulations)
+        metrics.worker_max_nodes.labels(
+            worker_id=self.worker_id, worker_type='eval'
+        ).set(self.max_nodes)
+
         # Setup
         print(f"Worker {self.worker_id}: Setting up evaluation environment...")
         self._setup_environment()
@@ -1060,15 +1131,6 @@ class EvalWorker(BaseWorker):
         # Log GNUBG settings to MLflow (if gnubg eval is enabled)
         if EvalType.GNUBG.value in self.enabled_eval_types:
             self._log_mlflow_gnubg_params()
-
-        # Start Prometheus metrics server
-        metrics_port_config = self.config.get('metrics_port', 9300)
-        metrics_port = start_metrics_server(metrics_port_config)
-        if metrics_port is None:
-            print(f"Worker {self.worker_id}: Failed to start metrics server")
-            metrics_port = metrics_port_config  # Fallback for registration
-        metrics = get_metrics()
-        self._metrics_port = metrics_port
 
         # Pre-initialize evaluation metrics so Grafana shows series
         # even before the first evaluation completes.
@@ -1088,32 +1150,9 @@ class EvalWorker(BaseWorker):
                 worker_id=self.worker_id, eval_type=eval_type
             ).inc(0)
 
-        # Register metrics endpoint (use actual bound port)
-        self._refresh_metrics_registration(force=True)
-
-        # Set worker info
-        metrics.worker_info.labels(worker_id=self.worker_id).info({
-            'type': 'eval',
-            'eval_games': str(self.eval_games),
-            'eval_types': ','.join(self.enabled_eval_types),
-        })
-        metrics.worker_status.labels(
+        metrics.worker_state.labels(
             worker_id=self.worker_id, worker_type='eval'
-        ).set(1)
-        metrics.worker_phase.labels(
-            worker_id=self.worker_id, worker_type='eval'
-        ).set(WorkerPhase.IDLE)
-
-        # Set configuration metrics (for correlating with memory usage)
-        metrics.worker_batch_size.labels(
-            worker_id=self.worker_id, worker_type='eval'
-        ).set(self.batch_size)
-        metrics.worker_num_simulations.labels(
-            worker_id=self.worker_id, worker_type='eval'
-        ).set(self.num_simulations)
-        metrics.worker_max_nodes.labels(
-            worker_id=self.worker_id, worker_type='eval'
-        ).set(self.max_nodes)
+        ).set(WorkerState.WAITING)
 
         print(f"Worker {self.worker_id}: Starting evaluation loop...")
         print(f"Worker {self.worker_id}: Enabled eval types: {self.enabled_eval_types}")
@@ -1140,6 +1179,12 @@ class EvalWorker(BaseWorker):
             if task is None:
                 # No tasks available, wait and check for model updates
                 self._check_and_update_model()
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(WorkerState.WAITING)
+                metrics.worker_steps_per_second.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(0.0)
                 time.sleep(5.0)
 
                 # Refresh metrics registration
@@ -1152,12 +1197,16 @@ class EvalWorker(BaseWorker):
             model_version, eval_type = task
             print(
                 f"Worker {self.worker_id}: Running {eval_type} evaluation "
-                f"for model v{model_version}"
+                f"for model v{model_version} ({self.eval_games} games, {self.num_simulations} sims)",
+                flush=True
             )
             self._refresh_metrics_registration(force=True)
             metrics.worker_phase.labels(
                 worker_id=self.worker_id, worker_type='eval'
             ).set(WorkerPhase.EVALUATING)
+            metrics.worker_state.labels(
+                worker_id=self.worker_id, worker_type='eval'
+            ).set(WorkerState.RUNNING)
 
             # Run the evaluation
             result = self._run_evaluation(model_version, eval_type)
@@ -1166,6 +1215,11 @@ class EvalWorker(BaseWorker):
                 # Store result
                 self._complete_eval_task(result)
                 eval_count += 1
+
+                if result.duration_seconds > 0:
+                    metrics.worker_steps_per_second.labels(
+                        worker_id=self.worker_id, worker_type='eval'
+                    ).set(result.games_played / result.duration_seconds)
 
                 # Update metrics
                 self._update_metrics(result, metrics)
@@ -1180,6 +1234,9 @@ class EvalWorker(BaseWorker):
                 metrics.worker_phase.labels(
                     worker_id=self.worker_id, worker_type='eval'
                 ).set(WorkerPhase.IDLE)
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='eval'
+                ).set(WorkerState.WAITING)
 
         # Mark worker as stopped
         metrics.worker_status.labels(
