@@ -74,7 +74,8 @@ class GameWorker(BaseWorker):
         self.num_simulations = self.config.get('num_simulations', 100)
         self.max_nodes = self.config.get('max_nodes', 400)
         self.max_episode_steps = self.config.get('max_episode_steps', 500)
-        self.short_game = bool(self.config['short_game'])
+        self.short_game = self.config.get('short_game', False)
+        self.simple_doubles = self.config.get('simple_doubles', False)
 
         # Temperature schedule is now managed by the Coordinator via Redis.
         # We just fetch the current temperature when updating the model.
@@ -198,7 +199,10 @@ class GameWorker(BaseWorker):
         """Set up the backgammon environment."""
         import pgx.backgammon as bg
 
-        self._env = bg.Backgammon(short_game=self.short_game)
+        self._env = bg.Backgammon(
+            short_game=self.short_game,
+            simple_doubles=self.simple_doubles,
+        )
 
         # Create step function that handles stochastic states
         def step_fn(state, action, key):

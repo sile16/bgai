@@ -415,6 +415,8 @@ def get_eval_worker_config(
     if device_type is None:
         device_type = detect_device_type()
 
+    # Eval section has its own settings that override mcts defaults
+    eval_cfg = config.get('eval', {})
     mcts = config.get('mcts', {})
     redis = config.get('redis', {})
     mlflow = config.get('mlflow', {})
@@ -458,11 +460,21 @@ def get_eval_worker_config(
     # GNUBG evaluation settings
     gnubg = config.get('gnubg', {})
 
+    # Eval section overrides mcts defaults for eval-specific settings
+    # Fallback chain: eval section -> mcts section -> default
+    num_simulations = eval_cfg.get('eval_simulations',
+                        mcts.get('eval_simulations',
+                            mcts.get('collect_simulations',
+                                mcts.get('simulations', 100))))
+    max_nodes = eval_cfg.get('max_nodes', mcts.get('max_nodes', 400))
+    persist_tree = eval_cfg.get('persist_tree', mcts.get('persist_tree', False))
+
     return {
         'batch_size': batch_size,
-        # eval_simulations is used for evaluation (can be different from collect)
-        'num_simulations': mcts.get('eval_simulations', mcts.get('collect_simulations', mcts.get('simulations', 100))),
-        'max_nodes': mcts.get('max_nodes', 400),
+        # eval_simulations from eval section, fallback to mcts section
+        'num_simulations': num_simulations,
+        'max_nodes': max_nodes,
+        'persist_tree': persist_tree,
         'redis_host': detect_redis_host(config),
         'redis_port': redis.get('port', 6379),
         'redis_password': redis.get('password'),
@@ -475,6 +487,8 @@ def get_eval_worker_config(
         'network_num_actions': network.get('num_actions', 156),
         # GNUBG settings (ply, shortcuts, osdb, move_filters)
         'gnubg': gnubg,
+        # Eval types from config
+        'eval_types': eval_cfg.get('eval_types', 'random,gnubg,self_play'),
     }
 
 

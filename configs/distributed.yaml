@@ -22,12 +22,6 @@ game:
   simple_doubles: False # simple doubles only plays doubles to limit randomness
 
 mcts:
-  collect_simulations: 400     # Base MCTS iterations (overridden by simulation_schedule)
-  eval_simulations: 50         # MCTS iterations for evaluation
-  max_nodes: 4000              # Maximum tree size (must be >= max simulations)
-  warm_tree_simulations: 2400   # MCTS sims for warm tree (0 = disabled)
-  warm_tree_max_nodes: 4000   # Max nodes for warm tree expansion
-  persist_tree: true           # Keep tree between moves
   # Temperature schedule (Stochastic MuZero paper style)
   # Values: [1.0, 0.5, 0.1] for first [1e5, 2e5, 3e5] steps, then 0.0 (greedy)
   temperature_schedule_values: [0.5, 0.3, 0.1, 0.0]
@@ -38,7 +32,26 @@ mcts:
   # Paper used 1600 throughout, but this saves compute early in training
   simulation_schedule_values: [400, 800, 1200, 1600]
   simulation_schedule_steps: [350000, 400000, 500000]
-  #discount: -1.0               # -1 for two-player zero-sum games
+  #mcts settings:
+  collect_simulations: 400     # Base MCTS iterations (overridden by simulation_schedule)
+  eval_simulations: 50         # MCTS iterations for evaluation
+  max_nodes: 4000              # Maximum tree size (must be >= max simulations)
+  warm_tree_simulations: 2400   # MCTS sims for warm tree (0 = disabled)
+  warm_tree_max_nodes: 4000   # Max nodes for warm tree expansion
+  persist_tree: True           # Keep tree between moves
+
+
+eval:
+  eval_types: "random,gnubg"
+  #mcts settings
+  persist_tree: True
+  eval_simulations: 50
+  warm_tree_simulations: 500
+  max_nodes: 600
+  #temp always 0, greedy for eval
+
+
+
 
 training:
   batch_size: 128              # Base training batch size (overridden by device_configs)

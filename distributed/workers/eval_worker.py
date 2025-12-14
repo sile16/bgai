@@ -136,6 +136,7 @@ class EvalWorker(BaseWorker):
         self.num_simulations = self.config.get('num_simulations', 200)
         self.max_nodes = self.config.get('max_nodes', 800)
         self.eval_interval = self.config.get('eval_interval', 300)  # seconds
+        self.persist_tree = self.config.get('persist_tree', False)  # Keep tree between moves
 
         # Which eval types this worker can run
         self.enabled_eval_types = self.config.get('eval_types', [
@@ -226,10 +227,22 @@ class EvalWorker(BaseWorker):
         return 'eval'
 
     def _setup_environment(self) -> None:
-        """Set up the backgammon environment."""
+        """Set up the backgammon environment.
+
+        Eval uses full games (short_game=False) by default for thorough testing,
+        but can be configured via eval section or game section.
+        """
         import pgx.backgammon as bg
 
-        self._env = bg.Backgammon(short_game=True)
+        # Eval defaults to full games for thorough testing
+        # Can be overridden via config
+        short_game = self.config.get('short_game', False)
+        simple_doubles = self.config.get('simple_doubles', False)
+
+        self._env = bg.Backgammon(
+            short_game=short_game,
+            simple_doubles=simple_doubles,
+        )
 
         # Create step function that handles stochastic states
         def step_fn(state, action, key):
@@ -340,7 +353,7 @@ class EvalWorker(BaseWorker):
             branching_factor=self._env.num_actions,
             action_selector=PUCTSelector(),
             temperature=0.1,  # Lower temperature for evaluation (less exploration)
-            persist_tree=False,  # Don't persist tree between games to prevent memory growth
+            persist_tree=self.persist_tree,  # From config (eval.persist_tree)
         )
 
     def _get_self_play_opponent_evaluator(self) -> StochasticMCTS:
@@ -362,7 +375,7 @@ class EvalWorker(BaseWorker):
                 branching_factor=self._env.num_actions,
                 action_selector=PUCTSelector(),
                 temperature=0.1,
-                persist_tree=False,  # Don't persist tree between games to prevent memory growth
+                persist_tree=self.persist_tree,  # From config (eval.persist_tree)
             )
         return self._self_play_opponent_evaluator
 
