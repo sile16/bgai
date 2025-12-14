@@ -1251,6 +1251,10 @@ class EvalWorker(BaseWorker):
         metrics.worker_max_nodes.labels(
             worker_id=self.worker_id, worker_type='eval'
         ).set(self.max_nodes)
+        device_type = 'cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu'
+        metrics.worker_device_type.labels(
+            worker_id=self.worker_id, worker_type='eval', device_type=device_type
+        ).set(1)
 
         # Setup
         print(f"Worker {self.worker_id}: Setting up evaluation environment...")

@@ -758,6 +758,10 @@ class GameWorker(BaseWorker):
         metrics.worker_short_game.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(1 if self.short_game else 0)
+        device_type = 'cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu'
+        metrics.worker_device_type.labels(
+            worker_id=self.worker_id, worker_type='game', device_type=device_type
+        ).set(1)
 
         # Setup
         print(f"Worker {self.worker_id}: Setting up environment and evaluator...")

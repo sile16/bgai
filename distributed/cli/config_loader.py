@@ -455,6 +455,9 @@ def get_eval_worker_config(
     # Network config for model architecture
     network = config.get('network', {})
 
+    # GNUBG evaluation settings
+    gnubg = config.get('gnubg', {})
+
     return {
         'batch_size': batch_size,
         # eval_simulations is used for evaluation (can be different from collect)
@@ -470,6 +473,8 @@ def get_eval_worker_config(
         'network_hidden_dim': network.get('hidden_dim', 256),
         'network_num_blocks': network.get('num_blocks', 6),
         'network_num_actions': network.get('num_actions', 156),
+        # GNUBG settings (ply, shortcuts, osdb, move_filters)
+        'gnubg': gnubg,
     }
 
 

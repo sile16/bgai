@@ -607,6 +607,13 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.worker_device_type = Gauge(
+            'bgai_worker_device_type',
+            'Worker device type encoded as label (value always 1, filter by device_type label)',
+            ['worker_id', 'worker_type', 'device_type'],
+            registry=self.registry,
+        )
+
         # =================================================================
         # Per-Worker Process Memory (RAM) Metrics
         # Useful for CPU workers and multi-process setups.
