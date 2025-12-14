@@ -196,6 +196,12 @@ def get_coordinator_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'learning_rate': training.get('learning_rate', 3e-4),
         # Store full config for device-specific distribution
         'device_configs': config.get('device_configs', {}),
+        # Temperature schedule (from Stochastic MuZero paper)
+        'temperature_schedule_values': mcts.get('temperature_schedule_values'),
+        'temperature_schedule_steps': mcts.get('temperature_schedule_steps'),
+        # Simulation schedule (ramp up as temperature decreases)
+        'simulation_schedule_values': mcts.get('simulation_schedule_values'),
+        'simulation_schedule_steps': mcts.get('simulation_schedule_steps'),
     }
 
 
