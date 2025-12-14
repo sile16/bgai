@@ -58,13 +58,24 @@ class Coordinator:
         # Default: linear decay 1.0 -> 0.2 over 50 epochs (legacy behavior approximation) if no schedule provided
         self.temp_steps = self.config.get('temperature_schedule_steps')
         self.temp_values = self.config.get('temperature_schedule_values')
-        
+
         if not self.temp_steps or not self.temp_values:
             # Fallback to simple static or linear decay if explicit schedule missing
             # This ensures we always have *some* valid logic
             print("Coordinator: No explicit temperature schedule found in config, using defaults.")
             self.temp_steps = []
             self.temp_values = [1.0]
+
+        # Simulation schedule (optimization: fewer sims at high temp, more at low temp)
+        # Paper used 1600 throughout, but we ramp up to save compute early in training
+        self.sim_steps = self.config.get('simulation_schedule_steps')
+        self.sim_values = self.config.get('simulation_schedule_values')
+
+        if not self.sim_steps or not self.sim_values:
+            # Default to fixed 400 simulations if no schedule provided
+            print("Coordinator: No explicit simulation schedule found in config, using default 400.")
+            self.sim_steps = []
+            self.sim_values = [400]
 
         # Runtime state
         self.running = False
@@ -242,11 +253,39 @@ class Coordinator:
 
         self.state.set_model_temperature(new_temp)
 
+    def _update_simulations(self) -> None:
+        """Update MCTS simulations based on training steps.
+
+        Similar logic to temperature schedule - ramp up simulations as
+        temperature decreases since precise MCTS matters more for greedy play.
+        """
+        if not self.sim_steps or not self.sim_values:
+            return
+
+        steps = self.state.get_training_steps()
+
+        # Default to first value
+        new_sims = self.sim_values[0]
+
+        # Find correct bucket
+        for threshold, val in zip(self.sim_steps, self.sim_values):
+            if steps < threshold:
+                new_sims = val
+                break
+            new_sims = val
+
+        # Use last value after all thresholds
+        if len(self.sim_values) > len(self.sim_steps) and steps >= self.sim_steps[-1]:
+            new_sims = self.sim_values[-1]
+
+        self.state.set_model_simulations(new_sims)
+
     def print_status(self) -> None:
         """Print current cluster status to stdout."""
         status = self.get_cluster_status()
         counts = status['workers']
         temp = self.state.get_model_temperature()
+        sims = self.state.get_model_simulations()
 
         print(
             f"Status: model_v{status['model_version']}, "
@@ -254,7 +293,7 @@ class Coordinator:
             f"training: {counts['training']}, "
             f"total_games: {status['total_games_generated']}, "
             f"train_steps: {status['total_training_steps']}, "
-            f"temp: {temp:.2f}"
+            f"temp: {temp:.2f}, sims: {sims}"
         )
 
     # =========================================================================
@@ -352,8 +391,9 @@ class Coordinator:
         """Main loop that prints status and cleans up stale workers."""
         while self.running:
             try:
-                # Update temperature based on schedule
+                # Update temperature and simulations based on schedule
                 self._update_temperature()
+                self._update_simulations()
 
                 self.print_status()
 

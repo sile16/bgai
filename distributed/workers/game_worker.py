@@ -80,6 +80,10 @@ class GameWorker(BaseWorker):
         self.temperature = self.config.get('temperature', 1.0)
         self._current_temperature = self.temperature
 
+        # Simulation schedule is also managed by Coordinator via Redis.
+        # Simulations ramp up as temperature decreases (fewer sims needed for random exploration).
+        self._current_simulations = self.num_simulations
+
         # Initialize Redis buffer (uses same connection info)
         redis_host = self.config.get('redis_host', 'localhost')
         redis_port = self.config.get('redis_port', 6379)
@@ -323,6 +327,16 @@ class GameWorker(BaseWorker):
             except Exception as e:
                 print(f"Worker {self.worker_id}: Could not read temperature from Redis: {e}")
 
+            # Read simulations from Redis (set by coordinator)
+            try:
+                redis_sims = self.state.get_model_simulations()
+                if redis_sims is not None and redis_sims > 0:
+                    self._current_simulations = redis_sims
+                    self.num_simulations = redis_sims
+                    print(f"Worker {self.worker_id}: Loaded simulations {redis_sims} from Redis")
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Could not read simulations from Redis: {e}")
+
             # Also try to get warm tree
             self._check_and_update_warm_tree()
         else:
@@ -411,6 +425,20 @@ class GameWorker(BaseWorker):
                     self._setup_batched_step()
             except Exception as e:
                 print(f"Worker {self.worker_id}: Error updating temperature: {e}")
+
+            # Update Simulations (only when model weights are updated)
+            try:
+                new_sims = self.state.get_model_simulations()
+                if new_sims != self._current_simulations:
+                    print(f"Worker {self.worker_id}: Updating simulations {self._current_simulations} -> {new_sims} due to model update")
+                    self._current_simulations = new_sims
+                    self.num_simulations = new_sims
+                    # Recreate evaluator with new simulation count
+                    self._setup_evaluator()
+                    # Re-JIT the step function with new evaluator
+                    self._setup_batched_step()
+            except Exception as e:
+                print(f"Worker {self.worker_id}: Error updating simulations: {e}")
 
             # Also check for warm tree update
             self._check_and_update_warm_tree()
@@ -689,8 +717,8 @@ class GameWorker(BaseWorker):
         print(f"Worker {self.worker_id}: JIT compiling batched step function...")
         self._setup_batched_step()
 
-        # Log temperature
-        print(f"Worker {self.worker_id}: Initial temperature: {self._current_temperature:.2f}")
+        # Log temperature and simulations
+        print(f"Worker {self.worker_id}: Initial temperature: {self._current_temperature:.2f}, simulations: {self._current_simulations}")
 
         # Start Prometheus metrics server
         metrics_port_config = self.config.get('metrics_port', 9100)
@@ -845,7 +873,7 @@ class GameWorker(BaseWorker):
                     except Exception:
                         pass
 
-                temp_str = f", temp={self._current_temperature:.2f}"
+                temp_str = f", temp={self._current_temperature:.2f}, sims={self._current_simulations}"
 
                 # Calculate GPU/CPU time breakdown
                 total_tracked = self._gpu_time_accum + self._cpu_time_accum

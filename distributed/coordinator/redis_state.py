@@ -44,6 +44,7 @@ KEY_WARM_TREE_VERSION = f"{PREFIX}:model:warm_tree_version"
 KEY_COLLECTION_PAUSED = f"{PREFIX}:collection:paused"
 KEY_TRAINING_STEPS = f"{PREFIX}:training:total_steps"
 KEY_MODEL_TEMPERATURE = f"{PREFIX}:model:temperature"
+KEY_MODEL_SIMULATIONS = f"{PREFIX}:model:simulations"
 
 # TTL values (seconds)
 WORKER_TTL = 60  # Workers expire after 60s without heartbeat
@@ -378,6 +379,23 @@ class RedisStateManager:
             temp: Temperature value.
         """
         self.redis.set(KEY_MODEL_TEMPERATURE, str(temp))
+
+    def get_model_simulations(self) -> int:
+        """Get current MCTS simulation count.
+
+        Returns:
+            Current simulations (default 400).
+        """
+        sims = self.redis.get(KEY_MODEL_SIMULATIONS)
+        return int(sims) if sims else 400
+
+    def set_model_simulations(self, sims: int) -> None:
+        """Set MCTS simulation count.
+
+        Args:
+            sims: Number of simulations.
+        """
+        self.redis.set(KEY_MODEL_SIMULATIONS, str(sims))
 
     # =========================================================================
     # Worker Registry
