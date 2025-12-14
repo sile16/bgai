@@ -48,16 +48,32 @@ class EvalType(Enum):
 
 @dataclass
 class EvalResult:
-    """Result of an evaluation run."""
+    """Result of an evaluation run.
+
+    Backgammon scoring:
+    - Normal win/loss: 1 point
+    - Gammon (opponent has no pieces off): 2 points
+    - Backgammon (gammon + opponent has piece in bar/home): 3 points
+
+    Points are tracked from our perspective: positive = we won, negative = we lost.
+    """
     eval_type: str
     model_version: int
     games_played: int
-    wins: int
-    losses: int
+    wins: int              # Total wins (1, 2, or 3 points)
+    losses: int            # Total losses (-1, -2, or -3 points)
     draws: int
+    # Detailed breakdown by point value
+    wins_single: int       # 1-point wins (normal)
+    wins_gammon: int       # 2-point wins (gammon)
+    wins_backgammon: int   # 3-point wins (backgammon)
+    losses_single: int     # 1-point losses
+    losses_gammon: int     # 2-point losses
+    losses_backgammon: int # 3-point losses
     win_rate: float
     avg_game_length: float
-    avg_points_won: float  # Average points won per game
+    avg_points_won: float  # Average points won per game (can be negative)
+    total_points: int      # Total points scored (positive - negative)
     duration_seconds: float
     timestamp: float
 
@@ -507,6 +523,14 @@ class EvalWorker(BaseWorker):
                 f'{prefix}_wins': result.wins,
                 f'{prefix}_losses': result.losses,
                 f'{prefix}_draws': result.draws,
+                # Detailed point breakdown
+                f'{prefix}_wins_single': result.wins_single,
+                f'{prefix}_wins_gammon': result.wins_gammon,
+                f'{prefix}_wins_backgammon': result.wins_backgammon,
+                f'{prefix}_losses_single': result.losses_single,
+                f'{prefix}_losses_gammon': result.losses_gammon,
+                f'{prefix}_losses_backgammon': result.losses_backgammon,
+                f'{prefix}_total_points': result.total_points,
                 f'{prefix}_avg_game_length': result.avg_game_length,
                 f'{prefix}_avg_points_won': result.avg_points_won,
                 f'{prefix}_duration_seconds': result.duration_seconds,
@@ -641,9 +665,16 @@ class EvalWorker(BaseWorker):
             'wins': result.wins,
             'losses': result.losses,
             'draws': result.draws,
+            'wins_single': result.wins_single,
+            'wins_gammon': result.wins_gammon,
+            'wins_backgammon': result.wins_backgammon,
+            'losses_single': result.losses_single,
+            'losses_gammon': result.losses_gammon,
+            'losses_backgammon': result.losses_backgammon,
             'win_rate': result.win_rate,
             'avg_game_length': result.avg_game_length,
             'avg_points_won': result.avg_points_won,
+            'total_points': result.total_points,
             'duration_seconds': result.duration_seconds,
             'timestamp': result.timestamp,
             'worker_id': self.worker_id,
@@ -661,9 +692,12 @@ class EvalWorker(BaseWorker):
         # Remove from in-progress set
         self.buffer.redis.srem(self.EVAL_IN_PROGRESS, task_id)
 
+        # Enhanced print with point breakdown
         print(
             f"Worker {self.worker_id}: Completed {result.eval_type} v{result.model_version}: "
-            f"win_rate={result.win_rate:.2%}"
+            f"win_rate={result.win_rate:.2%}, points={result.total_points} "
+            f"(W:{result.wins_single}/{result.wins_gammon}/{result.wins_backgammon} "
+            f"L:{result.losses_single}/{result.losses_gammon}/{result.losses_backgammon})"
         )
 
     def _run_evaluation(
@@ -715,6 +749,12 @@ class EvalWorker(BaseWorker):
         wins = results['wins']
         losses = results['losses']
         draws = results['draws']
+        wins_single = results.get('wins_single', 0)
+        wins_gammon = results.get('wins_gammon', 0)
+        wins_backgammon = results.get('wins_backgammon', 0)
+        losses_single = results.get('losses_single', 0)
+        losses_gammon = results.get('losses_gammon', 0)
+        losses_backgammon = results.get('losses_backgammon', 0)
         total_game_length = results['total_length']
         total_points = results['total_points']
 
@@ -729,9 +769,16 @@ class EvalWorker(BaseWorker):
             wins=wins,
             losses=losses,
             draws=draws,
+            wins_single=wins_single,
+            wins_gammon=wins_gammon,
+            wins_backgammon=wins_backgammon,
+            losses_single=losses_single,
+            losses_gammon=losses_gammon,
+            losses_backgammon=losses_backgammon,
             win_rate=wins / games_played,
             avg_game_length=total_game_length / games_played,
             avg_points_won=total_points / games_played,
+            total_points=int(total_points),
             duration_seconds=time.time() - start_time,
             timestamp=time.time(),
         )
@@ -780,9 +827,11 @@ class EvalWorker(BaseWorker):
             opponent_params: Parameters for opponent (None for random).
 
         Returns:
-            Dict with wins, losses, draws, total_length, total_points.
+            Dict with detailed win/loss breakdown by point value.
         """
         wins, losses, draws = 0, 0, 0
+        wins_single, wins_gammon, wins_backgammon = 0, 0, 0
+        losses_single, losses_gammon, losses_backgammon = 0, 0, 0
         total_game_length = 0
         total_points = 0.0
 
@@ -809,10 +858,24 @@ class EvalWorker(BaseWorker):
             # Explicitly delete large objects to free memory
             del frames, p_ids, outcomes, key
 
+            # Categorize by point value (1=single, 2=gammon, 3=backgammon)
+            points = int(round(abs(our_outcome)))
             if our_outcome > 0:
                 wins += 1
+                if points == 1:
+                    wins_single += 1
+                elif points == 2:
+                    wins_gammon += 1
+                elif points >= 3:
+                    wins_backgammon += 1
             elif our_outcome < 0:
                 losses += 1
+                if points == 1:
+                    losses_single += 1
+                elif points == 2:
+                    losses_gammon += 1
+                elif points >= 3:
+                    losses_backgammon += 1
             else:
                 draws += 1
 
@@ -826,6 +889,12 @@ class EvalWorker(BaseWorker):
             'wins': wins,
             'losses': losses,
             'draws': draws,
+            'wins_single': wins_single,
+            'wins_gammon': wins_gammon,
+            'wins_backgammon': wins_backgammon,
+            'losses_single': losses_single,
+            'losses_gammon': losses_gammon,
+            'losses_backgammon': losses_backgammon,
             'total_length': total_game_length,
             'total_points': total_points,
         }
@@ -839,9 +908,11 @@ class EvalWorker(BaseWorker):
         This method properly steps both evaluators after each action.
 
         Returns:
-            Dict with wins, losses, draws, total_length, total_points.
+            Dict with detailed win/loss breakdown by point value.
         """
         wins, losses, draws = 0, 0, 0
+        wins_single, wins_gammon, wins_backgammon = 0, 0, 0
+        losses_single, losses_gammon, losses_backgammon = 0, 0, 0
         total_game_length = 0
         total_points = 0.0
 
@@ -919,10 +990,24 @@ class EvalWorker(BaseWorker):
             else:
                 our_reward = float(metadata.rewards[1])
 
+            # Categorize by point value (1=single, 2=gammon, 3=backgammon)
+            points = int(round(abs(our_reward)))
             if our_reward > 0:
                 wins += 1
+                if points == 1:
+                    wins_single += 1
+                elif points == 2:
+                    wins_gammon += 1
+                elif points >= 3:
+                    wins_backgammon += 1
             elif our_reward < 0:
                 losses += 1
+                if points == 1:
+                    losses_single += 1
+                elif points == 2:
+                    losses_gammon += 1
+                elif points >= 3:
+                    losses_backgammon += 1
             else:
                 draws += 1
 
@@ -939,6 +1024,12 @@ class EvalWorker(BaseWorker):
             'wins': wins,
             'losses': losses,
             'draws': draws,
+            'wins_single': wins_single,
+            'wins_gammon': wins_gammon,
+            'wins_backgammon': wins_backgammon,
+            'losses_single': losses_single,
+            'losses_gammon': losses_gammon,
+            'losses_backgammon': losses_backgammon,
             'total_length': total_game_length,
             'total_points': total_points,
         }
@@ -1126,7 +1217,36 @@ class EvalWorker(BaseWorker):
             worker_id=self.worker_id, eval_type=result.eval_type
         ).inc(result.losses)
 
+        # Detailed point breakdown (gammon/backgammon)
+        metrics.eval_wins_single.labels(
+            worker_id=self.worker_id, eval_type=result.eval_type
+        ).inc(result.wins_single)
+
+        metrics.eval_wins_gammon.labels(
+            worker_id=self.worker_id, eval_type=result.eval_type
+        ).inc(result.wins_gammon)
+
+        metrics.eval_wins_backgammon.labels(
+            worker_id=self.worker_id, eval_type=result.eval_type
+        ).inc(result.wins_backgammon)
+
+        metrics.eval_losses_single.labels(
+            worker_id=self.worker_id, eval_type=result.eval_type
+        ).inc(result.losses_single)
+
+        metrics.eval_losses_gammon.labels(
+            worker_id=self.worker_id, eval_type=result.eval_type
+        ).inc(result.losses_gammon)
+
+        metrics.eval_losses_backgammon.labels(
+            worker_id=self.worker_id, eval_type=result.eval_type
+        ).inc(result.losses_backgammon)
+
         metrics.eval_win_rate.labels(eval_type=result.eval_type).set(result.win_rate)
+
+        metrics.eval_total_points.labels(eval_type=result.eval_type).set(result.total_points)
+
+        metrics.eval_avg_points.labels(eval_type=result.eval_type).set(result.avg_points_won)
 
         metrics.eval_duration.labels(
             worker_id=self.worker_id, eval_type=result.eval_type

@@ -352,6 +352,63 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        # Detailed win/loss breakdown by point value (gammon/backgammon)
+        self.eval_wins_single = Counter(
+            'bgai_eval_wins_single_total',
+            'Total 1-point wins (normal)',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_wins_gammon = Counter(
+            'bgai_eval_wins_gammon_total',
+            'Total 2-point wins (gammon)',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_wins_backgammon = Counter(
+            'bgai_eval_wins_backgammon_total',
+            'Total 3-point wins (backgammon)',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_losses_single = Counter(
+            'bgai_eval_losses_single_total',
+            'Total 1-point losses (normal)',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_losses_gammon = Counter(
+            'bgai_eval_losses_gammon_total',
+            'Total 2-point losses (gammon)',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_losses_backgammon = Counter(
+            'bgai_eval_losses_backgammon_total',
+            'Total 3-point losses (backgammon)',
+            ['worker_id', 'eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_total_points = Gauge(
+            'bgai_eval_total_points',
+            'Total points from most recent evaluation (positive = wins)',
+            ['eval_type'],
+            registry=self.registry,
+        )
+
+        self.eval_avg_points = Gauge(
+            'bgai_eval_avg_points_per_game',
+            'Average points per game from most recent evaluation',
+            ['eval_type'],
+            registry=self.registry,
+        )
+
         self.eval_duration = Histogram(
             'bgai_eval_duration_seconds',
             'Duration of evaluation runs',
@@ -511,6 +568,13 @@ class BGAIMetrics:
         self.worker_max_nodes = Gauge(
             'bgai_worker_max_nodes',
             'Maximum MCTS tree nodes',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_short_game = Gauge(
+            'bgai_worker_short_game',
+            'Whether the worker is using short-game (mid-game) starts (1=true, 0=false)',
             ['worker_id', 'worker_type'],
             registry=self.registry,
         )
