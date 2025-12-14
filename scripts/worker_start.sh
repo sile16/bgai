@@ -15,11 +15,14 @@
 #   ./scripts/worker_start.sh game eval -g 32 -e 16        # Both with overrides
 #   ./scripts/worker_start.sh eval --eval-types random     # Only random eval
 #   ./scripts/worker_start.sh eval --eval-types gnubg,random  # Multiple eval types
+#   ./scripts/worker_start.sh eval -n 4                    # Start 4 eval workers
+#   ./scripts/worker_start.sh eval --no-restart            # Don't kill existing workers
 #
 # Environment:
 #   GAME_BATCH_SIZE - Override game batch size
 #   EVAL_BATCH_SIZE - Override eval batch size
 #   EVAL_TYPES      - Override eval types (comma-separated: gnubg,random,self_play)
+#   NUM_WORKERS     - Number of workers to start (default: 1)
 
 set -e
 
@@ -107,6 +110,8 @@ EXTRA_ARGS=""
 CUSTOM_GAME_BATCH="${GAME_BATCH_SIZE:-}"
 CUSTOM_EVAL_BATCH="${EVAL_BATCH_SIZE:-}"
 CUSTOM_EVAL_TYPES="${EVAL_TYPES:-}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+NO_RESTART=false
 FORCE_DEVICE=""
 
 while [[ $# -gt 0 ]]; do
@@ -139,6 +144,14 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_EVAL_TYPES="$2"
             shift 2
             ;;
+        -n|--num-workers)
+            NUM_WORKERS="$2"
+            shift 2
+            ;;
+        --no-restart)
+            NO_RESTART=true
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 [game] [eval] [options]"
             echo ""
@@ -153,6 +166,8 @@ while [[ $# -gt 0 ]]; do
             echo "  -g, --game-batch-size N   Override game batch size"
             echo "  -e, --eval-batch-size N   Override eval batch size"
             echo "  -t, --eval-types TYPES    Eval types (comma-separated: gnubg,random,self_play)"
+            echo "  -n, --num-workers N       Number of workers to start (default: 1)"
+            echo "      --no-restart          Don't kill existing workers, just add more"
             echo "  -h, --help                Show this help"
             exit 0
             ;;
@@ -344,6 +359,12 @@ fi
 if [[ -n "$CUSTOM_EVAL_TYPES" ]]; then
     echo "Eval types:   $CUSTOM_EVAL_TYPES (override)"
 fi
+if [[ "$NUM_WORKERS" -gt 1 ]]; then
+    echo "Num workers:  $NUM_WORKERS"
+fi
+if $NO_RESTART; then
+    echo "Mode:         --no-restart (adding workers without killing existing)"
+fi
 echo "gnubg:        $(if $GNUBG_AVAILABLE; then echo "available"; else echo "not found"; fi)"
 echo ""
 
@@ -374,136 +395,178 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 PIDS=()
 
 start_game_worker() {
-    local worker_tag="${WORKER_TAG_BASE}-game"
-    local log_file="$LOG_DIR/game_${worker_tag}_${TIMESTAMP}.log"
-    local stop_file="$LOG_DIR/game_${worker_tag}.stop"
-    local pid_file="$LOG_DIR/game_${worker_tag}.pid"
+    local num_to_start="${NUM_WORKERS:-1}"
 
-    local existing_pid=""
-    existing_pid="$(find_existing_worker_pid "$pid_file" "game-worker" || true)"
-    if [[ -n "$existing_pid" ]]; then
-        describe_worker_process "$existing_pid" "game"
-        echo "Restarting ${worker_tag} with new params..."
-        stop_existing_worker "$existing_pid" "$stop_file" "$pid_file"
+    # Only check/kill existing workers if not in --no-restart mode and starting just 1
+    if ! $NO_RESTART && [[ "$num_to_start" -eq 1 ]]; then
+        local worker_tag="${WORKER_TAG_BASE}-game"
+        local stop_file="$LOG_DIR/game_${worker_tag}.stop"
+        local pid_file="$LOG_DIR/game_${worker_tag}.pid"
+
+        local existing_pid=""
+        existing_pid="$(find_existing_worker_pid "$pid_file" "game-worker" || true)"
+        if [[ -n "$existing_pid" ]]; then
+            describe_worker_process "$existing_pid" "game"
+            echo "Restarting ${worker_tag} with new params..."
+            stop_existing_worker "$existing_pid" "$stop_file" "$pid_file"
+        fi
     fi
 
-    rm -f "$stop_file"
+    # Start the requested number of game workers
+    for i in $(seq 1 "$num_to_start"); do
+        # Generate unique worker ID suffix
+        local worker_suffix
+        if [[ "$num_to_start" -gt 1 ]]; then
+            worker_suffix="-${i}"
+        else
+            worker_suffix=""
+        fi
 
-    echo "Starting game worker: $worker_tag"
-    echo "  Log: $log_file"
+        local worker_tag="${WORKER_TAG_BASE}-game${worker_suffix}"
+        local log_file="$LOG_DIR/game_${worker_tag}_${TIMESTAMP}.log"
+        local stop_file="$LOG_DIR/game_${worker_tag}.stop"
+        local pid_file="$LOG_DIR/game_${worker_tag}.pid"
 
-    # Build command (use -u for unbuffered output to ensure logs appear immediately)
-    local cmd="python -u -m distributed.cli.main game-worker"
-    cmd="$cmd --config-file $CONFIG_FILE"
-    cmd="$cmd --head-ip $HEAD_IP"
-    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
-        local gpu_mem_gb="${GAME_GPU_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['game_gpu_memory_gb'])")}"
-        cmd="$cmd --gpu-mem-gb $gpu_mem_gb"
-    fi
+        rm -f "$stop_file"
 
-    if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
-        cmd="$cmd --batch-size $CUSTOM_GAME_BATCH"
-    fi
+        echo "Starting game worker: $worker_tag"
+        echo "  Log: $log_file"
 
-    # Run with auto-restart loop
-    (
-        RESTART_DELAY=5
-        while true; do
-            if [[ -f "$stop_file" ]]; then
-                echo "$(date): Stop file detected. Exiting."
-                rm -f "$stop_file" "$pid_file"
-                exit 0
-            fi
+        # Build command (use -u for unbuffered output to ensure logs appear immediately)
+        local cmd="python -u -m distributed.cli.main game-worker"
+        cmd="$cmd --config-file $CONFIG_FILE"
+        cmd="$cmd --head-ip $HEAD_IP"
+        if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+            local gpu_mem_gb="${GAME_GPU_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['game_gpu_memory_gb'])")}"
+            cmd="$cmd --gpu-mem-gb $gpu_mem_gb"
+        fi
 
-            echo "$(date): Starting game worker..."
-            $cmd $EXTRA_ARGS
+        if [[ -n "$CUSTOM_GAME_BATCH" ]]; then
+            cmd="$cmd --batch-size $CUSTOM_GAME_BATCH"
+        fi
 
-            if [[ -f "$stop_file" ]]; then
-                rm -f "$stop_file" "$pid_file"
-                exit 0
-            fi
+        # Run with auto-restart loop
+        (
+            RESTART_DELAY=5
+            while true; do
+                if [[ -f "$stop_file" ]]; then
+                    echo "$(date): Stop file detected. Exiting."
+                    rm -f "$stop_file" "$pid_file"
+                    exit 0
+                fi
 
-            echo "$(date): Worker exited, restarting in ${RESTART_DELAY}s..."
-            sleep $RESTART_DELAY
-            RESTART_DELAY=$((RESTART_DELAY * 2))
-            [[ $RESTART_DELAY -gt 60 ]] && RESTART_DELAY=60
-        done
-    ) >> "$log_file" 2>&1 &
+                echo "$(date): Starting game worker..."
+                $cmd $EXTRA_ARGS
 
-    local pid=$!
-    echo "$pid" > "$pid_file"
-    PIDS+=($pid)
-    echo "  PID: $pid"
-    echo "  Stop: touch $stop_file"
+                if [[ -f "$stop_file" ]]; then
+                    rm -f "$stop_file" "$pid_file"
+                    exit 0
+                fi
+
+                echo "$(date): Worker exited, restarting in ${RESTART_DELAY}s..."
+                sleep $RESTART_DELAY
+                RESTART_DELAY=$((RESTART_DELAY * 2))
+                [[ $RESTART_DELAY -gt 60 ]] && RESTART_DELAY=60
+            done
+        ) >> "$log_file" 2>&1 &
+
+        local pid=$!
+        echo "$pid" > "$pid_file"
+        PIDS+=($pid)
+        echo "  PID: $pid"
+        echo "  Stop: touch $stop_file"
+        echo ""
+    done
 }
 
 start_eval_worker() {
-    local worker_tag="${WORKER_TAG_BASE}-eval"
-    local log_file="$LOG_DIR/eval_${worker_tag}_${TIMESTAMP}.log"
-    local stop_file="$LOG_DIR/eval_${worker_tag}.stop"
-    local pid_file="$LOG_DIR/eval_${worker_tag}.pid"
     local eval_types=$(get_eval_types)
+    local num_to_start="${NUM_WORKERS:-1}"
 
-    local existing_pid=""
-    existing_pid="$(find_existing_worker_pid "$pid_file" "eval-worker" || true)"
-    if [[ -n "$existing_pid" ]]; then
-        describe_worker_process "$existing_pid" "eval"
-        echo "Restarting ${worker_tag} with new params..."
-        stop_existing_worker "$existing_pid" "$stop_file" "$pid_file"
+    # Only check/kill existing workers if not in --no-restart mode and starting just 1
+    if ! $NO_RESTART && [[ "$num_to_start" -eq 1 ]]; then
+        local worker_tag="${WORKER_TAG_BASE}-eval"
+        local stop_file="$LOG_DIR/eval_${worker_tag}.stop"
+        local pid_file="$LOG_DIR/eval_${worker_tag}.pid"
+
+        local existing_pid=""
+        existing_pid="$(find_existing_worker_pid "$pid_file" "eval-worker" || true)"
+        if [[ -n "$existing_pid" ]]; then
+            describe_worker_process "$existing_pid" "eval"
+            echo "Restarting ${worker_tag} with new params..."
+            stop_existing_worker "$existing_pid" "$stop_file" "$pid_file"
+        fi
     fi
 
-    rm -f "$stop_file"
+    # Start the requested number of eval workers
+    for i in $(seq 1 "$num_to_start"); do
+        # Generate unique worker ID suffix
+        local worker_suffix
+        if [[ "$num_to_start" -gt 1 ]]; then
+            worker_suffix="-${i}"
+        else
+            worker_suffix=""
+        fi
 
-    echo "Starting eval worker: $worker_tag"
-    echo "  Eval types: $eval_types"
-    echo "  Log: $log_file"
+        local worker_tag="${WORKER_TAG_BASE}-eval${worker_suffix}"
+        local log_file="$LOG_DIR/eval_${worker_tag}_${TIMESTAMP}.log"
+        local stop_file="$LOG_DIR/eval_${worker_tag}.stop"
+        local pid_file="$LOG_DIR/eval_${worker_tag}.pid"
 
-    # Build command (use -u for unbuffered output to ensure logs appear immediately)
-    local cmd="python -u -m distributed.cli.main eval-worker"
-    cmd="$cmd --config-file $CONFIG_FILE"
-    cmd="$cmd --head-ip $HEAD_IP"
-    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
-        local gpu_mem_gb="${EVAL_GPU_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['eval_gpu_memory_gb'])")}"
-        cmd="$cmd --gpu-mem-gb $gpu_mem_gb"
-    fi
+        rm -f "$stop_file"
 
-    if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
-        cmd="$cmd --batch-size $CUSTOM_EVAL_BATCH"
-    fi
+        echo "Starting eval worker: $worker_tag"
+        echo "  Eval types: $eval_types"
+        echo "  Log: $log_file"
 
-    # Add eval types
-    cmd="$cmd --eval-types $eval_types"
+        # Build command (use -u for unbuffered output to ensure logs appear immediately)
+        local cmd="python -u -m distributed.cli.main eval-worker"
+        cmd="$cmd --config-file $CONFIG_FILE"
+        cmd="$cmd --head-ip $HEAD_IP"
+        if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+            local gpu_mem_gb="${EVAL_GPU_MEM_GB:-$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['device_configs']['cuda']['eval_gpu_memory_gb'])")}"
+            cmd="$cmd --gpu-mem-gb $gpu_mem_gb"
+        fi
 
-    # Run with auto-restart loop
-    (
-        RESTART_DELAY=5
-        while true; do
-            if [[ -f "$stop_file" ]]; then
-                echo "$(date): Stop file detected. Exiting."
-                rm -f "$stop_file" "$pid_file"
-                exit 0
-            fi
+        if [[ -n "$CUSTOM_EVAL_BATCH" ]]; then
+            cmd="$cmd --batch-size $CUSTOM_EVAL_BATCH"
+        fi
 
-            echo "$(date): Starting eval worker..."
-            $cmd $EXTRA_ARGS
+        # Add eval types
+        cmd="$cmd --eval-types $eval_types"
 
-            if [[ -f "$stop_file" ]]; then
-                rm -f "$stop_file" "$pid_file"
-                exit 0
-            fi
+        # Run with auto-restart loop
+        (
+            RESTART_DELAY=5
+            while true; do
+                if [[ -f "$stop_file" ]]; then
+                    echo "$(date): Stop file detected. Exiting."
+                    rm -f "$stop_file" "$pid_file"
+                    exit 0
+                fi
 
-            echo "$(date): Worker exited, restarting in ${RESTART_DELAY}s..."
-            sleep $RESTART_DELAY
-            RESTART_DELAY=$((RESTART_DELAY * 2))
-            [[ $RESTART_DELAY -gt 60 ]] && RESTART_DELAY=60
-        done
-    ) >> "$log_file" 2>&1 &
+                echo "$(date): Starting eval worker..."
+                $cmd $EXTRA_ARGS
 
-    local pid=$!
-    echo "$pid" > "$pid_file"
-    PIDS+=($pid)
-    echo "  PID: $pid"
-    echo "  Stop: touch $stop_file"
+                if [[ -f "$stop_file" ]]; then
+                    rm -f "$stop_file" "$pid_file"
+                    exit 0
+                fi
+
+                echo "$(date): Worker exited, restarting in ${RESTART_DELAY}s..."
+                sleep $RESTART_DELAY
+                RESTART_DELAY=$((RESTART_DELAY * 2))
+                [[ $RESTART_DELAY -gt 60 ]] && RESTART_DELAY=60
+            done
+        ) >> "$log_file" 2>&1 &
+
+        local pid=$!
+        echo "$pid" > "$pid_file"
+        PIDS+=($pid)
+        echo "  PID: $pid"
+        echo "  Stop: touch $stop_file"
+        echo ""
+    done
 }
 
 # Start requested worker types
