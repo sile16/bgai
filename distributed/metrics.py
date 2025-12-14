@@ -77,6 +77,13 @@ class WorkerPhase:
     EVALUATING = 6     # Eval worker: running evaluation games
 
 
+class WorkerState:
+    """High-level worker state for dashboards."""
+    WAITING = 0    # Blocked/waiting (e.g. gating condition not met)
+    COMPILING = 1  # JIT compiling / initializing
+    RUNNING = 2    # Actively doing work
+
+
 class BGAIMetrics:
     """Container for all BGAI training metrics."""
 
@@ -175,6 +182,13 @@ class BGAIMetrics:
             registry=self.registry,
         )
 
+        self.value_loss_per_output = Gauge(
+            'bgai_value_loss_per_output',
+            'Value loss per value-head output (4-way conditional head)',
+            ['worker_id', 'output'],
+            registry=self.registry,
+        )
+
         self.predicted_outcome_prob = Gauge(
             'bgai_predicted_outcome_prob',
             'Mean predicted probability per outcome type',
@@ -251,7 +265,7 @@ class BGAIMetrics:
 
         self.buffer_games = Gauge(
             'bgai_buffer_games',
-            'Current number of games in buffer',
+            'Total number of games (episodes) ever added to the replay buffer (monotonic)',
             registry=self.registry,
         )
 
@@ -453,6 +467,20 @@ class BGAIMetrics:
         self.worker_phase = Gauge(
             'bgai_worker_phase',
             'Current worker phase (see WorkerPhase constants)',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_state = Gauge(
+            'bgai_worker_state',
+            'High-level worker state (see WorkerState constants)',
+            ['worker_id', 'worker_type'],
+            registry=self.registry,
+        )
+
+        self.worker_steps_per_second = Gauge(
+            'bgai_worker_steps_per_second',
+            'Current worker throughput (steps/s; meaning depends on worker_type)',
             ['worker_id', 'worker_type'],
             registry=self.registry,
         )
