@@ -25,8 +25,8 @@ mcts:
   collect_simulations: 400     # Base MCTS iterations (overridden by simulation_schedule)
   eval_simulations: 50         # MCTS iterations for evaluation
   max_nodes: 4000              # Maximum tree size (must be >= max simulations)
-  warm_tree_simulations: 500   # MCTS sims for warm tree (0 = disabled)
-  warm_tree_max_nodes: 10000   # Max nodes for warm tree expansion
+  warm_tree_simulations: 2400   # MCTS sims for warm tree (0 = disabled)
+  warm_tree_max_nodes: 4000   # Max nodes for warm tree expansion
   persist_tree: true           # Keep tree between moves
   # Temperature schedule (Stochastic MuZero paper style)
   # Values: [1.0, 0.5, 0.1] for first [1e5, 2e5, 3e5] steps, then 0.0 (greedy)
