@@ -30,7 +30,7 @@ from ..serialization import (
     deserialize_warm_tree,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase, WorkerState
 
 
 class GameWorker(BaseWorker):
@@ -74,6 +74,7 @@ class GameWorker(BaseWorker):
         self.num_simulations = self.config.get('num_simulations', 100)
         self.max_nodes = self.config.get('max_nodes', 400)
         self.max_episode_steps = self.config.get('max_episode_steps', 500)
+        self.short_game = bool(self.config['short_game'])
 
         # Temperature schedule is now managed by the Coordinator via Redis.
         # We just fetch the current temperature when updating the model.
@@ -197,7 +198,7 @@ class GameWorker(BaseWorker):
         """Set up the backgammon environment."""
         import pgx.backgammon as bg
 
-        self._env = bg.Backgammon(short_game=True)
+        self._env = bg.Backgammon(short_game=self.short_game)
 
         # Create step function that handles stochastic states
         def step_fn(state, action, key):
@@ -702,25 +703,7 @@ class GameWorker(BaseWorker):
         Returns:
             Dict with results/statistics from the run.
         """
-        # Setup
-        print(f"Worker {self.worker_id}: Setting up environment and evaluator...")
-        self._setup_environment()
-        self._setup_neural_network()
-        self._setup_evaluator()
-        self._initialize_params()
-
-        # Initialize collection state
-        print(f"Worker {self.worker_id}: Initializing {self.batch_size} parallel environments...")
-        self._collection_state = self._init_collection_state()
-
-        # Setup and JIT compile the batched step function
-        print(f"Worker {self.worker_id}: JIT compiling batched step function...")
-        self._setup_batched_step()
-
-        # Log temperature and simulations
-        print(f"Worker {self.worker_id}: Initial temperature: {self._current_temperature:.2f}, simulations: {self._current_simulations}")
-
-        # Start Prometheus metrics server
+        # Start Prometheus metrics server early so the dashboard can show startup/compile state.
         metrics_port_config = self.config.get('metrics_port', 9100)
         metrics_port = start_metrics_server(metrics_port_config)
         if metrics_port is None:
@@ -749,11 +732,18 @@ class GameWorker(BaseWorker):
         metrics.worker_info.labels(worker_id=self.worker_id).info({
             'type': 'game',
             'batch_size': str(self.batch_size),
-            'device': 'gpu' if jax.devices()[0].platform == 'gpu' else 'cpu',
+            'device_type': 'cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu',
+            'device_kind': str(self.device_info.device_kind),
         })
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(1)
+        metrics.worker_phase.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(WorkerPhase.COLLECTING)
+        metrics.worker_state.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(WorkerState.COMPILING)
 
         # Set configuration metrics (for correlating with memory usage)
         metrics.worker_batch_size.labels(
@@ -765,11 +755,30 @@ class GameWorker(BaseWorker):
         metrics.worker_max_nodes.labels(
             worker_id=self.worker_id, worker_type='game'
         ).set(self.max_nodes)
-
-        # Game worker is always in collecting phase when running
-        metrics.worker_phase.labels(
+        metrics.worker_short_game.labels(
             worker_id=self.worker_id, worker_type='game'
-        ).set(WorkerPhase.COLLECTING)
+        ).set(1 if self.short_game else 0)
+
+        # Setup
+        print(f"Worker {self.worker_id}: Setting up environment and evaluator...")
+        self._setup_environment()
+        self._setup_neural_network()
+        self._setup_evaluator()
+        self._initialize_params()
+
+        # Initialize collection state
+        print(f"Worker {self.worker_id}: Initializing {self.batch_size} parallel environments...")
+        self._collection_state = self._init_collection_state()
+
+        # Setup and JIT compile the batched step function
+        print(f"Worker {self.worker_id}: JIT compiling batched step function...")
+        self._setup_batched_step()
+
+        # Log temperature and simulations
+        print(f"Worker {self.worker_id}: Initial temperature: {self._current_temperature:.2f}, simulations: {self._current_simulations}")
+        metrics.worker_state.labels(
+            worker_id=self.worker_id, worker_type='game'
+        ).set(WorkerState.RUNNING)
 
         # Pre-initialize truncated counter series so Grafana panels don't disappear
         # when there are zero truncations.
@@ -815,11 +824,17 @@ class GameWorker(BaseWorker):
             # Only pause GPU collectors; CPU collectors can continue generating games while
             # the trainer uses the head GPU.
             if self.state.is_collection_paused() and jax.default_backend() == "gpu":
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='game'
+                ).set(WorkerState.WAITING)
                 if time.time() - last_pause_log > 10:
                     print(f"Worker {self.worker_id}: Collection paused, waiting for training...")
                     last_pause_log = time.time()
                 time.sleep(0.5)  # Wait while paused
                 continue
+            metrics.worker_state.labels(
+                worker_id=self.worker_id, worker_type='game'
+            ).set(WorkerState.RUNNING)
 
             # Check for model updates periodically (every 10 seconds)
             if time.time() - last_model_check > 10:
@@ -849,6 +864,9 @@ class GameWorker(BaseWorker):
                 metrics.collection_steps_per_second.labels(
                     worker_id=self.worker_id
                 ).set(steps_per_sec)
+                metrics.worker_steps_per_second.labels(
+                    worker_id=self.worker_id, worker_type='game'
+                ).set(steps_per_sec)
                 metrics.games_per_minute.labels(
                     worker_id=self.worker_id
                 ).set(games_per_min)
@@ -860,6 +878,10 @@ class GameWorker(BaseWorker):
                 metrics.mcts_temperature.labels(
                     worker_id=self.worker_id
                 ).set(self._current_temperature)
+
+                metrics.worker_num_simulations.labels(
+                    worker_id=self.worker_id, worker_type='game'
+                ).set(self._current_simulations)
 
                 if not self.config.get('pushgateway_url'):
                     try:

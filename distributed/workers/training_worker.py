@@ -194,7 +194,7 @@ from ..serialization import (
     experiences_to_numpy_batch,
 )
 from ..buffer.redis_buffer import RedisReplayBuffer
-from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase
+from ..metrics import get_metrics, start_metrics_server, register_metrics_endpoint, WorkerPhase, WorkerState
 
 
 @dataclass
@@ -1578,26 +1578,7 @@ class TrainingWorker(BaseWorker):
         Returns:
             Dict with results/statistics from the run.
         """
-        # Setup
-        print(f"Worker {self.worker_id}: Setting up training...")
-        self._setup_environment()
-        self._setup_neural_network()
-        self._initialize_train_state()
-
-        # Ensure only one training worker is active cluster-wide (prevents RAM OOM).
-        self._acquire_training_lock()
-
-        # Now that we own the training lock, load large resources (bearoff table).
-        self._maybe_load_bearoff_table()
-
-        # Ensure collection is not paused from a previous crash
-        self.state.set_collection_paused(False)
-        print(f"Worker {self.worker_id}: Cleared collection pause state")
-
-        # Set up MLflow tracking
-        self._setup_mlflow()
-
-        # Start Prometheus metrics server
+        # Start Prometheus metrics server early so the dashboard can show startup/compile state.
         metrics_port_config = self.config.get('metrics_port', 9200)
         metrics_port = start_metrics_server(metrics_port_config)
         if metrics_port is None:
@@ -1623,15 +1604,47 @@ class TrainingWorker(BaseWorker):
         except Exception as e:
             print(f"Worker {self.worker_id}: Failed to register metrics endpoint: {e}")
 
-        # Set worker info
         metrics.worker_info.labels(worker_id=self.worker_id).info({
             'type': 'training',
             'batch_size': str(self.train_batch_size),
             'learning_rate': str(self.learning_rate),
+            'device_type': 'cuda' if self.device_info.is_cuda else 'metal' if self.device_info.is_metal else 'cpu',
+            'device_kind': str(self.device_info.device_kind),
         })
         metrics.worker_status.labels(
             worker_id=self.worker_id, worker_type='training'
         ).set(1)
+        metrics.worker_batch_size.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(self.train_batch_size)
+        metrics.worker_phase.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(WorkerPhase.IDLE)
+        metrics.worker_state.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(WorkerState.COMPILING)
+
+        # Setup
+        print(f"Worker {self.worker_id}: Setting up training...")
+        self._setup_environment()
+        self._setup_neural_network()
+        self._initialize_train_state()
+
+        # Ensure only one training worker is active cluster-wide (prevents RAM OOM).
+        self._acquire_training_lock()
+
+        # Now that we own the training lock, load large resources (bearoff table).
+        self._maybe_load_bearoff_table()
+
+        # Ensure collection is not paused from a previous crash
+        self.state.set_collection_paused(False)
+        print(f"Worker {self.worker_id}: Cleared collection pause state")
+
+        # Set up MLflow tracking
+        self._setup_mlflow()
+        metrics.worker_state.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(WorkerState.WAITING)
 
         steps_per_game_target = self.config.get(
             'steps_per_game',
@@ -1693,11 +1706,20 @@ class TrainingWorker(BaseWorker):
         self._training_stats.games_at_last_train = self._get_current_games_count()
         self._training_stats.experiences_at_last_train = self.buffer.get_size()
         set_phase(WorkerPhase.IDLE)
+        metrics.worker_state.labels(
+            worker_id=self.worker_id, worker_type='training'
+        ).set(WorkerState.WAITING)
 
         while self.running:
             # Check if training is active
             if not self.is_training_active():
                 print(f"Worker {self.worker_id}: Training paused, waiting...")
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(WorkerState.WAITING)
+                metrics.worker_steps_per_second.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(0.0)
                 time.sleep(5.0)
                 continue
 
@@ -1711,6 +1733,12 @@ class TrainingWorker(BaseWorker):
                     f"Worker {self.worker_id}: Waiting for buffer "
                     f"({buffer_size}/{self.min_buffer_size})..."
                 )
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(WorkerState.WAITING)
+                metrics.worker_steps_per_second.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(0.0)
                 time.sleep(2.0)
                 continue
 
@@ -1726,6 +1754,9 @@ class TrainingWorker(BaseWorker):
 
             if backlog_steps < min_backlog_steps:
                 # Caught up (or very small backlog), wait briefly.
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(WorkerState.WAITING)
                 time.sleep(1.0)
 
                 # Keep training visible in Prometheus discovery even while idle.
@@ -1744,6 +1775,9 @@ class TrainingWorker(BaseWorker):
                         pass
                     metrics.training_steps_per_second.labels(
                         worker_id=self.worker_id
+                    ).set(0.0)
+                    metrics.worker_steps_per_second.labels(
+                        worker_id=self.worker_id, worker_type='training'
                     ).set(0.0)
                     last_metrics_refresh = current_time
 
@@ -1796,6 +1830,9 @@ class TrainingWorker(BaseWorker):
 
                 # Set training phase
                 set_phase(WorkerPhase.TRAINING)
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(WorkerState.RUNNING)
 
                 # Run training epoch (game collection is paused)
                 batch_metrics = self._run_training_batch(target_steps)
@@ -1806,6 +1843,9 @@ class TrainingWorker(BaseWorker):
             finally:
                 # Back to idle even if training fails (prevents deadlocked collection pause).
                 set_phase(WorkerPhase.IDLE)
+                metrics.worker_state.labels(
+                    worker_id=self.worker_id, worker_type='training'
+                ).set(WorkerState.WAITING)
 
                 if paused_collection:
                     self.state.set_collection_paused(False)
@@ -1877,9 +1917,15 @@ class TrainingWorker(BaseWorker):
             # Per-output value metrics (4-way conditional format)
             output_names = ['win', 'gam_win_cond', 'gam_loss_cond', 'bg_rate']
             for output_name in output_names:
+                metrics.value_loss_per_output.labels(
+                    worker_id=self.worker_id, output=output_name
+                ).set(batch_metrics.get(f'value_loss_{output_name}', 0))
                 metrics.predicted_outcome_prob.labels(
                     worker_id=self.worker_id, outcome=output_name
-                ).set(batch_metrics.get(f'pred_{output_name}', 0))
+                ).set(batch_metrics.get(f'pred_prob_{output_name}', 0))
+                metrics.target_outcome_prob.labels(
+                    worker_id=self.worker_id, outcome=output_name
+                ).set(batch_metrics.get(f'target_prob_{output_name}', 0))
 
             # Accuracy metrics
             metrics.value_accuracy.labels(
@@ -1891,6 +1937,9 @@ class TrainingWorker(BaseWorker):
 
             metrics.training_steps_per_second.labels(
                 worker_id=self.worker_id
+            ).set(overall_steps_per_sec)
+            metrics.worker_steps_per_second.labels(
+                worker_id=self.worker_id, worker_type='training'
             ).set(overall_steps_per_sec)
             metrics.training_batch_duration.labels(
                 worker_id=self.worker_id

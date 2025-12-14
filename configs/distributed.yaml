@@ -135,10 +135,10 @@ device_configs:
     # Memory is split 45%/45% but compute alternates for 100% utilization
     # batch_size=128 with max_nodes=2000 fits in 11GB with ~62% GPU util
     # Keep this conservative so the head GPU game worker stays alive.
-    game_batch_size: 64
+    game_batch_size: 128
     # Fixed per-process GPU memory caps (GB). Prefer these over fractions.
     # Keep sums below total VRAM so multiple JAX processes can coexist.
-    game_gpu_memory_gb: 15.0
+    game_gpu_memory_gb: 17.0
     train_batch_size: 4096
     train_gpu_memory_gb: 6.0
     eval_batch_size: 32
