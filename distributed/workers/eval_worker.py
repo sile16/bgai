@@ -15,6 +15,7 @@ No Ray dependency - uses Redis for all coordination.
 
 import gc
 import time
+import subprocess
 from enum import Enum
 from functools import partial
 from typing import Dict, Any, Optional, List, Tuple
@@ -137,6 +138,7 @@ class EvalWorker(BaseWorker):
         self.max_nodes = self.config.get('max_nodes', 800)
         self.eval_interval = self.config.get('eval_interval', 300)  # seconds
         self.persist_tree = self.config.get('persist_tree', False)  # Keep tree between moves
+        self.gnubg_max_steps = int(self.config.get('gnubg_max_steps', 200))
 
         # Which eval types this worker can run
         self.enabled_eval_types = self.config.get('eval_types', [
@@ -200,6 +202,38 @@ class EvalWorker(BaseWorker):
             'redis_port': redis_port,
             'redis_password': redis_password,
         })
+
+        # GNUBG-on-CPU safety overrides to avoid runaway memory and latency.
+        if (EvalType.GNUBG.value in self.enabled_eval_types) and (not self.device_info.is_cuda):
+            tuned_sims = min(self.num_simulations, 16)
+            tuned_nodes = min(self.max_nodes, 256)
+            if (tuned_sims != self.num_simulations) or (tuned_nodes != self.max_nodes) or self.persist_tree:
+                print(
+                    f"Worker {self.worker_id}: Applying GNUBG CPU overrides "
+                    f"(sims {self.num_simulations}->{tuned_sims}, "
+                    f"nodes {self.max_nodes}->{tuned_nodes}, persist_tree=False, "
+                    f"max_steps={self.gnubg_max_steps})"
+                )
+            self.num_simulations = tuned_sims
+            self.max_nodes = tuned_nodes
+            self.persist_tree = False
+            self.gnubg_max_steps = min(self.gnubg_max_steps, 60)
+            self.config['short_game'] = self.config.get('short_game', True)
+            gnubg_cfg = dict(self.config.get('gnubg', {}))
+            gnubg_cfg.setdefault('ply', 0)
+            gnubg_cfg.setdefault('shortcuts', 1)
+            gnubg_cfg.setdefault('move_filters', (4, 2, 1, 1))
+            self.config['gnubg'] = gnubg_cfg
+            # Keep config in sync so later logging reflects the tuned values.
+            self.config['num_simulations'] = self.num_simulations
+            self.config['max_nodes'] = self.max_nodes
+            self.config['persist_tree'] = self.persist_tree
+            self.config['gnubg_max_steps'] = self.gnubg_max_steps
+
+        # Instrumentation
+        self.resource_log_interval_seconds = float(self.config.get('resource_log_interval_seconds', 30.0))
+        self._last_resource_log_time = 0.0
+        self._cpu_percent_initialized = False
 
     def _refresh_metrics_registration(self, force: bool = False) -> None:
         if self._metrics_port is None:
@@ -337,6 +371,8 @@ class EvalWorker(BaseWorker):
             num_hidden=num_hidden,
             num_blocks=num_blocks
         )
+        # Cache eval fn for lightweight (non-MCTS) inference paths.
+        self._nn_eval_fn = make_nn_eval_fn(self._nn_model, self._state_to_nn_input_fn)
 
     def _setup_mcts_evaluator(self) -> None:
         """Set up the MCTS evaluator for the current model."""
@@ -520,6 +556,69 @@ class EvalWorker(BaseWorker):
             print(f"Worker {self.worker_id}: MLflow setup error: {e}")
             self._mlflow_run = None
 
+    def _get_gpu_memory_mb(self) -> Optional[int]:
+        """Return GPU memory in MiB for this process if available."""
+        if not self.device_info.is_cuda:
+            return None
+        try:
+            pid = self._psutil_process.pid if self._psutil_process else None
+            if pid is None:
+                return None
+            cmd = [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                return None
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 2:
+                    continue
+                line_pid, mem = parts
+                if int(line_pid) == pid:
+                    return int(mem)
+        except Exception:
+            return None
+        return None
+
+    def _log_resource_snapshot(self, phase: str, extra: Optional[Dict[str, Any]] = None, force: bool = False) -> None:
+        """Log RSS/CPU/GC (and GPU if available) to spot leaks and hotspots."""
+        if self._psutil_process is None:
+            return
+        now = time.time()
+        if not force and (now - self._last_resource_log_time) < self.resource_log_interval_seconds:
+            return
+        self._last_resource_log_time = now
+
+        try:
+            if not self._cpu_percent_initialized:
+                # Prime cpu_percent to avoid an initial 0.0 reading.
+                self._psutil_process.cpu_percent(interval=None)
+                self._cpu_percent_initialized = True
+            cpu = self._psutil_process.cpu_percent(interval=None)
+            mem = self._psutil_process.memory_info()
+            rss_mb = mem.rss / (1024 * 1024)
+            vms_mb = mem.vms / (1024 * 1024)
+            threads = self._psutil_process.num_threads()
+            gc_counts = gc.get_count()
+            gpu_mem_mb = self._get_gpu_memory_mb()
+
+            msg = (
+                f"Worker {self.worker_id}: [resources:{phase}] "
+                f"rss={rss_mb:.1f}MB vms={vms_mb:.1f}MB cpu={cpu:.1f}% "
+                f"threads={threads} gc={gc_counts}"
+            )
+            if gpu_mem_mb is not None:
+                msg += f" gpu_mem={gpu_mem_mb}MiB"
+            if extra:
+                details = " ".join(f"{k}={v}" for k, v in extra.items())
+                msg += f" {details}"
+            print(msg, flush=True)
+        except Exception as e:
+            print(f"Worker {self.worker_id}: resource snapshot failed ({phase}): {e}", flush=True)
+
     def _log_mlflow_eval_metrics(self, result: 'EvalResult') -> None:
         """Log evaluation metrics to MLflow.
 
@@ -640,7 +739,8 @@ class EvalWorker(BaseWorker):
             try:
                 self._warm_tree = deserialize_warm_tree(tree_bytes)
                 self._warm_tree_version = version
-                print(f"Worker {self.worker_id}: Loaded warm tree version {version}")
+                size_mb = len(tree_bytes) / (1024 * 1024)
+                print(f"Worker {self.worker_id}: Loaded warm tree version {version} ({size_mb:.2f}MB)")
             except Exception as e:
                 print(f"Worker {self.worker_id}: Error loading warm tree: {e}")
                 self._warm_tree = None
@@ -900,7 +1000,7 @@ class EvalWorker(BaseWorker):
                 print(f"Worker {self.worker_id}: GNUBG not available, skipping")
                 return None
             # GNUBG uses pure_callback, not JIT-compatible with two_player_game
-            results = self._run_gnubg_eval(num_games=games_to_run)
+            results = self._run_gnubg_eval(num_games=games_to_run, model_version=model_version)
         elif eval_type_normalized == EvalType.RANDOM.value:
             # Use TurboZero's two_player_game (JIT-compatible)
             results = self._run_two_player_eval(self._random_evaluator, None, num_games=games_to_run)
@@ -1017,6 +1117,10 @@ class EvalWorker(BaseWorker):
             if not self.running:
                 break
             self._refresh_metrics_registration()
+            self._log_resource_snapshot(
+                "two-player-loop",
+                extra={'eval_type': opponent_name, 'game_idx': game_idx, 'games_to_run': games_to_run}
+            )
 
             # Progress logging every 10 games or every game if games_to_run < 20
             log_interval = max(1, games_to_run // 10)
@@ -1084,7 +1188,7 @@ class EvalWorker(BaseWorker):
             'total_points': total_points,
         }
 
-    def _run_gnubg_eval(self, num_games: Optional[int] = None) -> Dict[str, Any]:
+    def _run_gnubg_eval(self, num_games: Optional[int] = None, model_version: Optional[int] = None) -> Dict[str, Any]:
         """Run evaluation games against GNUBG.
 
         Uses a Python loop since GNUBG evaluator uses jax.pure_callback
@@ -1104,14 +1208,21 @@ class EvalWorker(BaseWorker):
         total_game_length = 0
         total_points = 0.0
 
-        max_steps = 500
+        max_steps = self.gnubg_max_steps
         start_time = time.time()
         games_to_run = num_games if num_games is not None else self.eval_games
+        version = model_version if model_version is not None else self.current_model_version
+
+        use_mcts = self.device_info.is_cuda
 
         for game_idx in range(games_to_run):
             if not self.running:
                 break
             self._refresh_metrics_registration()
+            self._log_resource_snapshot(
+                "gnubg-loop",
+                extra={'game_idx': game_idx, 'games_to_run': games_to_run}
+            )
 
             # Progress logging every game for gnubg (it's slow)
             if game_idx > 0:
@@ -1131,10 +1242,14 @@ class EvalWorker(BaseWorker):
             env_state, metadata = self._env_init_fn(init_key)
 
             # Initialize evaluator states - use warm tree if available
-            if self._warm_tree is not None:
-                our_eval_state = self._warm_tree
+            # Use warm tree only when allowed (GPU preferred). On CPU we start fresh to keep memory bounded.
+            if use_mcts:
+                if self._warm_tree is not None and self.device_info.is_cuda:
+                    our_eval_state = self._warm_tree
+                else:
+                    our_eval_state = self._mcts_evaluator.init(template_embedding=env_state)
             else:
-                our_eval_state = self._mcts_evaluator.init(template_embedding=env_state)
+                our_eval_state = None
             opp_eval_state = self._gnubg_evaluator.init(template_embedding=env_state)
 
             # Randomly assign which evaluator plays which color
@@ -1145,30 +1260,54 @@ class EvalWorker(BaseWorker):
             game_length = 0
             done = False
             last_refresh_time = time.time()
+            last_progress_log = time.time()
 
             while not done and game_length < max_steps:
                 if time.time() - last_refresh_time >= self._metrics_refresh_interval_seconds:
                     self._refresh_metrics_registration(force=True)
                     last_refresh_time = time.time()
 
+                # Progress + resource sample every ~5 seconds to surface stalls/leaks
+                if time.time() - last_progress_log >= 5.0:
+                    self._log_resource_snapshot(
+                        "gnubg-step",
+                        extra={
+                            'game_idx': game_idx,
+                            'step': game_length,
+                            'max_steps': max_steps,
+                            'version': version,
+                        },
+                        force=True,
+                    )
+                    last_progress_log = time.time()
+
                 key, step_key = jax.random.split(key)
                 current_player = int(metadata.cur_player_id)
 
                 # Determine which evaluator should move
                 if (current_player == 0) == we_are_player_0:
-                    # Our turn (MCTS)
-                    output = self._mcts_evaluator.evaluate(
-                        key=step_key,
-                        eval_state=our_eval_state,
-                        env_state=env_state,
-                        root_metadata=metadata,
-                        params=self._nn_params,
-                        env_step_fn=self._env_step_fn,
-                    )
-                    action = output.action
-                    # Step our evaluator and the opponent's evaluator
-                    our_eval_state = self._mcts_evaluator.step(output.eval_state, action)
-                    opp_eval_state = self._gnubg_evaluator.step(opp_eval_state, action)
+                    # Our turn (MCTS or lightweight greedy if on CPU)
+                    if use_mcts:
+                        if not self.persist_tree:
+                            our_eval_state = self._mcts_evaluator.init(template_embedding=env_state)
+                        output = self._mcts_evaluator.evaluate(
+                            key=step_key,
+                            eval_state=our_eval_state,
+                            env_state=env_state,
+                            root_metadata=metadata,
+                            params=self._nn_params,
+                            env_step_fn=self._env_step_fn,
+                        )
+                        action = jax.device_get(output.action)
+                        # Step our evaluator and the opponent's evaluator
+                        our_eval_state = self._mcts_evaluator.step(output.eval_state, action)
+                        opp_eval_state = self._gnubg_evaluator.step(opp_eval_state, action)
+                    else:
+                        logits, _ = self._nn_eval_fn(env_state, self._nn_params, step_key)
+                        legal_mask = metadata.action_mask
+                        masked_logits = jnp.where(legal_mask, logits, -jnp.inf)
+                        action = int(jnp.argmax(masked_logits))
+                        opp_eval_state = self._gnubg_evaluator.step(opp_eval_state, action)
                 else:
                     # Opponent's turn (GNUBG)
                     output = self._gnubg_evaluator.evaluate(
@@ -1179,11 +1318,15 @@ class EvalWorker(BaseWorker):
                     action = output.action
                     # Step both evaluators
                     opp_eval_state = self._gnubg_evaluator.step(output.eval_state, action)
-                    our_eval_state = self._mcts_evaluator.step(our_eval_state, action)
+                    if use_mcts:
+                        our_eval_state = self._mcts_evaluator.step(our_eval_state, action)
 
                 # Step environment
                 env_state, metadata = self._env_step_fn(env_state, action, step_key)
                 game_length += 1
+
+                if game_length % 10 == 0:
+                    gc.collect()
 
                 if metadata.terminated:
                     done = True
@@ -1337,6 +1480,7 @@ class EvalWorker(BaseWorker):
 
         print(f"Worker {self.worker_id}: Starting evaluation loop...")
         print(f"Worker {self.worker_id}: Enabled eval types: {self.enabled_eval_types}")
+        self._log_resource_snapshot("post-setup", extra={'batch_size': self.batch_size}, force=True)
 
         start_time = time.time()
         eval_count = 0
@@ -1387,11 +1531,27 @@ class EvalWorker(BaseWorker):
                 metrics.worker_state.labels(
                     worker_id=self.worker_id, worker_type='eval'
                 ).set(WorkerState.RUNNING)
+                self._log_resource_snapshot(
+                    "batch-start",
+                    extra={'eval_type': eval_type, 'version': current_version, 'batch': batch_size},
+                    force=True,
+                )
 
                 # Run the batch evaluation
                 result = self._run_evaluation(current_version, eval_type, num_games=batch_size)
 
                 if result is not None:
+                    self._log_resource_snapshot(
+                        "batch-end",
+                        extra={
+                            'eval_type': eval_type,
+                            'version': current_version,
+                            'games': result.games_played,
+                            'duration_s': f"{result.duration_seconds:.1f}",
+                            'win_rate': f"{result.win_rate:.3f}",
+                        },
+                        force=True,
+                    )
                     # Update metrics immediately (Prometheus aggregates across workers)
                     self._update_metrics(result, metrics)
                     eval_count += 1
